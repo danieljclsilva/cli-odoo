@@ -93,24 +93,54 @@ Table/YAML are for humans and never change the JSON shape.
 ## Write gate
 
 Writes never run silently. Every mutating command follows
-preview → confirm → execute:
+readonly check → confirm → TTY check → execute → audit:
 
 ```bash
 # 1. Preview (never mutates, always allowed):
 odoo write res.partner 42 --values-json '{"phone":"+81-90-0000-0000"}' --dry-run
 
-# 2. Execute (requires BOTH the flag AND the env gate):
+# 2. Allow writes on the instance (default-deny: file/env instances are
+#    read-only unless readonly:false is set in the config file):
+#    instances:
+#      prod: {url: ..., db: ..., username: ..., readonly: false}
+#    Or at login time: odoo login --url ... --db ... --username ... --writable
+#    (ODOO_READONLY=1/true/yes can only tighten to read-only, never loosen.)
+
+# 3. Execute (requires ALL of the following):
 export ODOO_WRITES_ENABLED=1
 odoo write res.partner 42 --values-json '{"phone":"+81-90-0000-0000"}' --yes
+# Then type YES at the /dev/tty prompt when asked.
 ```
 
-Rules:
+The chain, in order:
 
-- `--dry-run` previews the exact payload and bypasses all gates.
-- `--yes` confirms AND requires `ODOO_WRITES_ENABLED=1` in the environment.
-- Without both, the command refuses with a non-zero exit and a failure envelope.
-- Same gate applies to `create`, `unlink`, `chatter-post`, `attachment-add`,
-  and every `call` method outside the read-only allowlist (`search_read`, `read`, `search_count`, `read_group`, `fields_get`, `name_search`, `check_access_rights`, `version`, `context_get`).
+1. **Read-only default** — instances refuse mutations unless `readonly: false`
+   is set explicitly in the config file. `ODOO_READONLY=1/true/yes` forces
+   read-only (tighten-only: `0`/`false` never loosen).
+2. **`--yes` + `ODOO_WRITES_ENABLED=1`** — the flag confirms intent and the
+   env var gates automation; without both, the command refuses with a
+   non-zero exit and a failure envelope.
+3. **Human-at-TTY confirmation** — a real controlling terminal (`/dev/tty`)
+   prompts `Type YES to confirm <op>: `; only an exact `YES` proceeds. Piped
+   stdin cannot feed it, and a headless sandbox without `/dev/tty` is
+   refused. `ODOO_ALLOW_NON_TTY=1` skips this step for human-owned CI only —
+   it is agent-abusable, so never enable it for agent runs.
+4. **Audit log** — every mutation attempt appends one JSON line (timestamp,
+   URL, db, user, model, method, truncated args, never secrets) to the
+   instance `audit_log` path (default `<defaultDir>/audit.log`). If the audit
+   write fails, the RPC is refused (fail closed). Reads are never logged.
+
+`call` uses the read-only allowlist (`search_read`, `read`, `search_count`,
+`read_group`, `fields_get`, `name_search`, `check_access_rights`, `version`,
+`context_get`): allowlisted methods run without confirmation, everything else
+follows the full chain above (`call:<model>.<method>`). The same gate applies
+to `create`, `write`, `unlink`, `chatter-post`, and `attachment-add`.
+
+Server-side, give the Odoo user least-privilege access rights / record rules:
+the CLI gate is defense in depth, not the only boundary. For unattended
+automation, keep a dedicated human-owned pipeline (with its own writable
+instance and `ODOO_ALLOW_NON_TTY=1`) separate from agent sandboxes — agents
+must always go through a human at a TTY.
 
 ## Multi-instance
 

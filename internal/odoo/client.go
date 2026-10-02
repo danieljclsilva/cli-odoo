@@ -15,6 +15,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -27,6 +29,7 @@ import (
 const (
 	maxJSONResponseBytes = 10 << 20
 	maxServerErrorChars  = 500
+	maxAuditArgsChars    = 500
 )
 
 // Client talks to one Odoo instance.
@@ -40,6 +43,8 @@ type Client struct {
 	Timeout   time.Duration
 	VerifySSL bool
 	Lang      string
+	ReadOnly  bool
+	AuditLog  string
 
 	uid      int
 	secret   string // password, API key fallback; never echoed in errors
@@ -51,6 +56,19 @@ type Client struct {
 
 // UID returns the authenticated user id.
 func (c *Client) UID() int { return c.uid }
+
+// IsReadOnlyMethod reports whether method is on the read-only allowlist and
+// therefore exempt from write gating. Comparison is case-insensitive on the
+// trimmed method name; everything else is treated as a mutation.
+func IsReadOnlyMethod(method string) bool {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "search_read", "read", "search_count", "read_group", "fields_get",
+		"name_search", "check_access_rights", "version", "context_get":
+		return true
+	default:
+		return false
+	}
+}
 
 // New connects to inst and validates credentials.
 // XML-RPC authenticates via /xmlrpc/2/common authenticate with
@@ -103,6 +121,8 @@ func New(inst *config.Instance) (*Client, error) {
 		Timeout:   timeout,
 		VerifySSL: inst.VerifySSL,
 		Lang:      inst.Lang,
+		ReadOnly:  inst.ReadOnly,
+		AuditLog:  inst.AuditLog,
 		secret:    secret,
 		http: &http.Client{
 			Timeout:   timeout,
@@ -145,6 +165,17 @@ func New(inst *config.Instance) (*Client, error) {
 // {base}/{model}/{method} (json2). When Lang is configured it is injected
 // as context.lang. Credentials are never included in returned errors.
 func (c *Client) Execute(model, method string, args []any, kwargs map[string]any) (any, error) {
+	// Client-level backstop, before any RPC: every mutation attempt appends
+	// one audit line first (fail closed), then read-only instances refuse
+	// outright. Reads are never logged.
+	if !IsReadOnlyMethod(method) {
+		if err := c.appendAudit(model, method, args, kwargs); err != nil {
+			return nil, err
+		}
+		if c.ReadOnly {
+			return nil, fmt.Errorf("odoo: refusing %s.%s: instance is read-only (set readonly:false in the config file to allow writes; server ACLs still apply)", model, method)
+		}
+	}
 	if args == nil {
 		args = []any{}
 	}
@@ -174,6 +205,78 @@ func (c *Client) Execute(model, method string, args []any, kwargs map[string]any
 		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s.%s: %w", model, method, err))
 	}
 	return out, nil
+}
+
+// auditEntry is one JSON audit-log line for a mutation attempt. Secrets are
+// never recorded: only the formatted positional args (capped at
+// maxAuditArgsChars) are kept, never the password/API key.
+type auditEntry struct {
+	TS            string `json:"ts"`
+	URL           string `json:"url"`
+	DB            string `json:"db"`
+	Username      string `json:"username"`
+	UID           int    `json:"uid"`
+	Model         string `json:"model"`
+	Method        string `json:"method"`
+	ArgsTruncated string `json:"args_truncated"`
+}
+
+// appendAudit records one JSON line for a mutation attempt to the instance
+// audit log (dir 0700, file 0600). A write failure refuses the RPC.
+func (c *Client) appendAudit(model, method string, args []any, kwargs map[string]any) error {
+	argStr := fmt.Sprintf("args=%v kwargs=%v", args, kwargs)
+	if r := []rune(argStr); len(r) > maxAuditArgsChars {
+		argStr = string(r[:maxAuditArgsChars])
+	}
+	logURL := c.URL
+	if u, err := url.Parse(c.URL); err == nil && u != nil {
+		u.User = nil
+		logURL = u.String()
+	}
+	line, err := json.Marshal(auditEntry{
+		TS:            time.Now().UTC().Format(time.RFC3339),
+		URL:           logURL,
+		DB:            c.DB,
+		Username:      c.Username,
+		UID:           c.uid,
+		Model:         model,
+		Method:        method,
+		ArgsTruncated: argStr,
+	})
+	if err != nil {
+		return fmt.Errorf("odoo: refusing %s.%s: cannot record audit entry: %v", model, method, err)
+	}
+	line = append(line, '\n')
+	path := c.auditPath()
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("odoo: refusing %s.%s: cannot write audit log %q: %v", model, method, path, err)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("odoo: refusing %s.%s: cannot write audit log %q: %v", model, method, path, err)
+	}
+	if _, err := f.Write(line); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("odoo: refusing %s.%s: cannot write audit log %q: %v", model, method, path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("odoo: refusing %s.%s: cannot write audit log %q: %v", model, method, path, err)
+	}
+	return nil
+}
+
+// auditPath is the instance audit log, falling back to the config default
+// when the client was built without one.
+func (c *Client) auditPath() string {
+	if strings.TrimSpace(c.AuditLog) != "" {
+		return c.AuditLog
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".config", "odoo-cli", "audit.log")
+	}
+	return filepath.Join(".", "odoo-audit.log")
 }
 
 // ServerVersion returns the server version info (common.version on xmlrpc).

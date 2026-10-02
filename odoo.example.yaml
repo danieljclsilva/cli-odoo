@@ -11,6 +11,12 @@ transport: xmlrpc   # xmlrpc (default, Odoo 17 compatible) | json2 (opt-in, Odoo
 timeout: 30         # seconds
 verify_ssl: true
 lang: en_US         # also accepted as `locale`; env override: ODOO_LOCALE
+# readonly: true    # default-deny: file/env instances are read-only unless
+#                   # explicitly set to `readonly: false`. Env ODOO_READONLY
+#                   # can only tighten (1/true/yes force readonly; 0/false
+#                   # never loosen). Non-TTY escape hatch ODOO_ALLOW_NON_TTY=1
+#                   # is human-owned CI only (agent-abusable, never a default).
+# audit_log: ""     # mutation audit trail path (default <defaultDir>/audit.log)
 
 # --- Multi-instance layout (uncomment to use named instances) ---
 # instances:
@@ -23,6 +29,8 @@ lang: en_US         # also accepted as `locale`; env override: ODOO_LOCALE
 #     timeout: 30
 #     verify_ssl: true
 #     lang: en_US
+#     readonly: true   # default-deny; set false only to allow writes
+#     audit_log: ""    # default <defaultDir>/audit.log
 #   staging:
 #     url: https://staging.example.com
 #     db: staging
@@ -32,4 +40,5 @@ lang: en_US         # also accepted as `locale`; env override: ODOO_LOCALE
 #     timeout: 30
 #     verify_ssl: true
 #     lang: en_US
+#     readonly: true
 # default_instance: prod

@@ -51,12 +51,12 @@ func newCreateCmd() *cobra.Command {
 				output.Ok("create_preview", map[string]any{"model": model, "values": values}, 0)
 				return
 			}
-			if err := safety.RequireConfirm(confirmed, false); err != nil {
+			inst, err := config.Resolve(InstanceName())
+			if err != nil {
 				output.Fail("create", err)
 				return
 			}
-			inst, err := config.Resolve(InstanceName())
-			if err != nil {
+			if err := safety.RequireWrite(inst, confirmed, false, "create:"+model+".create"); err != nil {
 				output.Fail("create", err)
 				return
 			}
@@ -107,12 +107,12 @@ func newWriteCmd() *cobra.Command {
 				output.Ok("write_preview", map[string]any{"model": model, "ids": ids, "values": values}, 0)
 				return
 			}
-			if err := safety.RequireConfirm(confirmed, false); err != nil {
+			inst, err := config.Resolve(InstanceName())
+			if err != nil {
 				output.Fail("write", err)
 				return
 			}
-			inst, err := config.Resolve(InstanceName())
-			if err != nil {
+			if err := safety.RequireWrite(inst, confirmed, false, "write:"+model+".write"); err != nil {
 				output.Fail("write", err)
 				return
 			}
@@ -157,12 +157,12 @@ func newUnlinkCmd() *cobra.Command {
 				output.Ok("unlink_preview", map[string]any{"model": model, "ids": ids}, 0)
 				return
 			}
-			if err := safety.RequireConfirm(confirmed, false); err != nil {
+			inst, err := config.Resolve(InstanceName())
+			if err != nil {
 				output.Fail("unlink", err)
 				return
 			}
-			inst, err := config.Resolve(InstanceName())
-			if err != nil {
+			if err := safety.RequireWrite(inst, confirmed, false, "unlink:"+model+".unlink"); err != nil {
 				output.Fail("unlink", err)
 				return
 			}

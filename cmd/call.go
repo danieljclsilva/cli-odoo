@@ -24,11 +24,14 @@ func newCallCmd() *cobra.Command {
 		Use:   "call <model> <method> --args-json '[...]' --kwargs-json '{...}' [--dry-run] [--yes]",
 		Short: "Call any Odoo model method (Odoo 17-safe ORM methods)",
 		Long: `Call an arbitrary Odoo model method via execute_kw.
-
-Default-deny: every method requires --yes plus ODOO_WRITES_ENABLED=1,
-except the read-only allowlist (search_read, read, search_count,
-read_group, fields_get, name_search, check_access_rights, version,
-context_get). Preview the payload first with --dry-run.`,
+	
+	Default-deny: instances are read-only unless readonly:false is set in the
+	config file, and every non-read-only method additionally requires --yes
+	plus ODOO_WRITES_ENABLED=1 plus a human-at-TTY confirmation (type YES at
+	/dev/tty; ODOO_ALLOW_NON_TTY=1 skips it for human-owned CI only).
+	Read-only methods (search_read, read, search_count, read_group,
+	fields_get, name_search, check_access_rights, version, context_get)
+	run without confirmation. Preview the payload first with --dry-run.`,
 		Args: cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			model, method := args[0], args[1]
@@ -62,16 +65,16 @@ context_get). Preview the payload first with --dry-run.`,
 				}, 0)
 				return
 			}
-			if !callIsReadOnly(method) {
-				if err := safety.RequireConfirm(yes, dryRun); err != nil {
-					output.Fail("call", err)
-					return
-				}
-			}
 			inst, err := config.Resolve(InstanceName())
 			if err != nil {
 				output.Fail("call", err)
 				return
+			}
+			if !odoo.IsReadOnlyMethod(method) {
+				if err := safety.RequireWrite(inst, yes, false, "call:"+model+"."+method); err != nil {
+					output.Fail("call", err)
+					return
+				}
 			}
 			cl, err := odoo.New(inst)
 			if err != nil {
@@ -88,20 +91,9 @@ context_get). Preview the payload first with --dry-run.`,
 	}
 	cmd.Flags().StringVar(&argsJSON, "args-json", "", "positional args as JSON array (default [])")
 	cmd.Flags().StringVar(&kwargsJSON, "kwargs-json", "", "keyword args as JSON object (default {})")
-	cmd.Flags().BoolVar(&yes, "yes", false, "confirm a gated (non-read-only) call (also needs ODOO_WRITES_ENABLED=1)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview payload without calling the server (never mutates, bypasses all gates)")
+	cmd.Flags().BoolVar(&yes, "yes", false, "confirm a gated write (also needs ODOO_WRITES_ENABLED=1, a writable instance, and human-at-TTY confirmation)")
 	return cmd
-}
-
-// callIsReadOnly reports whether method is on the read-only allowlist and
-// therefore exempt from the confirmation gate. Comparison is
-// case-insensitive on the trimmed method name; everything else is gated.
-func callIsReadOnly(method string) bool {
-	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "search_read", "read", "search_count", "read_group", "fields_get",
-		"name_search", "check_access_rights", "version", "context_get":
-		return true
-	}
-	return false
 }
 
 func init() {

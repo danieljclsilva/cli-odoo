@@ -22,6 +22,8 @@ type Instance struct {
 	VerifySSL   bool   `mapstructure:"verify_ssl"`
 	TimeoutSecs int    `mapstructure:"timeout"`
 	Lang        string `mapstructure:"lang"`
+	ReadOnly    bool   `mapstructure:"readonly"`
+	AuditLog    string `mapstructure:"audit_log"`
 	IsDefault   bool   `mapstructure:"-"`
 	Name        string `mapstructure:"-"`
 }
@@ -64,12 +66,27 @@ func Load(cfgFile string) error {
 		// Default-deny TLS: unset verify_ssl/verify means verify (H2).
 		// Explicit false stays false (user-opt-in InsecureSkipVerify).
 		switch {
-		case v.IsSet("instances."+name+".verify_ssl"):
+		case v.IsSet("instances." + name + ".verify_ssl"):
 			// Unmarshalled value already correct.
-		case v.IsSet("instances."+name+".verify"):
+		case v.IsSet("instances." + name + ".verify"):
 			inst.VerifySSL = v.GetBool("instances." + name + ".verify")
 		default:
 			inst.VerifySSL = true
+		}
+
+		// Default-deny writes: read-only unless readonly:false is set
+		// explicitly in the file. ODOO_READONLY only tightens.
+		inst.ReadOnly = true
+		if v.IsSet("instances." + name + ".readonly") {
+			inst.ReadOnly = v.GetBool("instances." + name + ".readonly")
+		}
+		if readonlyEnvForces() {
+			inst.ReadOnly = true
+		}
+		if al := first(v.GetString("instances."+name+".audit_log"), v.GetString("audit_log"), os.Getenv("ODOO_AUDIT_LOG")); al != "" {
+			inst.AuditLog = al
+		} else {
+			inst.AuditLog = defaultAuditLog()
 		}
 		s.Instances[name] = inst
 	}
@@ -86,6 +103,13 @@ func Load(cfgFile string) error {
 		Lang:        first(v.GetString("lang"), v.GetString("locale"), os.Getenv("ODOO_LOCALE")),
 		VerifySSL:   true,
 		TimeoutSecs: 10,
+	}
+
+	env.ReadOnly = flatReadOnly(v)
+	if al := first(v.GetString("audit_log"), os.Getenv("ODOO_AUDIT_LOG")); al != "" {
+		env.AuditLog = al
+	} else {
+		env.AuditLog = defaultAuditLog()
 	}
 	if v.IsSet("verify_ssl") {
 		env.VerifySSL = v.GetBool("verify_ssl")
@@ -176,4 +200,46 @@ func first(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// readonlyEnvForces reports whether ODOO_READONLY tightens the instance to
+// read-only. Only 1/true/yes (case-insensitive) count; any other value is
+// ignored so the env gate can never loosen an explicit readonly:false.
+func readonlyEnvForces() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ODOO_READONLY"))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// flatReadOnly resolves the flat/env layout default-deny flag: read-only
+// unless the flat `readonly` key is set explicitly in the file.
+// v.IsSet covers both the file key and ODOO_READONLY via AutomaticEnv, so a
+// set-but-not-tightening env value is hidden while resolving the file-only
+// value (restored via defer); otherwise ODOO_READONLY=0 would loosen the
+// default. A tightening value forces read-only regardless of the file.
+func flatReadOnly(v *viper.Viper) bool {
+	if readonlyEnvForces() {
+		return true
+	}
+	if _, ok := os.LookupEnv("ODOO_READONLY"); ok {
+		val := os.Getenv("ODOO_READONLY")
+		_ = os.Unsetenv("ODOO_READONLY")
+		defer func() { _ = os.Setenv("ODOO_READONLY", val) }()
+	}
+	if v.IsSet("readonly") {
+		return v.GetBool("readonly")
+	}
+	return true
+}
+
+// defaultAuditLog is <defaultDir>/audit.log, or ./odoo-audit.log when no
+// home directory is available.
+func defaultAuditLog() string {
+	if dir := defaultDir(); dir != "" {
+		return filepath.Join(dir, "audit.log")
+	}
+	return filepath.Join(".", "odoo-audit.log")
 }

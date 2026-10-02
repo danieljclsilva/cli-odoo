@@ -41,12 +41,12 @@ func newChatterPostCmd() *cobra.Command {
 				output.Ok("chatter_post_preview", map[string]any{"model": model, "id": id, "kwargs": kwargs}, 0)
 				return
 			}
-			if err := safety.RequireConfirm(confirmed, false); err != nil {
+			inst, err := config.Resolve(InstanceName())
+			if err != nil {
 				output.Fail("chatter_post", err)
 				return
 			}
-			inst, err := config.Resolve(InstanceName())
-			if err != nil {
+			if err := safety.RequireWrite(inst, confirmed, false, "chatter_post:"+model+".message_post"); err != nil {
 				output.Fail("chatter_post", err)
 				return
 			}

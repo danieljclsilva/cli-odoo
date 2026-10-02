@@ -142,12 +142,12 @@ func newAttachmentAddCmd() *cobra.Command {
 				}, 0)
 				return
 			}
-			if err := safety.RequireConfirm(confirmed, false); err != nil {
+			inst, err := config.Resolve(InstanceName())
+			if err != nil {
 				output.Fail("attachment_add", err)
 				return
 			}
-			inst, err := config.Resolve(InstanceName())
-			if err != nil {
+			if err := safety.RequireWrite(inst, confirmed, false, "attachment_add:ir.attachment.create"); err != nil {
 				output.Fail("attachment_add", err)
 				return
 			}

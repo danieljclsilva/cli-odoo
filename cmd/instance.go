@@ -226,6 +226,7 @@ func newInstancesCmd() *cobra.Command {
 					"db":         inst.DB,
 					"username":   inst.Username,
 					"transport":  inst.Transport,
+					"readonly":   inst.ReadOnly,
 					"is_default": inst.IsDefault || n == config.DefaultName(),
 				})
 			}
@@ -238,18 +239,24 @@ func newLoginCmd() *cobra.Command {
 	var url, db, username, password, apiKey, transport, target string
 	var passwordStdin, apiKeyStdin bool
 	var timeout int
-	var verifySSL bool
+	var verifySSL, writable bool
 	c := &cobra.Command{
 		Use:   "login",
 		Short: "Save Odoo connection settings to the config file (mode 0600)",
 		Long: `Save connection settings to the config file (default ~/.config/odoo-cli/config.yaml, or --config path).
 
-The file keeps the odoo.example.yaml shape and is written with mode 0600.
-The secret is never printed. Verify with: odoo status
+	The file keeps the odoo.example.yaml shape and is written with mode 0600.
+	The secret is never printed. Verify with: odoo status
 
-Provide the secret via exactly one of --password (deprecated), --password-stdin,
---api-key, --api-key-stdin, or the ODOO_PASSWORD / ODOO_API_KEY environment.
-With none of those, the interactive prompt reads without echo.`,
+	Provide the secret via exactly one of --password (deprecated), --password-stdin,
+	--api-key, --api-key-stdin, or the ODOO_PASSWORD / ODOO_API_KEY environment.
+	With none of those, the interactive prompt reads without echo.
+
+	New instances are read-only by default (default-deny): writes are refused
+	unless the instance sets readonly:false. Pass --writable to save the
+	instance with readonly:false. Server-side, use a least-privilege Odoo user
+	(access rights / record rules) so the CLI gate is defense in depth, not
+	the only boundary.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "login"
 			if strings.TrimSpace(url) == "" {
@@ -342,6 +349,7 @@ With none of those, the interactive prompt reads without echo.`,
 				"transport":  tr,
 				"timeout":    timeout,
 				"verify_ssl": verifySSL,
+				"readonly":   !writable,
 			}
 			if secret != "" {
 				entry["password"] = secret
@@ -360,6 +368,7 @@ With none of those, the interactive prompt reads without echo.`,
 				"db":        entry["db"],
 				"username":  entry["username"],
 				"transport": tr,
+				"readonly":  !writable,
 			}, 1)
 		},
 	}
@@ -375,6 +384,7 @@ With none of those, the interactive prompt reads without echo.`,
 	c.Flags().StringVar(&target, "name", "", "save as a named instance (default: single-instance file)")
 	c.Flags().IntVar(&timeout, "timeout", 30, "request timeout in seconds")
 	c.Flags().BoolVar(&verifySSL, "verify-ssl", true, "verify TLS certificates")
+	c.Flags().BoolVar(&writable, "writable", false, "save with readonly:false (default saves readonly:true)")
 	return c
 }
 
@@ -414,7 +424,7 @@ func opsPackLoginSave(path, target string, entry map[string]any) (string, error)
 	} else if !os.IsNotExist(err) {
 		return "", fmt.Errorf("reading existing config %s: %w", path, err)
 	}
-	connKeys := []string{"url", "db", "username", "password", "api_key", "transport", "timeout", "verify_ssl", "verify", "lang", "locale"}
+	connKeys := []string{"url", "db", "username", "password", "api_key", "transport", "timeout", "verify_ssl", "verify", "lang", "locale", "readonly", "audit_log"}
 	instances, _ := doc["instances"].(map[string]any)
 	if target != "" || instances != nil {
 		if instances == nil {
