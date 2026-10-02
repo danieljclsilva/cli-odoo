@@ -42,9 +42,9 @@ func Load(cfgFile string) error {
 	v.SetConfigType("yaml")
 	if cfgFile != "" {
 		v.SetConfigFile(cfgFile)
-	} else {
-		v.AddConfigPath(defaultDir())
-		v.AddConfigPath(".")
+	} else if dir := defaultDir(); dir != "" {
+		// Home-dir config only: never auto-load ./config.yaml (M2).
+		v.AddConfigPath(dir)
 	}
 	v.SetEnvPrefix("ODOO")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -61,6 +61,16 @@ func Load(cfgFile string) error {
 	_ = v.Unmarshal(&file)
 	for name, inst := range file.Instances {
 		inst.Name = name
+		// Default-deny TLS: unset verify_ssl/verify means verify (H2).
+		// Explicit false stays false (user-opt-in InsecureSkipVerify).
+		switch {
+		case v.IsSet("instances."+name+".verify_ssl"):
+			// Unmarshalled value already correct.
+		case v.IsSet("instances."+name+".verify"):
+			inst.VerifySSL = v.GetBool("instances." + name + ".verify")
+		default:
+			inst.VerifySSL = true
+		}
 		s.Instances[name] = inst
 	}
 	s.Default = file.DefaultInstance
@@ -79,6 +89,8 @@ func Load(cfgFile string) error {
 	}
 	if v.IsSet("verify_ssl") {
 		env.VerifySSL = v.GetBool("verify_ssl")
+	} else if v.IsSet("verify") {
+		env.VerifySSL = v.GetBool("verify")
 	} else if v := os.Getenv("ODOO_VERIFY_SSL"); v != "" {
 		env.VerifySSL = v != "0" && !strings.EqualFold(v, "false")
 	}
@@ -152,7 +164,7 @@ func DefaultName() string {
 func defaultDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "."
+		return ""
 	}
 	return filepath.Join(home, ".config", "odoo-cli")
 }

@@ -61,7 +61,7 @@ via `--format json` (default); `--format table|yaml` renders for humans.
 
 | CLI command | What it does | mcp-odoo equivalent |
 |---|---|---|
-| `odoo login --url … --db … --username …` | Save connection settings to the 0600 config file (verify with `status`) | client config helpers |
+| `odoo login --url … --db … --username …` | Save connection settings to the 0600 config file (secret via `--password-stdin`/`--api-key-stdin`, env, or no-echo prompt; `--password` deprecated) | client config helpers |
 | `odoo status` / `odoo health` | Auth check + server version / transport + user (no secrets) | `health_check` |
 | `odoo instances` | Named-instance discovery (credentials never shown) | `list_instances` |
 | `odoo search <model>` | `search_read` with `--domain` (JSON array), `--fields` (CSV), `--limit/--offset/--order` | `search_records` |
@@ -110,7 +110,7 @@ Rules:
 - `--yes` confirms AND requires `ODOO_WRITES_ENABLED=1` in the environment.
 - Without both, the command refuses with a non-zero exit and a failure envelope.
 - Same gate applies to `create`, `unlink`, `chatter-post`, `attachment-add`,
-  and destructive `call` methods.
+  and every `call` method outside the read-only allowlist (`search_read`, `read`, `search_count`, `read_group`, `fields_get`, `name_search`, `check_access_rights`, `version`, `context_get`).
 
 ## Multi-instance
 

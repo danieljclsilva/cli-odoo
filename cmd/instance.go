@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 
 	"github.com/KomoriNoKage/cli-odoo/internal/config"
@@ -235,7 +236,7 @@ func newInstancesCmd() *cobra.Command {
 
 func newLoginCmd() *cobra.Command {
 	var url, db, username, password, apiKey, transport, target string
-	var passwordStdin bool
+	var passwordStdin, apiKeyStdin bool
 	var timeout int
 	var verifySSL bool
 	c := &cobra.Command{
@@ -244,7 +245,11 @@ func newLoginCmd() *cobra.Command {
 		Long: `Save connection settings to the config file (default ~/.config/odoo-cli/config.yaml, or --config path).
 
 The file keeps the odoo.example.yaml shape and is written with mode 0600.
-The secret is never printed. Verify with: odoo status`,
+The secret is never printed. Verify with: odoo status
+
+Provide the secret via exactly one of --password (deprecated), --password-stdin,
+--api-key, --api-key-stdin, or the ODOO_PASSWORD / ODOO_API_KEY environment.
+With none of those, the interactive prompt reads without echo.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "login"
 			if strings.TrimSpace(url) == "" {
@@ -259,8 +264,21 @@ The secret is never printed. Verify with: odoo status`,
 				output.Fail(tool, fmt.Errorf("missing --username"))
 				return
 			}
-			if password != "" && passwordStdin {
-				output.Fail(tool, fmt.Errorf("pass only one of --password or --password-stdin"))
+			nSet := 0
+			if password != "" {
+				nSet++
+			}
+			if passwordStdin {
+				nSet++
+			}
+			if strings.TrimSpace(apiKey) != "" {
+				nSet++
+			}
+			if apiKeyStdin {
+				nSet++
+			}
+			if nSet > 1 {
+				output.Fail(tool, fmt.Errorf("pass at most one of --password, --password-stdin, --api-key, --api-key-stdin"))
 				return
 			}
 			secret := password
@@ -272,23 +290,30 @@ The secret is never printed. Verify with: odoo status`,
 				}
 				secret = strings.TrimSpace(string(b))
 			}
+			if apiKeyStdin {
+				b, err := io.ReadAll(os.Stdin)
+				if err != nil {
+					output.Fail(tool, fmt.Errorf("reading API key from stdin: %w", err))
+					return
+				}
+				apiKey = strings.TrimSpace(string(b))
+			}
 			if secret == "" && strings.TrimSpace(apiKey) == "" {
 				if env := strings.TrimSpace(os.Getenv("ODOO_PASSWORD")); env != "" {
 					secret = env
 				} else if env := strings.TrimSpace(os.Getenv("ODOO_API_KEY")); env != "" {
 					apiKey = env
 				} else {
-					fmt.Fprint(os.Stderr, "Password: ")
-					line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-					if err != nil && err != io.EOF {
+					s, err := readSecretNoEcho("Password: ")
+					if err != nil {
 						output.Fail(tool, fmt.Errorf("reading password: %w", err))
 						return
 					}
-					secret = strings.TrimSpace(line)
+					secret = s
 				}
 			}
 			if secret == "" && strings.TrimSpace(apiKey) == "" {
-				output.Fail(tool, fmt.Errorf("no secret provided (use --password, --password-stdin, --api-key, or ODOO_PASSWORD/ODOO_API_KEY)"))
+				output.Fail(tool, fmt.Errorf("no secret provided (use --password-stdin, --api-key, --api-key-stdin, or ODOO_PASSWORD/ODOO_API_KEY)"))
 				return
 			}
 			tr := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(transport)), "-", "")
@@ -341,14 +366,37 @@ The secret is never printed. Verify with: odoo status`,
 	c.Flags().StringVar(&url, "url", "", "Odoo server URL (required)")
 	c.Flags().StringVar(&db, "db", "", "database name (required)")
 	c.Flags().StringVar(&username, "username", "", "login username (required)")
-	c.Flags().StringVar(&password, "password", "", "password (prefer --password-stdin)")
+	c.Flags().StringVar(&password, "password", "", "password (deprecated: use --password-stdin or ODOO_PASSWORD env)")
 	c.Flags().BoolVar(&passwordStdin, "password-stdin", false, "read password from stdin")
 	c.Flags().StringVar(&apiKey, "api-key", "", "API key instead of password")
+	c.Flags().BoolVar(&apiKeyStdin, "api-key-stdin", false, "read API key from stdin")
+	_ = c.Flags().MarkDeprecated("password", "use --password-stdin or ODOO_PASSWORD env")
 	c.Flags().StringVar(&transport, "transport", "xmlrpc", "transport: xmlrpc (Odoo 17 default) | json2 (Odoo 19+ opt-in)")
 	c.Flags().StringVar(&target, "name", "", "save as a named instance (default: single-instance file)")
 	c.Flags().IntVar(&timeout, "timeout", 30, "request timeout in seconds")
 	c.Flags().BoolVar(&verifySSL, "verify-ssl", true, "verify TLS certificates")
 	return c
+}
+
+// readSecretNoEcho prompts on stderr and reads a secret without echo when
+// stdin is a terminal; otherwise it falls back to a line read so piped
+// input keeps working.
+func readSecretNoEcho(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		b, err := term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }
 
 // opsPackLoginSave merges entry into the YAML config at path and writes it

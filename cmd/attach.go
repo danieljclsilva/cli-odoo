@@ -36,6 +36,7 @@ func maxAttachmentBytes() int {
 
 func newAttachmentGetCmd() *cobra.Command {
 	var out string
+	var force bool
 	c := &cobra.Command{
 		Use:   "attachment-get <id>",
 		Short: "Download an ir.attachment (base64 datas decoded to file)",
@@ -82,7 +83,13 @@ func newAttachmentGetCmd() *cobra.Command {
 				output.Fail("read_attachment", fmt.Errorf("decoding attachment %d datas: %w", id, err))
 				return
 			}
-			if err := os.WriteFile(out, raw, 0o644); err != nil {
+			if _, err := os.Stat(out); err == nil {
+				if !force {
+					output.Fail("read_attachment", fmt.Errorf("destination file %q already exists (use --force to overwrite)", out))
+					return
+				}
+			}
+			if err := os.WriteFile(out, raw, 0o600); err != nil {
 				output.Fail("read_attachment", err)
 				return
 			}
@@ -93,6 +100,7 @@ func newAttachmentGetCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&out, "out", "", "destination file path (required)")
+	c.Flags().BoolVar(&force, "force", false, "overwrite destination file if it exists")
 	_ = c.MarkFlagRequired("out")
 	return c
 }
@@ -106,6 +114,10 @@ func newAttachmentAddCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			model := args[0]
+			if err := rpCheckModel(model); err != nil {
+				output.Fail("attachment_add", err)
+				return
+			}
 			resID, err := strconv.Atoi(args[1])
 			if err != nil {
 				output.Fail("attachment_add", err)

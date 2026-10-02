@@ -38,6 +38,10 @@ func newCreateCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			model := args[0]
+			if err := rpCheckModel(model); err != nil {
+				output.Fail("create", err)
+				return
+			}
 			values, err := odoo.ParseJSONObj(valuesJSON)
 			if err != nil {
 				output.Fail("create", err)
@@ -85,6 +89,10 @@ func newWriteCmd() *cobra.Command {
 		Args:  cobra.MinimumNArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			model := args[0]
+			if err := rpCheckModel(model); err != nil {
+				output.Fail("write", err)
+				return
+			}
 			ids, err := parseRecordIDs(args[1:])
 			if err != nil {
 				output.Fail("write", err)
@@ -136,6 +144,10 @@ func newUnlinkCmd() *cobra.Command {
 		Args:  cobra.MinimumNArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			model := args[0]
+			if err := rpCheckModel(model); err != nil {
+				output.Fail("unlink", err)
+				return
+			}
 			ids, err := parseRecordIDs(args[1:])
 			if err != nil {
 				output.Fail("unlink", err)

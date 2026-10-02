@@ -24,6 +24,10 @@ func newChatterPostCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			model := args[0]
+			if err := rpCheckModel(model); err != nil {
+				output.Fail("chatter_post", err)
+				return
+			}
 			id, err := strconv.Atoi(args[1])
 			if err != nil {
 				output.Fail("chatter_post", err)

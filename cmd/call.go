@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"encoding/json"
+	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -12,6 +14,9 @@ import (
 	"github.com/KomoriNoKage/cli-odoo/internal/safety"
 )
 
+// callMethodRe validates Odoo method names: non-empty [A-Za-z0-9_]+.
+var callMethodRe = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
 func newCallCmd() *cobra.Command {
 	var argsJSON, kwargsJSON string
 	var dryRun, yes bool
@@ -20,8 +25,10 @@ func newCallCmd() *cobra.Command {
 		Short: "Call any Odoo model method (Odoo 17-safe ORM methods)",
 		Long: `Call an arbitrary Odoo model method via execute_kw.
 
-Destructive methods (create, write, unlink, *destructive*) require --yes
-plus ODOO_WRITES_ENABLED=1; preview the payload first with --dry-run.`,
+Default-deny: every method requires --yes plus ODOO_WRITES_ENABLED=1,
+except the read-only allowlist (search_read, read, search_count,
+read_group, fields_get, name_search, check_access_rights, version,
+context_get). Preview the payload first with --dry-run.`,
 		Args: cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			model, method := args[0], args[1]
@@ -37,6 +44,14 @@ plus ODOO_WRITES_ENABLED=1; preview the payload first with --dry-run.`,
 				output.Fail("call", err)
 				return
 			}
+			if err := rpCheckModel(model); err != nil {
+				output.Fail("call", err)
+				return
+			}
+			if !callMethodRe.MatchString(strings.TrimSpace(method)) {
+				output.Fail("call", fmt.Errorf("invalid method name %q: must match [A-Za-z0-9_]+", method))
+				return
+			}
 			if dryRun {
 				output.Ok("call", map[string]any{
 					"model":   model,
@@ -47,7 +62,7 @@ plus ODOO_WRITES_ENABLED=1; preview the payload first with --dry-run.`,
 				}, 0)
 				return
 			}
-			if callIsDestructive(method) {
+			if !callIsReadOnly(method) {
 				if err := safety.RequireConfirm(yes, dryRun); err != nil {
 					output.Fail("call", err)
 					return
@@ -73,19 +88,20 @@ plus ODOO_WRITES_ENABLED=1; preview the payload first with --dry-run.`,
 	}
 	cmd.Flags().StringVar(&argsJSON, "args-json", "", "positional args as JSON array (default [])")
 	cmd.Flags().StringVar(&kwargsJSON, "kwargs-json", "", "keyword args as JSON object (default {})")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the payload without calling Odoo")
-	cmd.Flags().BoolVar(&yes, "yes", false, "confirm a destructive call (also needs ODOO_WRITES_ENABLED=1)")
+	cmd.Flags().BoolVar(&yes, "yes", false, "confirm a gated (non-read-only) call (also needs ODOO_WRITES_ENABLED=1)")
 	return cmd
 }
 
-// callIsDestructive reports whether method mutates data and therefore
-// needs explicit confirmation.
-func callIsDestructive(method string) bool {
+// callIsReadOnly reports whether method is on the read-only allowlist and
+// therefore exempt from the confirmation gate. Comparison is
+// case-insensitive on the trimmed method name; everything else is gated.
+func callIsReadOnly(method string) bool {
 	switch strings.ToLower(strings.TrimSpace(method)) {
-	case "create", "write", "unlink":
+	case "search_read", "read", "search_count", "read_group", "fields_get",
+		"name_search", "check_access_rights", "version", "context_get":
 		return true
 	}
-	return strings.Contains(strings.ToLower(method), "destruct")
+	return false
 }
 
 func init() {

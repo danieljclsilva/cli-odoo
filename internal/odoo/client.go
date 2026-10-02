@@ -14,12 +14,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/kolo/xmlrpc"
 
 	"github.com/KomoriNoKage/cli-odoo/internal/config"
+)
+
+const (
+	maxJSONResponseBytes = 10 << 20
+	maxServerErrorChars  = 500
 )
 
 // Client talks to one Odoo instance.
@@ -184,7 +191,7 @@ func (c *Client) ServerVersion() (any, error) {
 		}
 		defer resp.Body.Close()
 		var out any
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		if err := decodeJSONCapped(resp.Body, &out); err != nil {
 			return nil, c.sanitizeErr(fmt.Errorf("odoo: version: %w", err))
 		}
 		return out, nil
@@ -208,15 +215,78 @@ func (c *Client) sanitizeErr(err error) error {
 		return nil
 	}
 	s := err.Error()
-	for _, sec := range []string{c.Password, c.APIKey, c.secret} {
-		if sec != "" {
-			s = strings.ReplaceAll(s, sec, "***")
+	seen := map[string]struct{}{}
+	var secrets []string
+	add := func(v string) {
+		if v == "" {
+			return
 		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		secrets = append(secrets, v)
+		if dec, derr := url.QueryUnescape(v); derr == nil && dec != "" && dec != v {
+			if _, ok := seen[dec]; !ok {
+				seen[dec] = struct{}{}
+				secrets = append(secrets, dec)
+			}
+		}
+		if dec, derr := url.PathUnescape(v); derr == nil && dec != "" && dec != v {
+			if _, ok := seen[dec]; !ok {
+				seen[dec] = struct{}{}
+				secrets = append(secrets, dec)
+			}
+		}
+		if enc := url.QueryEscape(v); enc != "" && enc != v {
+			if _, ok := seen[enc]; !ok {
+				seen[enc] = struct{}{}
+				secrets = append(secrets, enc)
+			}
+		}
+	}
+	for _, sec := range []string{c.Password, c.APIKey, c.secret} {
+		add(sec)
+	}
+	if u, uerr := url.Parse(c.URL); uerr == nil && u != nil && u.User != nil {
+		add(u.User.Username())
+		if pw, ok := u.User.Password(); ok {
+			add(pw)
+		}
+	}
+	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	for _, sec := range secrets {
+		s = strings.ReplaceAll(s, sec, "***")
 	}
 	if s == err.Error() {
 		return err
 	}
 	return errors.New(s)
+}
+
+// decodeJSONCapped decodes one JSON value while bounding how much of r
+// the decoder may consume. Oversized bodies fail instead of allocating
+// without bound.
+func decodeJSONCapped(r io.Reader, dst any) error {
+	lr := &io.LimitedReader{R: r, N: maxJSONResponseBytes + 1}
+	if err := json.NewDecoder(lr).Decode(dst); err != nil {
+		return err
+	}
+	if lr.N <= 0 {
+		return fmt.Errorf("odoo: response exceeds %d bytes", maxJSONResponseBytes)
+	}
+	return nil
+}
+
+// truncateServerError renders a server-provided error value capped at
+// maxServerErrorChars runes so error paths never echo unbounded bodies.
+func truncateServerError(v any) string {
+	s := fmt.Sprintf("%v", v)
+	r := []rune(s)
+	if len(r) > maxServerErrorChars {
+		return string(r[:maxServerErrorChars]) + "... (truncated)"
+	}
+	return s
 }
 
 func (c *Client) jsonCall(path string, payload any) (any, error) {
@@ -237,15 +307,20 @@ func (c *Client) jsonCall(path string, payload any) (any, error) {
 	}
 	defer resp.Body.Close()
 	var out any
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := decodeJSONCapped(resp.Body, &out); err != nil {
 		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s: bad status %d: %w", path, resp.StatusCode, err))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s: status %d: %v", path, resp.StatusCode, out))
+		if m, ok := out.(map[string]any); ok {
+			if e, ok := m["error"]; ok && e != nil {
+				return nil, c.sanitizeErr(fmt.Errorf("odoo: %s: status %d: %s", path, resp.StatusCode, truncateServerError(e)))
+			}
+		}
+		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s: request failed with status %d", path, resp.StatusCode))
 	}
 	if m, ok := out.(map[string]any); ok {
 		if e, ok := m["error"]; ok && e != nil {
-			return nil, c.sanitizeErr(fmt.Errorf("odoo: %s: %v", path, e))
+			return nil, c.sanitizeErr(fmt.Errorf("odoo: %s: %s", path, truncateServerError(e)))
 		}
 		if r, ok := m["result"]; ok {
 			return r, nil
