@@ -199,6 +199,9 @@ func newAgingCmd() *cobra.Command {
 			if limit <= 0 {
 				limit = 200
 			}
+			if limit > 1000 {
+				limit = 1000
+			}
 			client, _, err := opsPackClient()
 			if err != nil {
 				output.Fail(tool, err)

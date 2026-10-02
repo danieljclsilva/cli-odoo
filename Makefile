@@ -3,7 +3,7 @@ MODULE := github.com/danieljclsilva/cli-odoo
 VERSION ?= dev
 LDFLAGS := -s -w -X $(MODULE)/cmd.Version=$(VERSION)
 
-.PHONY: build test lint cross clean
+.PHONY: build test lint vuln cross clean
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o $(BINARY) .
@@ -14,8 +14,10 @@ test:
 lint:
 	go vet ./...
 
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
 # Cross-compile release binaries into dist/.
-# Covers macOS (amd64/arm64), Linux (amd64/arm64), Windows (amd64).
 cross:
 	mkdir -p dist
 	GOOS=darwin  GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-darwin-amd64 .

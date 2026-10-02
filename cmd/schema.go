@@ -22,6 +22,12 @@ Example:
 		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "list_models"
+			if limit <= 0 {
+				limit = 100
+			}
+			if limit > 1000 {
+				limit = 1000
+			}
 			domain := []any{}
 			if query != "" {
 				domain = []any{
@@ -42,7 +48,7 @@ Example:
 		},
 	}
 	c.Flags().StringVar(&query, "query", "", "case-insensitive substring filter on the model technical name")
-	c.Flags().IntVar(&limit, "limit", 100, "maximum models to return")
+	c.Flags().IntVar(&limit, "limit", 100, "maximum models to return (capped at 1000)")
 	return c
 }
 
@@ -90,9 +96,14 @@ func newRpSchemaCmd() *cobra.Command {
 Example:
   odoo schema --query sale --include-fields --limit 10
   odoo schema --models sale.order,res.partner`,
-		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "schema_catalog"
+			if limit <= 0 {
+				limit = 50
+			}
+			if limit > 500 {
+				limit = 500
+			}
 			var targets []string
 			if modelsStr != "" {
 				for _, m := range odoo.ParseCSV(modelsStr) {
@@ -171,7 +182,7 @@ Example:
 	c.Flags().StringVar(&query, "query", "", "case-insensitive substring filter on the model technical name")
 	c.Flags().StringVar(&modelsStr, "models", "", "comma-separated explicit models to catalog (skips ir.model lookup)")
 	c.Flags().BoolVar(&includeFields, "include-fields", false, "include full fields_get descriptors instead of field-name lists")
-	c.Flags().IntVar(&limit, "limit", 50, "maximum models to catalog")
+	c.Flags().IntVar(&limit, "limit", 50, "maximum models to catalog (capped at 500)")
 	return c
 }
 

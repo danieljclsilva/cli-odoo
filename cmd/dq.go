@@ -65,6 +65,10 @@ and duplicate values, client-side. Duplicate examples are capped at 10 per field
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "data_quality"
 			model := args[0]
+			if err := rpCheckModel(model); err != nil {
+				output.Fail(tool, err)
+				return
+			}
 			if limit <= 0 {
 				limit = 100
 			}
@@ -226,6 +230,10 @@ text fields that exist (name/display_name/email/phone), using only Odoo
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "search_knowledge"
 			model := args[0]
+			if err := rpCheckModel(model); err != nil {
+				output.Fail(tool, err)
+				return
+			}
 			q := strings.TrimSpace(query)
 			if q == "" {
 				output.Fail(tool, fmt.Errorf("missing --query"))

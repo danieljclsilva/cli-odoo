@@ -41,6 +41,10 @@ rights are not probed and no write is ever sent.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "diagnose_access"
 			model := args[0]
+			if err := rpCheckModel(model); err != nil {
+				output.Fail(tool, err)
+				return
+			}
 			client, _, err := opsPackClient()
 			if err != nil {
 				output.Fail(tool, err)
@@ -91,6 +95,10 @@ Returns a map of field name to type, target model, label, and flags.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "inspect_model_relationships"
 			model := args[0]
+			if err := rpCheckModel(model); err != nil {
+				output.Fail(tool, err)
+				return
+			}
 			client, _, err := opsPackClient()
 			if err != nil {
 				output.Fail(tool, err)

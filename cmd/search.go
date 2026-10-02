@@ -107,6 +107,15 @@ Example:
 			if err != nil {
 				output.Fail(tool, err)
 			}
+			if limit <= 0 {
+				limit = 50
+			}
+			if limit > 1000 {
+				limit = 1000
+			}
+			if offset < 0 {
+				offset = 0
+			}
 			kwargs := map[string]any{
 				"domain": domain,
 				"limit":  limit,
@@ -128,7 +137,7 @@ Example:
 	}
 	c.Flags().StringVar(&domainStr, "domain", "", "search domain as JSON array string, e.g. '[[\"name\",\"ilike\",\"acme\"]]'")
 	c.Flags().StringVar(&fieldsStr, "fields", "", "comma-separated fields to return (default: all)")
-	c.Flags().IntVar(&limit, "limit", 50, "maximum records to return")
+	c.Flags().IntVar(&limit, "limit", 50, "maximum records to return (capped at 1000)")
 	c.Flags().IntVar(&offset, "offset", 0, "records to skip")
 	c.Flags().StringVar(&order, "order", "", "sort order, e.g. 'name asc'")
 	return c

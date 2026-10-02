@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ import (
 
 const (
 	maxJSONResponseBytes = 10 << 20
+	maxXMLResponseBytes  = 10 << 20
 	maxServerErrorChars  = 500
 )
 
@@ -66,6 +68,57 @@ func IsReadOnlyMethod(method string) bool {
 	}
 }
 
+// isValidModelName reports whether model is a safe Odoo technical name
+// ([A-Za-z0-9._]+). Execute refuses anything else before any RPC so a
+// malicious or mistyped model can never become an XML-RPC parameter or a
+// json2 URL path segment.
+func isValidModelName(model string) bool {
+	if model == "" {
+		return false
+	}
+	for i := range model {
+		c := model[i]
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '.' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// isLoopbackHost reports whether host is a loopback address or name.
+// Only loopback ever defaults to cleartext HTTP; every other bare host
+// defaults to HTTPS (see normalizeURL).
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	// Strip an optional :port suffix, including bracketed IPv6 "[::1]:8069".
+	if strings.HasPrefix(h, "[") {
+		if i := strings.Index(h, "]:"); i >= 0 {
+			h = h[:i+1]
+		}
+	} else if strings.Count(h, ":") == 1 {
+		if i := strings.LastIndex(h, ":"); i >= 0 {
+			h = h[:i]
+		}
+	}
+	return h == "localhost" || strings.HasPrefix(h, "127.") ||
+		h == "::1" || h == "[::1]"
+}
+
+// warnCleartextHTTP warns when credentials are about to be sent over an
+// explicit non-loopback http:// URL. Bare hostnames already default to
+// https (see normalizeURL); only an explicit http:// scheme reaches here.
+func warnCleartextHTTP(base string) {
+	u, err := url.Parse(base)
+	if err != nil || u == nil || !strings.EqualFold(u.Scheme, "http") {
+		return
+	}
+	if isLoopbackHost(u.Host) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: Odoo URL %q uses cleartext HTTP; credentials are sent unencrypted (use https)\n", base)
+}
+
 // New connects to inst and validates credentials.
 // XML-RPC authenticates via /xmlrpc/2/common authenticate with
 // db/username/password-or-API-key. JSON-2 validates via
@@ -78,6 +131,7 @@ func New(inst *config.Instance) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	warnCleartextHTTP(base)
 	if strings.TrimSpace(inst.DB) == "" {
 		return nil, errors.New("no Odoo database configured (set ODOO_DB)")
 	}
@@ -161,6 +215,11 @@ func New(inst *config.Instance) (*Client, error) {
 // The client is read-only: only allowlisted read methods execute; any other
 // method is refused before any RPC is sent. There is no write path.
 func (c *Client) Execute(model, method string, args []any, kwargs map[string]any) (any, error) {
+	model = strings.TrimSpace(model)
+	method = strings.TrimSpace(method)
+	if !isValidModelName(model) {
+		return nil, fmt.Errorf("odoo: refusing model %q: must match [A-Za-z0-9._]+", model)
+	}
 	if !IsReadOnlyMethod(method) {
 		return nil, fmt.Errorf("odoo: refusing %s.%s: CLI is read-only (no write request is ever sent)", model, method)
 	}
@@ -185,7 +244,7 @@ func (c *Client) Execute(model, method string, args []any, kwargs map[string]any
 	}
 
 	if c.Transport == "json2" {
-		return c.jsonCall("/"+model+"/"+method, map[string]any{"args": args, "kwargs": kw})
+		return c.jsonCall("/"+url.PathEscape(model)+"/"+url.PathEscape(method), map[string]any{"args": args, "kwargs": kw})
 	}
 	var out any
 	params := []any{c.DB, c.uid, c.secret, model, method, args, kw}
@@ -348,8 +407,11 @@ func (c *Client) jsonCall(path string, payload any) (any, error) {
 	return out, nil
 }
 
-// normalizeURL trims and ensures a scheme. Bare hosts default to https,
-// except local names (localhost, LAN, extensionless) which use http.
+// normalizeURL trims and ensures a scheme. Bare hosts default to https;
+// only loopback names/addresses (localhost, 127.x, ::1) use http.
+// LAN (.local/.internal) and extensionless names stay on https: sending
+// credentials over cleartext outside loopback requires an explicit
+// http:// scheme (warned about in New).
 func normalizeURL(raw string) (string, error) {
 	s := strings.TrimSuffix(strings.TrimSpace(raw), "/")
 	if s == "" {
@@ -360,10 +422,7 @@ func normalizeURL(raw string) (string, error) {
 		if i := strings.Index(host, "/"); i >= 0 {
 			host = host[:i]
 		}
-		h := strings.ToLower(host)
-		if h == "localhost" || strings.HasPrefix(h, "127.") || h == "::1" ||
-			strings.HasPrefix(h, "[::1]") || strings.HasSuffix(h, ".local") ||
-			strings.HasSuffix(h, ".internal") || !strings.Contains(host, ".") {
+		if isLoopbackHost(host) {
 			s = "http://" + s
 		} else {
 			s = "https://" + s
@@ -407,8 +466,32 @@ func (t timeoutRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) 
 		cancel()
 		return nil, err
 	}
-	resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
+	// Bound XML-RPC bodies like the json2 path: hostile or huge server
+	// responses fail instead of decoding without bound.
+	resp.Body = &cancelBody{ReadCloser: &maxBytesReader{R: resp.Body, N: maxXMLResponseBytes + 1}, cancel: cancel}
 	return resp, nil
+}
+
+// maxBytesReader errors once more than N bytes are read.
+type maxBytesReader struct {
+	R io.ReadCloser
+	N int64
+}
+
+func (r *maxBytesReader) Read(p []byte) (int, error) {
+	if r.N <= 0 {
+		return 0, fmt.Errorf("odoo: response exceeds %d bytes", maxXMLResponseBytes)
+	}
+	if int64(len(p)) > r.N {
+		p = p[:r.N]
+	}
+	n, err := r.R.Read(p)
+	r.N -= int64(n)
+	return n, err
+}
+
+func (r *maxBytesReader) Close() error {
+	return r.R.Close()
 }
 
 // cancelBody releases the request context once the body is consumed.

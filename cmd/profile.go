@@ -27,7 +27,7 @@ func newProfileCmd() *cobra.Command {
 			}
 			modelRes, err := cl.Execute("ir.model", "search_read",
 				[]any{[]any{}, []any{"model", "name"}},
-				map[string]any{"limit": 100000, "order": "model asc"})
+				map[string]any{"limit": 10000, "order": "model asc"})
 			if err != nil {
 				output.Fail("profile", err)
 				return
@@ -37,6 +37,9 @@ func newProfileCmd() *cobra.Command {
 				limit := moduleLimit
 				if limit <= 0 {
 					limit = 1000
+				}
+				if limit > 5000 {
+					limit = 5000
 				}
 				modRes, err := cl.Execute("ir.module.module", "search_read",
 					[]any{[]any{[]any{"state", "=", "installed"}}, []any{"name", "shortdesc", "installed_version"}},

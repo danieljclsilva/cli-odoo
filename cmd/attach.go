@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -66,14 +67,45 @@ func newAttachmentGetCmd() *cobra.Command {
 				output.Fail("read_attachment", fmt.Errorf("decoding attachment %d datas: %w", id, err))
 				return
 			}
-			if _, err := os.Stat(out); err == nil {
+			if strings.TrimSpace(out) == "" {
+				output.Fail("read_attachment", fmt.Errorf("missing --out destination file path"))
+				return
+			}
+			// Refuse symlinks: Lstat (no follow) so a symlink at --out,
+			// swapped in between check and write, cannot redirect
+			// server-controlled bytes to an unintended target.
+			if fi, err := os.Lstat(out); err == nil {
+				if fi.Mode()&os.ModeSymlink != 0 {
+					output.Fail("read_attachment", fmt.Errorf("destination file %q is a symlink (refusing to follow)", out))
+					return
+				}
 				if !force {
 					output.Fail("read_attachment", fmt.Errorf("destination file %q already exists (use --force to overwrite)", out))
 					return
 				}
-			}
-			if err := os.WriteFile(out, raw, 0o600); err != nil {
+			} else if !os.IsNotExist(err) {
 				output.Fail("read_attachment", err)
+				return
+			}
+			var werr error
+			if !force {
+				// O_EXCL makes the create-or-fail atomic: no TOCTOU
+				// between the Lstat above and the write.
+				f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+				if err != nil {
+					output.Fail("read_attachment", err)
+					return
+				}
+				_, werr = f.Write(raw)
+				cerr := f.Close()
+				if werr == nil {
+					werr = cerr
+				}
+			} else {
+				werr = os.WriteFile(out, raw, 0o600)
+			}
+			if werr != nil {
+				output.Fail("read_attachment", werr)
 				return
 			}
 			name, _ := rec["name"].(string)

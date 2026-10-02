@@ -185,8 +185,10 @@ func Resolve(name string) (*Instance, error) {
 				if err != nil {
 					return nil, err
 				}
-				inst.Password = secret
-				return inst, nil
+				// Copy so the shared Settings never holds the secret.
+				out := *inst
+				out.Password = secret
+				return &out, nil
 			}
 		}
 		return nil, fmt.Errorf("no Odoo connection configured (run: odoo login --url <url> --db <db> --username <user>)")
@@ -207,7 +209,8 @@ func Resolve(name string) (*Instance, error) {
 }
 
 // ResolveNoAuth returns the instance connection fields without touching the
-// keychain. For login/logout bookkeeping only.
+// keychain. For login/logout bookkeeping only. The result is a copy: the
+// shared Settings never leaks secrets held by a concurrent Resolve caller.
 func ResolveNoAuth(name string) (*Instance, error) {
 	if active == nil {
 		return nil, fmt.Errorf("config not loaded")
@@ -218,7 +221,10 @@ func ResolveNoAuth(name string) (*Instance, error) {
 	if name == "" {
 		if len(active.Instances) == 1 {
 			for _, inst := range active.Instances {
-				return inst, nil
+				out := *inst
+				out.Password = ""
+				out.APIKey = ""
+				return &out, nil
 			}
 		}
 		return nil, fmt.Errorf("no Odoo connection configured")
@@ -227,15 +233,25 @@ func ResolveNoAuth(name string) (*Instance, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown instance %q", name)
 	}
-	return inst, nil
+	out := *inst
+	out.Password = ""
+	out.APIKey = ""
+	return &out, nil
 }
 
-// List returns all configured instances (secrets never attached).
+// List returns copies of all configured instances (secrets never attached).
 func List() map[string]*Instance {
 	if active == nil {
 		return nil
 	}
-	return active.Instances
+	out := make(map[string]*Instance, len(active.Instances))
+	for name, inst := range active.Instances {
+		cp := *inst
+		cp.Password = ""
+		cp.APIKey = ""
+		out[name] = &cp
+	}
+	return out
 }
 
 // LoggedIn reports whether a keychain secret exists for inst.
