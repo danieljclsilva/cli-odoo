@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/KomoriNoKage/cli-odoo/internal/output"
+	"github.com/danieljclsilva/cli-odoo/internal/output"
 )
 
 func init() {

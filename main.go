@@ -4,7 +4,7 @@ package main
 import (
 	"os"
 
-	"github.com/KomoriNoKage/cli-odoo/cmd"
+	"github.com/danieljclsilva/cli-odoo/cmd"
 )
 
 func main() {

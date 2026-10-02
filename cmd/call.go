@@ -8,10 +8,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/KomoriNoKage/cli-odoo/internal/config"
-	"github.com/KomoriNoKage/cli-odoo/internal/odoo"
-	"github.com/KomoriNoKage/cli-odoo/internal/output"
-	"github.com/KomoriNoKage/cli-odoo/internal/safety"
+	"github.com/danieljclsilva/cli-odoo/internal/config"
+	"github.com/danieljclsilva/cli-odoo/internal/odoo"
+	"github.com/danieljclsilva/cli-odoo/internal/output"
+	"github.com/danieljclsilva/cli-odoo/internal/safety"
 )
 
 // callMethodRe validates Odoo method names: non-empty [A-Za-z0-9_]+.

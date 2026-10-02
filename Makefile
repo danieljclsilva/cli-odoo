@@ -1,5 +1,5 @@
 BINARY := odoo
-MODULE := github.com/KomoriNoKage/cli-odoo
+MODULE := github.com/danieljclsilva/cli-odoo
 VERSION ?= dev
 LDFLAGS := -s -w -X $(MODULE)/cmd.Version=$(VERSION)
 

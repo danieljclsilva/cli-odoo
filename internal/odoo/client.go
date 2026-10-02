@@ -23,7 +23,7 @@ import (
 
 	"github.com/kolo/xmlrpc"
 
-	"github.com/KomoriNoKage/cli-odoo/internal/config"
+	"github.com/danieljclsilva/cli-odoo/internal/config"
 )
 
 const (

@@ -20,7 +20,7 @@ odoo.example.yaml        documented single + multi-instance config template
 Makefile / .goreleaser.yml / .github/workflows/ci.yml   build & release plumbing
 ```
 
-- Module path: `github.com/KomoriNoKage/cli-odoo`. Go 1.24.
+- Module path: `github.com/danieljclsilva/cli-odoo`. Go 1.24.
 - Deps: Cobra + Viper (+ `kolo/xmlrpc`, `yaml.v3`).
 
 ## Command registration pattern

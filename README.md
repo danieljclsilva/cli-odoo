@@ -21,7 +21,7 @@ for Odoo 19+ only and is never required for Odoo 17 paths. Only Odoo
 
 ```bash
 # Homebrew (once tapped / released)
-brew install KomoriNoKage/tap/cli-odoo
+brew install danieljclsilva/tap/cli-odoo
 
 # Or download a release binary from GitHub Releases and put it on PATH.
 # Or build from source (Go 1.24+):

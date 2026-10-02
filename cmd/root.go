@@ -6,8 +6,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	"github.com/KomoriNoKage/cli-odoo/internal/config"
-	"github.com/KomoriNoKage/cli-odoo/internal/output"
+	"github.com/danieljclsilva/cli-odoo/internal/config"
+	"github.com/danieljclsilva/cli-odoo/internal/output"
 )
 
 var (

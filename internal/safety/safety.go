@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/KomoriNoKage/cli-odoo/internal/config"
+	"github.com/danieljclsilva/cli-odoo/internal/config"
 )
 
 // WritesEnabled reports whether the env gate permits mutations.

@@ -1,4 +1,4 @@
-module github.com/KomoriNoKage/cli-odoo
+module github.com/danieljclsilva/cli-odoo
 
 go 1.24
 

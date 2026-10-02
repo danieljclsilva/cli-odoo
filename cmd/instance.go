@@ -13,9 +13,9 @@ import (
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 
-	"github.com/KomoriNoKage/cli-odoo/internal/config"
-	"github.com/KomoriNoKage/cli-odoo/internal/odoo"
-	"github.com/KomoriNoKage/cli-odoo/internal/output"
+	"github.com/danieljclsilva/cli-odoo/internal/config"
+	"github.com/danieljclsilva/cli-odoo/internal/odoo"
+	"github.com/danieljclsilva/cli-odoo/internal/output"
 )
 
 func init() {
