@@ -10,12 +10,11 @@ Odoo 17 compatible (XML-RPC); JSON-2 opt-in for 19+.
 main.go                  entrypoint: executes cmd.RootCmd
 cmd/root.go              RootCmd + global flags (--config/--format/--instance/--verbose) + InstanceName()
 cmd/version.go           `version` command (ldflags: -X <module>/cmd.Version=…)
-cmd/<slice>.go           one file per command slice (search, read, schema, write, …)
-internal/config/         Instance/Settings, Load(), Resolve(name), List(), DefaultName()
+cmd/<slice>.go           one file per command slice (search, read, schema, call, …)
+internal/config/         Instance/Settings, Load(), Resolve(name), ResolveNoAuth(name), List(), DefaultName(), LoggedIn()
 internal/output/         Format (json|table|yaml), Print(), Ok(tool,result,count), Fail(), Fatal()
-internal/safety/         WritesEnabled(), RequireConfirm(confirmed, dryRun)
-internal/odoo/           Client, New(*config.Instance), Execute(), ServerVersion(),
-                         UserContext(), ParseDomain/ParseCSV/ParseJSONObj helpers
+internal/odoo/           Client, New(*config.Instance), Execute() [read-only allowlist], ServerVersion(),
+                         UserContext(), IsReadOnlyMethod(), ParseDomain/ParseCSV/ParseJSONObj helpers
 odoo.example.yaml        documented single + multi-instance config template
 Makefile / .goreleaser.yml / .github/workflows/ci.yml   build & release plumbing
 ```
@@ -50,8 +49,8 @@ Rules:
 - Inherit global flags from root (`--instance`, `--format`); never redeclare them.
 - `--domain` takes a JSON array string; `--fields` takes CSV;
   `--limit/--offset/--order` for reads.
-- Writes: `--dry-run` previews, `--yes` confirms AND requires
-  `ODOO_WRITES_ENABLED=1` (enforced via `safety.RequireConfirm`).
+- Read-only: no command sends a write. `call` accepts allowlisted read methods
+  only. There are no `--yes`/`--dry-run` flags and no safety package.
 
 ## Contracts
 
@@ -61,12 +60,15 @@ Rules:
 - **Config** (`internal/config`): `config.Load(cfgFile)` runs in root's
   `PersistentPreRunE`. Resolve with `Resolve(cmd.InstanceName())` — flag >
   `ODOO_INSTANCE` > default. Env-only mode works (no file required).
-- **Safety** (`internal/safety`): mutating paths call
-  `RequireConfirm(confirmed, dryRun)`; dry-run previews never mutate.
+  Secrets live ONLY in the OS keychain (service `cli-odoo`); `Resolve`
+  attaches the keychain secret, `ResolveNoAuth` skips it (login/logout only).
+  File/env secret keys (`password:`, `api_key:`, `ODOO_PASSWORD`,
+  `ODOO_API_KEY`) do not exist and are ignored.
 - **Odoo client** (`internal/odoo`): XML-RPC default, JSON-2 opt-in for 19+.
-  Use only Odoo 17-safe ORM methods (`search_read`, `read`, `search_count`,
-  `read_group`, `fields_get`, `name_search`, `check_access_rights`,
-  `message_post`, `ir.attachment` `datas`). Never use 19+-only APIs
+  `Execute` refuses any non-allowlisted method before any RPC — there is no
+  write path. Use only read-only Odoo 17-safe ORM methods (`search_read`,
+  `read`, `search_count`, `read_group`, `fields_get`, `name_search`,
+  `check_access_rights`). Never use 19+-only APIs
   (e.g. `formatted_read_group`) without an XML-RPC fallback. Auth via
   `/xmlrpc/2/common` `authenticate`.
 
@@ -77,9 +79,8 @@ Rules:
 | Scaffold (scaffold/docs) | `.gitignore`, `README.md`, `AGENTS.md`, `Makefile`, `.goreleaser.yml`, `.github/workflows/ci.yml`, `odoo.example.yaml`, `LICENSE` |
 | Core client | `internal/odoo/*` |
 | Read pack | `cmd/search.go`, `cmd/read.go`, `cmd/schema.go` |
-| Write pack | `cmd/write.go`, `cmd/chatter.go`, `cmd/attach.go` |
-| Ops pack | `cmd/diag.go`, `cmd/acct.go`, `cmd/instance.go`, `cmd/call.go`, `cmd/profile.go` |
-| Shared (read-only) | `main.go`, `cmd/root.go`, `cmd/version.go`, `internal/config/*`, `internal/output/*`, `internal/safety/*`, `go.mod` |
+| Ops pack | `cmd/diag.go`, `cmd/acct.go`, `cmd/instance.go`, `cmd/call.go`, `cmd/profile.go`, `cmd/attach.go` (get only) |
+| Shared (read-only) | `main.go`, `cmd/root.go`, `cmd/version.go`, `internal/config/*`, `internal/output/*`, `go.mod` |
 
 Never touch another slice's files. Read shared contracts, do not edit them.
 Coordinate via hub before editing anything shared.

@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -12,26 +11,10 @@ import (
 	"github.com/danieljclsilva/cli-odoo/internal/config"
 	"github.com/danieljclsilva/cli-odoo/internal/odoo"
 	"github.com/danieljclsilva/cli-odoo/internal/output"
-	"github.com/danieljclsilva/cli-odoo/internal/safety"
 )
 
-const defaultMaxAttachmentBytes = 10 * 1024 * 1024
-
 func init() {
-	RootCmd.AddCommand(newAttachmentGetCmd(), newAttachmentAddCmd())
-}
-
-// maxAttachmentBytes reads the upload cap, defaulting to 10MB.
-func maxAttachmentBytes() int {
-	v := os.Getenv("ODOO_MCP_MAX_ATTACHMENT_UPLOAD_BYTES")
-	if v == "" {
-		return defaultMaxAttachmentBytes
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		return defaultMaxAttachmentBytes
-	}
-	return n
+	RootCmd.AddCommand(newAttachmentGetCmd())
 }
 
 func newAttachmentGetCmd() *cobra.Command {
@@ -102,78 +85,5 @@ func newAttachmentGetCmd() *cobra.Command {
 	c.Flags().StringVar(&out, "out", "", "destination file path (required)")
 	c.Flags().BoolVar(&force, "force", false, "overwrite destination file if it exists")
 	_ = c.MarkFlagRequired("out")
-	return c
-}
-
-func newAttachmentAddCmd() *cobra.Command {
-	var file, name string
-	var dryRun, confirmed bool
-	c := &cobra.Command{
-		Use:   "attachment-add <model> <res-id>",
-		Short: "Upload a file as ir.attachment (gated write, 10MB default cap)",
-		Args:  cobra.ExactArgs(2),
-		Run: func(cmd *cobra.Command, args []string) {
-			model := args[0]
-			if err := rpCheckModel(model); err != nil {
-				output.Fail("attachment_add", err)
-				return
-			}
-			resID, err := strconv.Atoi(args[1])
-			if err != nil {
-				output.Fail("attachment_add", err)
-				return
-			}
-			raw, err := os.ReadFile(file)
-			if err != nil {
-				output.Fail("attachment_add", err)
-				return
-			}
-			if cap := maxAttachmentBytes(); len(raw) > cap {
-				output.Fail("attachment_add", fmt.Errorf("file %d bytes exceeds cap %d bytes (ODOO_MCP_MAX_ATTACHMENT_UPLOAD_BYTES)", len(raw), cap))
-				return
-			}
-			if name == "" {
-				name = filepath.Base(file)
-			}
-			if dryRun {
-				output.Ok("attachment_add_preview", map[string]any{
-					"model": model, "res_id": resID, "name": name,
-					"file": file, "bytes": len(raw),
-				}, 0)
-				return
-			}
-			inst, err := config.Resolve(InstanceName())
-			if err != nil {
-				output.Fail("attachment_add", err)
-				return
-			}
-			if err := safety.RequireWrite(inst, confirmed, false, "attachment_add:ir.attachment.create"); err != nil {
-				output.Fail("attachment_add", err)
-				return
-			}
-			cl, err := odoo.New(inst)
-			if err != nil {
-				output.Fail("attachment_add", err)
-				return
-			}
-			vals := map[string]any{
-				"name":      name,
-				"datas":     base64.StdEncoding.EncodeToString(raw),
-				"res_model": model,
-				"res_id":    resID,
-			}
-			res, err := cl.Execute("ir.attachment", "create", []any{vals}, nil)
-			if err != nil {
-				output.Fail("attachment_add", err)
-				return
-			}
-			output.Ok("attachment_add", res, 0)
-		},
-	}
-	c.Flags().StringVar(&file, "file", "", "local file to upload (required)")
-	c.Flags().StringVar(&name, "name", "", "attachment name (default: file basename)")
-	c.Flags().BoolVar(&dryRun, "dry-run", false, "preview canonical payload without calling the server")
-	c.Flags().BoolVar(&confirmed, "yes", false, "confirm mutation (also requires ODOO_WRITES_ENABLED=1)")
-	_ = c.MarkFlagRequired("file")
 	return c
 }

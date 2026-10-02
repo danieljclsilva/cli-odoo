@@ -11,11 +11,11 @@ roundup for why Cobra is the boring, correct choice for Go CLIs — plus
 
 **Odoo 17 compatible (XML-RPC); JSON-2 opt-in for 19+.** XML-RPC is the
 default and primary transport. JSON-2 (`ODOO_TRANSPORT=json2`) is opt-in
-for Odoo 19+ only and is never required for Odoo 17 paths. Only Odoo
-17-safe ORM methods are used (`search_read`, `read`, `search_count`,
-`read_group`, `fields_get`, `name_search`, `check_access_rights`,
-`message_post`, `ir.attachment` `datas`) — never 19+-only APIs such as
-`formatted_read_group` without an XML-RPC fallback.
+for Odoo 19+ only and is never required for Odoo 17 paths. Only read-only
+Odoo 17-safe ORM methods are used (`search_read`, `read`, `search_count`,
+`read_group`, `fields_get`, `name_search`, `check_access_rights`) — never
+19+-only APIs such as `formatted_read_group` without an XML-RPC fallback.
+The CLI is read-only: no write request is ever sent.
 
 ## Install
 
@@ -30,26 +30,28 @@ go build -o odoo .
 
 ## Quickstart
 
-No config file needed — env vars are enough:
+The user logs in once; the secret lives in the OS keychain (service
+`cli-odoo`), never in the config file or env. Agents reuse that login
+without ever seeing the secret:
 
 ```bash
-export ODOO_URL=https://my-odoo.example.com
-export ODOO_DB=mydb
-export ODOO_USERNAME=admin
-export ODOO_PASSWORD='secret-or-api-key'
+# Human setup (interactive no-echo prompt; or pipe via --password-stdin):
+odoo login --url https://my-odoo.example.com --db mydb --username admin
+odoo status        # verify auth (server version + user, no secrets)
+odoo logout        # remove the keychain secret (config file untouched)
 
-# Log in / verify the connection (authenticates over /xmlrpc/2/common):
-odoo login
-
-# Find recent customers and show a human-readable table:
+# Agent reads (no credentials visible, none needed in env):
 odoo search res.partner \
-  --domain '[["customer_rank",">",0]]' \
+  --domain '[["is_company","=",true]]' \
   --fields name,email,phone \
   --limit 10 --order "create_date desc" \
   --format table
 ```
 
-Prefer a file? Copy `odoo.example.yaml` to
+No config file needed for the non-secret fields either — `ODOO_URL` /
+`ODOO_DB` / `ODOO_USERNAME` env vars work. The secret has no env or file
+form: `ODOO_PASSWORD` / `ODOO_API_KEY` and `password:` / `api_key:` keys are
+ignored. Prefer a file for the rest? Copy `odoo.example.yaml` to
 `~/.config/odoo-cli/config.yaml` (or pass `--config`) — it documents both
 the single-instance layout and the multi-instance layout (`instances:`
 map + `default_instance:`). Env vars always win over file values.
@@ -61,22 +63,21 @@ via `--format json` (default); `--format table|yaml` renders for humans.
 
 | CLI command | What it does | mcp-odoo equivalent |
 |---|---|---|
-| `odoo login --url … --db … --username …` | Save connection settings to the 0600 config file (secret via `--password-stdin`/`--api-key-stdin`, env, or no-echo prompt; `--password` deprecated) | client config helpers |
+| `odoo login --url … --db … --username …` | Save non-secret connection to the 0600 config file + store secret in OS keychain (via `--password-stdin` or no-echo prompt); verified against the server before storing | client config helpers |
+| `odoo logout [--name …]` | Remove the keychain secret (config file untouched) | client config helpers |
 | `odoo status` / `odoo health` | Auth check + server version / transport + user (no secrets) | `health_check` |
-| `odoo instances` | Named-instance discovery (credentials never shown) | `list_instances` |
+| `odoo instances` | Named-instance discovery (`logged_in`, never secrets) | `list_instances` |
 | `odoo search <model>` | `search_read` with `--domain` (JSON array), `--fields` (CSV), `--limit/--offset/--order` | `search_records` |
 | `odoo read <model> <id…>` | `read` records by ID with `--fields` | `read_record` |
 | `odoo models` | List registered models (`ir.model`) | `list_models` |
 | `odoo fields <model>` | `fields_get` field listing | `inspect_model` / `fields_get` |
 | `odoo schema` | Catalog models + field names (`--models`, `--query`, `--include-fields`) | `inspect_model` |
 | `odoo aggregate <model>` | `read_group` with `--groupby` + `--sum/--avg/--count` | aggregate helpers |
-| `odoo create <model>` / `write <model> <ids…>` / `unlink <model> <ids…>` | Gated mutations (see below) | approved `create`/`write`/`unlink` |
-| `odoo chatter-post <model> <id>` | Post to `mail.thread` chatter (`--body`, `--subtype`) | `chatter_post` |
-| `odoo attachment-add <model> <id>` / `attachment-get <id>` | Upload / download `ir.attachment` (`datas`) | attachment tools |
-| `odoo diagnose-access <model>` / `relations <model>` | Access-rights probe / relational-field map | `diagnose_odoo_call`, `diagnose_access` |
+| `odoo attachment-get <id>` | Download `ir.attachment` (`datas`) | attachment tools |
+| `odoo diagnose-access <model>` / `relations <model>` | Read-access probe / relational-field map | `diagnose_odoo_call`, `diagnose_access` |
 | `odoo aging` / `acct-health` | Receivable/payable aging, accounting health (`read_group`) | `receivable_payable_aging`, `accounting_health_summary` |
 | `odoo dq-check <model>` / `kb-search <model>` | Null/duplicate scan / fuzzy text search | data-quality helpers |
-| `odoo call <model> <method>` | Low-level `execute_kw` escape hatch | `execute_custom_method` |
+| `odoo call <model> <method>` | Read-only `execute_kw` escape hatch (allowlisted methods only) | `execute_custom_method` |
 | `odoo profile` | Installed models + modules | client config helpers |
 
 ## Output formats
@@ -90,69 +91,32 @@ odoo search res.partner --limit 5 --format yaml      # YAML
 JSON is the agent contract: parse `result` / `count`, check `success`.
 Table/YAML are for humans and never change the JSON shape.
 
-## Write gate
+## Read-only guarantee
 
-Writes never run silently. Every mutating command follows
-readonly check → confirm → TTY check → execute → audit:
+There is no write path. `Client.Execute` refuses any method outside the
+read-only allowlist (`search_read`, `read`, `search_count`, `read_group`,
+`fields_get`, `name_search`, `check_access_rights`, `version`,
+`context_get`) before any RPC is sent — including via `call`. The former
+`create`/`write`/`unlink`/`chatter-post`/`attachment-add` commands, the
+`--yes`/`--dry-run` flags, and the `internal/safety` TTY gate are gone:
+a pty-forged `YES` can no longer produce a write because no code path sends
+one.
 
-```bash
-# 1. Preview (never mutates, always allowed):
-odoo write res.partner 42 --values-json '{"phone":"+81-90-0000-0000"}' --dry-run
-
-# 2. Allow writes on the instance (default-deny: file/env instances are
-#    read-only unless readonly:false is set in the config file):
-#    instances:
-#      prod: {url: ..., db: ..., username: ..., readonly: false}
-#    Or at login time: odoo login --url ... --db ... --username ... --writable
-#    (ODOO_READONLY=1/true/yes can only tighten to read-only, never loosen.)
-
-# 3. Execute (requires ALL of the following):
-export ODOO_WRITES_ENABLED=1
-odoo write res.partner 42 --values-json '{"phone":"+81-90-0000-0000"}' --yes
-# Then type YES at the /dev/tty prompt when asked.
-```
-
-The chain, in order:
-
-1. **Read-only default** — instances refuse mutations unless `readonly: false`
-   is set explicitly in the config file. `ODOO_READONLY=1/true/yes` forces
-   read-only (tighten-only: `0`/`false` never loosen).
-2. **`--yes` + `ODOO_WRITES_ENABLED=1`** — the flag confirms intent and the
-   env var gates automation; without both, the command refuses with a
-   non-zero exit and a failure envelope.
-3. **Human-at-TTY confirmation** — a real controlling terminal (`/dev/tty`)
-   prompts `Type YES to confirm <op>: `; only an exact `YES` proceeds. Piped
-   stdin cannot feed it, and a headless sandbox without `/dev/tty` is
-   refused. `ODOO_ALLOW_NON_TTY=1` skips this step for human-owned CI only —
-   it is agent-abusable, so never enable it for agent runs.
-4. **Audit log** — every mutation attempt appends one JSON line (timestamp,
-   URL, db, user, model, method, truncated args, never secrets) to the
-   instance `audit_log` path (default `<defaultDir>/audit.log`). If the audit
-   write fails, the RPC is refused (fail closed). Reads are never logged.
-
-`call` uses the read-only allowlist (`search_read`, `read`, `search_count`,
-`read_group`, `fields_get`, `name_search`, `check_access_rights`, `version`,
-`context_get`): allowlisted methods run without confirmation, everything else
-follows the full chain above (`call:<model>.<method>`). The same gate applies
-to `create`, `write`, `unlink`, `chatter-post`, and `attachment-add`.
-
-Server-side, give the Odoo user least-privilege access rights / record rules:
-the CLI gate is defense in depth, not the only boundary. For unattended
-automation, keep a dedicated human-owned pipeline (with its own writable
-instance and `ODOO_ALLOW_NON_TTY=1`) separate from agent sandboxes — agents
-must always go through a human at a TTY.
+Server-side, still give the Odoo user least-privilege access rights /
+record rules: the CLI guarantee is defense in depth, not the only boundary.
 
 ## Multi-instance
 
 ```yaml
-# ~/.config/odoo-cli/config.yaml
+# ~/.config/odoo-cli/config.yaml (non-secret fields only; secrets in keychain)
 instances:
-  prod:    {url: https://odoo.example.com, db: prod, username: admin, password: x}
-  staging: {url: https://staging.example.com, db: staging, username: admin, api_key: y}
+  prod:    {url: https://odoo.example.com, db: prod, username: admin}
+  staging: {url: https://staging.example.com, db: staging, username: admin}
 default_instance: prod
 ```
 
 ```bash
+odoo login --name staging --url https://staging.example.com --db staging --username admin
 odoo --instance staging search sale.order --limit 5
 ODOO_INSTANCE=staging odoo search sale.order --limit 5
 ```

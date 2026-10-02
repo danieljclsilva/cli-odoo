@@ -23,7 +23,7 @@ var RootCmd = &cobra.Command{
 	Long: `odoo talks to any Odoo 16+ instance over XML-RPC (default) or JSON-2 (Odoo 19+).
 
 Every command emits stable JSON with --format json (default), or human tables
-with --format table. Writes are gated: preview first, then confirm explicitly.`,
+with --format table. The CLI is read-only: only read methods ever run.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {

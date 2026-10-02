@@ -1,22 +1,16 @@
 # Single-instance layout (simplest: one Odoo server).
 # Copy to config.yaml (~/.config/odoo-cli/config.yaml) or pass with --config,
-# or skip the file entirely and use ODOO_URL / ODOO_DB / ODOO_USERNAME /
-# ODOO_PASSWORD env vars instead.
+# or skip the file entirely and use ODOO_URL / ODOO_DB / ODOO_USERNAME env
+# vars instead. The file holds NON-SECRET fields only: the secret (API key or
+# password) lives in the OS keychain (service "cli-odoo") and is stored by
+# `odoo login`. File/env secret keys do not exist.
 url: https://odoo.example.com
 db: mydb
 username: admin
-password: changeme
-# api_key: <Odoo API key — preferred over password when set>
 transport: xmlrpc   # xmlrpc (default, Odoo 17 compatible) | json2 (opt-in, Odoo 19+ only)
 timeout: 30         # seconds
 verify_ssl: true
 lang: en_US         # also accepted as `locale`; env override: ODOO_LOCALE
-# readonly: true    # default-deny: file/env instances are read-only unless
-#                   # explicitly set to `readonly: false`. Env ODOO_READONLY
-#                   # can only tighten (1/true/yes force readonly; 0/false
-#                   # never loosen). Non-TTY escape hatch ODOO_ALLOW_NON_TTY=1
-#                   # is human-owned CI only (agent-abusable, never a default).
-# audit_log: ""     # mutation audit trail path (default <defaultDir>/audit.log)
 
 # --- Multi-instance layout (uncomment to use named instances) ---
 # instances:
@@ -24,21 +18,16 @@ lang: en_US         # also accepted as `locale`; env override: ODOO_LOCALE
 #     url: https://odoo.example.com
 #     db: prod
 #     username: admin
-#     password: changeme
 #     transport: xmlrpc
 #     timeout: 30
 #     verify_ssl: true
 #     lang: en_US
-#     readonly: true   # default-deny; set false only to allow writes
-#     audit_log: ""    # default <defaultDir>/audit.log
 #   staging:
 #     url: https://staging.example.com
 #     db: staging
 #     username: admin
-#     api_key: 0123456789abcdef
 #     transport: xmlrpc
 #     timeout: 30
 #     verify_ssl: true
 #     lang: en_US
-#     readonly: true
 # default_instance: prod

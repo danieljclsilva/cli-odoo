@@ -21,6 +21,7 @@ import (
 func init() {
 	RootCmd.AddCommand(newInstancesCmd())
 	RootCmd.AddCommand(newLoginCmd())
+	RootCmd.AddCommand(newLogoutCmd())
 	RootCmd.AddCommand(newStatusCmd())
 }
 
@@ -226,7 +227,7 @@ func newInstancesCmd() *cobra.Command {
 					"db":         inst.DB,
 					"username":   inst.Username,
 					"transport":  inst.Transport,
-					"readonly":   inst.ReadOnly,
+					"logged_in":  config.LoggedIn(inst),
 					"is_default": inst.IsDefault || n == config.DefaultName(),
 				})
 			}
@@ -236,27 +237,25 @@ func newInstancesCmd() *cobra.Command {
 }
 
 func newLoginCmd() *cobra.Command {
-	var url, db, username, password, apiKey, transport, target string
-	var passwordStdin, apiKeyStdin bool
+	var url, db, username, secret, transport, target string
+	var secretStdin bool
 	var timeout int
-	var verifySSL, writable bool
+	var verifySSL bool
 	c := &cobra.Command{
 		Use:   "login",
-		Short: "Save Odoo connection settings to the config file (mode 0600)",
-		Long: `Save connection settings to the config file (default ~/.config/odoo-cli/config.yaml, or --config path).
+		Short: "Save connection (no secret) and store the secret in the OS keychain",
+		Long: `Save non-secret connection fields to the config file (default ~/.config/odoo-cli/config.yaml, or --config path) and store the secret in the OS keychain (service "cli-odoo").
 
-	The file keeps the odoo.example.yaml shape and is written with mode 0600.
-	The secret is never printed. Verify with: odoo status
+	The file keeps the odoo.example.yaml shape, is written with mode 0600, and
+	never contains a secret. The secret is never printed. Verify with: odoo status
 
-	Provide the secret via exactly one of --password (deprecated), --password-stdin,
-	--api-key, --api-key-stdin, or the ODOO_PASSWORD / ODOO_API_KEY environment.
-	With none of those, the interactive prompt reads without echo.
+	Provide the secret via exactly one of --password-stdin (read an API key or
+	password from stdin) or the interactive no-echo prompt. File and env secret
+	sources do not exist: ODOO_PASSWORD / ODOO_API_KEY and password:/api_key:
+	config keys are ignored.
 
-	New instances are read-only by default (default-deny): writes are refused
-	unless the instance sets readonly:false. Pass --writable to save the
-	instance with readonly:false. Server-side, use a least-privilege Odoo user
-	(access rights / record rules) so the CLI gate is defense in depth, not
-	the only boundary.`,
+	The CLI is read-only: login stores no write privilege and there is no
+	writable mode.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "login"
 			if strings.TrimSpace(url) == "" {
@@ -271,56 +270,24 @@ func newLoginCmd() *cobra.Command {
 				output.Fail(tool, fmt.Errorf("missing --username"))
 				return
 			}
-			nSet := 0
-			if password != "" {
-				nSet++
-			}
-			if passwordStdin {
-				nSet++
-			}
-			if strings.TrimSpace(apiKey) != "" {
-				nSet++
-			}
-			if apiKeyStdin {
-				nSet++
-			}
-			if nSet > 1 {
-				output.Fail(tool, fmt.Errorf("pass at most one of --password, --password-stdin, --api-key, --api-key-stdin"))
-				return
-			}
-			secret := password
-			if passwordStdin {
+			if secretStdin {
 				b, err := io.ReadAll(os.Stdin)
 				if err != nil {
-					output.Fail(tool, fmt.Errorf("reading password from stdin: %w", err))
+					output.Fail(tool, fmt.Errorf("reading secret from stdin: %w", err))
 					return
 				}
 				secret = strings.TrimSpace(string(b))
 			}
-			if apiKeyStdin {
-				b, err := io.ReadAll(os.Stdin)
+			if secret == "" {
+				s, err := readSecretNoEcho("Odoo API key (or password): ")
 				if err != nil {
-					output.Fail(tool, fmt.Errorf("reading API key from stdin: %w", err))
+					output.Fail(tool, fmt.Errorf("reading secret: %w", err))
 					return
 				}
-				apiKey = strings.TrimSpace(string(b))
+				secret = s
 			}
-			if secret == "" && strings.TrimSpace(apiKey) == "" {
-				if env := strings.TrimSpace(os.Getenv("ODOO_PASSWORD")); env != "" {
-					secret = env
-				} else if env := strings.TrimSpace(os.Getenv("ODOO_API_KEY")); env != "" {
-					apiKey = env
-				} else {
-					s, err := readSecretNoEcho("Password: ")
-					if err != nil {
-						output.Fail(tool, fmt.Errorf("reading password: %w", err))
-						return
-					}
-					secret = s
-				}
-			}
-			if secret == "" && strings.TrimSpace(apiKey) == "" {
-				output.Fail(tool, fmt.Errorf("no secret provided (use --password-stdin, --api-key, --api-key-stdin, or ODOO_PASSWORD/ODOO_API_KEY)"))
+			if secret == "" {
+				output.Fail(tool, fmt.Errorf("no secret provided (use --password-stdin or the interactive prompt)"))
 				return
 			}
 			tr := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(transport)), "-", "")
@@ -349,16 +316,28 @@ func newLoginCmd() *cobra.Command {
 				"transport":  tr,
 				"timeout":    timeout,
 				"verify_ssl": verifySSL,
-				"readonly":   !writable,
-			}
-			if secret != "" {
-				entry["password"] = secret
-			} else {
-				entry["api_key"] = strings.TrimSpace(apiKey)
 			}
 			instName, err := opsPackLoginSave(path, strings.TrimSpace(target), entry)
 			if err != nil {
 				output.Fail(tool, err)
+				return
+			}
+			probe := &config.Instance{
+				Name:        instName,
+				URL:         strings.TrimSpace(url),
+				DB:          strings.TrimSpace(db),
+				Username:    strings.TrimSpace(username),
+				Password:    secret,
+				Transport:   tr,
+				VerifySSL:   verifySSL,
+				TimeoutSecs: timeout,
+			}
+			if _, err := odoo.New(probe); err != nil {
+				output.Fail(tool, fmt.Errorf("login verification failed: %w", err))
+				return
+			}
+			if err := probe.SaveSecret(secret); err != nil {
+				output.Fail(tool, fmt.Errorf("storing secret in keychain: %w", err))
 				return
 			}
 			output.Ok(tool, map[string]any{
@@ -368,23 +347,50 @@ func newLoginCmd() *cobra.Command {
 				"db":        entry["db"],
 				"username":  entry["username"],
 				"transport": tr,
-				"readonly":  !writable,
 			}, 1)
 		},
 	}
 	c.Flags().StringVar(&url, "url", "", "Odoo server URL (required)")
 	c.Flags().StringVar(&db, "db", "", "database name (required)")
 	c.Flags().StringVar(&username, "username", "", "login username (required)")
-	c.Flags().StringVar(&password, "password", "", "password (deprecated: use --password-stdin or ODOO_PASSWORD env)")
-	c.Flags().BoolVar(&passwordStdin, "password-stdin", false, "read password from stdin")
-	c.Flags().StringVar(&apiKey, "api-key", "", "API key instead of password")
-	c.Flags().BoolVar(&apiKeyStdin, "api-key-stdin", false, "read API key from stdin")
-	_ = c.Flags().MarkDeprecated("password", "use --password-stdin or ODOO_PASSWORD env")
+	c.Flags().BoolVar(&secretStdin, "password-stdin", false, "read API key or password from stdin")
 	c.Flags().StringVar(&transport, "transport", "xmlrpc", "transport: xmlrpc (Odoo 17 default) | json2 (Odoo 19+ opt-in)")
 	c.Flags().StringVar(&target, "name", "", "save as a named instance (default: single-instance file)")
 	c.Flags().IntVar(&timeout, "timeout", 30, "request timeout in seconds")
 	c.Flags().BoolVar(&verifySSL, "verify-ssl", true, "verify TLS certificates")
-	c.Flags().BoolVar(&writable, "writable", false, "save with readonly:false (default saves readonly:true)")
+	return c
+}
+
+func newLogoutCmd() *cobra.Command {
+	var target string
+	c := &cobra.Command{
+		Use:   "logout",
+		Short: "Remove the keychain secret for an instance (config file untouched)",
+		Run: func(cmd *cobra.Command, args []string) {
+			const tool = "logout"
+			inst, err := config.ResolveNoAuth(InstanceName())
+			if err != nil && target == "" {
+				output.Fail(tool, err)
+				return
+			}
+			if target != "" {
+				all := config.List()
+				var ok bool
+				inst, ok = all[target]
+				if !ok {
+					output.Fail(tool, fmt.Errorf("unknown instance %q", target))
+					return
+				}
+			}
+			name := inst.Name
+			if err := inst.DeleteSecret(); err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			output.Ok(tool, map[string]any{"instance": name, "logged_out": true}, 1)
+		},
+	}
+	c.Flags().StringVar(&target, "name", "", "named instance to log out (default: effective instance)")
 	return c
 }
 
@@ -424,7 +430,7 @@ func opsPackLoginSave(path, target string, entry map[string]any) (string, error)
 	} else if !os.IsNotExist(err) {
 		return "", fmt.Errorf("reading existing config %s: %w", path, err)
 	}
-	connKeys := []string{"url", "db", "username", "password", "api_key", "transport", "timeout", "verify_ssl", "verify", "lang", "locale", "readonly", "audit_log"}
+	connKeys := []string{"url", "db", "username", "transport", "timeout", "verify_ssl", "verify", "lang", "locale"}
 	instances, _ := doc["instances"].(map[string]any)
 	if target != "" || instances != nil {
 		if instances == nil {

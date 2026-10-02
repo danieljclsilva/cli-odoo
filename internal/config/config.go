@@ -1,5 +1,9 @@
-// Package config loads connection settings from env, flags, and an optional
-// YAML file with named instances (mirrors odoo_config.multi.json convention).
+// Package config loads connection settings. Non-secret connection fields
+// (url, db, username, transport, …) come from the YAML file or env.
+// Secrets (password / API key) live ONLY in the OS keychain under service
+// "cli-odoo" and account "<instance-url>|<db>|<username>"; they are never
+// read from files or environment variables. The CLI is read-only: there is
+// no writable instance flag and no write gate to loosen.
 package config
 
 import (
@@ -9,21 +13,24 @@ import (
 	"strings"
 
 	"github.com/spf13/viper"
+	"github.com/zalando/go-keyring"
 )
 
-// Instance holds one Odoo connection profile.
+// KeyringService is the OS keychain service name for all stored secrets.
+const KeyringService = "cli-odoo"
+
+// Instance holds one Odoo connection profile. Secrets are populated at
+// Resolve time from the OS keychain, never from file or env.
 type Instance struct {
 	URL         string `mapstructure:"url"`
 	DB          string `mapstructure:"db"`
 	Username    string `mapstructure:"username"`
-	Password    string `mapstructure:"password"`
-	APIKey      string `mapstructure:"api_key"`
+	Password    string `mapstructure:"-"`
+	APIKey      string `mapstructure:"-"`
 	Transport   string `mapstructure:"transport"` // xmlrpc (default) | json2
 	VerifySSL   bool   `mapstructure:"verify_ssl"`
 	TimeoutSecs int    `mapstructure:"timeout"`
 	Lang        string `mapstructure:"lang"`
-	ReadOnly    bool   `mapstructure:"readonly"`
-	AuditLog    string `mapstructure:"audit_log"`
 	IsDefault   bool   `mapstructure:"-"`
 	Name        string `mapstructure:"-"`
 }
@@ -37,7 +44,44 @@ type Settings struct {
 
 var active *Settings
 
-// Load reads config file + env into the active settings.
+// AccountName derives the keychain account for an instance identity.
+func AccountName(url, db, username string) string {
+	return strings.TrimSpace(url) + "|" + strings.TrimSpace(db) + "|" + strings.TrimSpace(username)
+}
+
+// account returns this instance's keychain account.
+func (inst *Instance) account() string {
+	return AccountName(inst.URL, inst.DB, inst.Username)
+}
+
+// SaveSecret stores secret in the OS keychain for this instance identity.
+func (inst *Instance) SaveSecret(secret string) error {
+	if strings.TrimSpace(inst.URL) == "" || strings.TrimSpace(inst.DB) == "" || strings.TrimSpace(inst.Username) == "" {
+		return fmt.Errorf("instance identity incomplete (need url, db, username)")
+	}
+	return keyring.Set(KeyringService, inst.account(), secret)
+}
+
+// DeleteSecret removes this instance identity's secret from the keychain.
+func (inst *Instance) DeleteSecret() error {
+	err := keyring.Delete(KeyringService, inst.account())
+	if err != nil && err != keyring.ErrNotFound {
+		return err
+	}
+	return nil
+}
+
+// loadSecret fetches this instance's secret from the OS keychain.
+func (inst *Instance) loadSecret() (string, error) {
+	secret, err := keyring.Get(KeyringService, inst.account())
+	if err != nil {
+		return "", fmt.Errorf("no keychain secret for %q (run: odoo login --url %s --db %s --username %s)", inst.Name, inst.URL, inst.DB, inst.Username)
+	}
+	return secret, nil
+}
+
+// Load reads non-secret connection fields from config file + env.
+// Secrets are never loaded here; Resolve pulls them from the keychain.
 func Load(cfgFile string) error {
 	v := viper.New()
 	v.SetConfigName("config")
@@ -63,6 +107,8 @@ func Load(cfgFile string) error {
 	_ = v.Unmarshal(&file)
 	for name, inst := range file.Instances {
 		inst.Name = name
+		inst.Password = ""
+		inst.APIKey = ""
 		// Default-deny TLS: unset verify_ssl/verify means verify (H2).
 		// Explicit false stays false (user-opt-in InsecureSkipVerify).
 		switch {
@@ -73,44 +119,21 @@ func Load(cfgFile string) error {
 		default:
 			inst.VerifySSL = true
 		}
-
-		// Default-deny writes: read-only unless readonly:false is set
-		// explicitly in the file. ODOO_READONLY only tightens.
-		inst.ReadOnly = true
-		if v.IsSet("instances." + name + ".readonly") {
-			inst.ReadOnly = v.GetBool("instances." + name + ".readonly")
-		}
-		if readonlyEnvForces() {
-			inst.ReadOnly = true
-		}
-		if al := first(v.GetString("instances."+name+".audit_log"), v.GetString("audit_log"), os.Getenv("ODOO_AUDIT_LOG")); al != "" {
-			inst.AuditLog = al
-		} else {
-			inst.AuditLog = defaultAuditLog()
-		}
 		s.Instances[name] = inst
 	}
 	s.Default = file.DefaultInstance
 
-	// Single-instance fallback from env / flat keys (mirrors odoo_config.json).
+	// Single-instance fallback from env / flat keys (non-secret fields only).
 	env := &Instance{
 		URL:         first(v.GetString("url"), os.Getenv("ODOO_URL")),
 		DB:          first(v.GetString("db"), os.Getenv("ODOO_DB")),
 		Username:    first(v.GetString("username"), os.Getenv("ODOO_USERNAME")),
-		Password:    first(v.GetString("password"), os.Getenv("ODOO_PASSWORD")),
-		APIKey:      first(v.GetString("api_key"), os.Getenv("ODOO_API_KEY")),
 		Transport:   first(v.GetString("transport"), os.Getenv("ODOO_TRANSPORT")),
 		Lang:        first(v.GetString("lang"), v.GetString("locale"), os.Getenv("ODOO_LOCALE")),
 		VerifySSL:   true,
 		TimeoutSecs: 10,
 	}
 
-	env.ReadOnly = flatReadOnly(v)
-	if al := first(v.GetString("audit_log"), os.Getenv("ODOO_AUDIT_LOG")); al != "" {
-		env.AuditLog = al
-	} else {
-		env.AuditLog = defaultAuditLog()
-	}
 	if v.IsSet("verify_ssl") {
 		env.VerifySSL = v.GetBool("verify_ssl")
 	} else if v.IsSet("verify") {
@@ -145,7 +168,8 @@ func Load(cfgFile string) error {
 	return nil
 }
 
-// Resolve returns the instance for name ("" = default). Errors if unconfigured.
+// Resolve returns the instance for name ("" = default) with its secret
+// attached from the OS keychain. Errors if unconfigured or not logged in.
 func Resolve(name string) (*Instance, error) {
 	if active == nil {
 		return nil, fmt.Errorf("config not loaded")
@@ -157,10 +181,47 @@ func Resolve(name string) (*Instance, error) {
 		// Single unnamed file instance convenience.
 		if len(active.Instances) == 1 {
 			for _, inst := range active.Instances {
+				secret, err := inst.loadSecret()
+				if err != nil {
+					return nil, err
+				}
+				inst.Password = secret
 				return inst, nil
 			}
 		}
-		return nil, fmt.Errorf("no Odoo connection configured (set ODOO_URL/ODOO_DB/ODOO_USERNAME/ODOO_PASSWORD or --config file)")
+		return nil, fmt.Errorf("no Odoo connection configured (run: odoo login --url <url> --db <db> --username <user>)")
+	}
+	inst, ok := active.Instances[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown instance %q", name)
+	}
+	secret, err := inst.loadSecret()
+	if err != nil {
+		return nil, err
+	}
+	// Copy so the shared Settings never holds the secret in memory longer
+	// than the caller's client lifetime.
+	out := *inst
+	out.Password = secret
+	return &out, nil
+}
+
+// ResolveNoAuth returns the instance connection fields without touching the
+// keychain. For login/logout bookkeeping only.
+func ResolveNoAuth(name string) (*Instance, error) {
+	if active == nil {
+		return nil, fmt.Errorf("config not loaded")
+	}
+	if name == "" {
+		name = active.Default
+	}
+	if name == "" {
+		if len(active.Instances) == 1 {
+			for _, inst := range active.Instances {
+				return inst, nil
+			}
+		}
+		return nil, fmt.Errorf("no Odoo connection configured")
 	}
 	inst, ok := active.Instances[name]
 	if !ok {
@@ -169,12 +230,21 @@ func Resolve(name string) (*Instance, error) {
 	return inst, nil
 }
 
-// List returns all configured instances (credentials redacted by caller).
+// List returns all configured instances (secrets never attached).
 func List() map[string]*Instance {
 	if active == nil {
 		return nil
 	}
 	return active.Instances
+}
+
+// LoggedIn reports whether a keychain secret exists for inst.
+func LoggedIn(inst *Instance) bool {
+	if inst == nil {
+		return false
+	}
+	_, err := keyring.Get(KeyringService, inst.account())
+	return err == nil
 }
 
 // DefaultName returns the default instance name (may be empty).
@@ -200,46 +270,4 @@ func first(vals ...string) string {
 		}
 	}
 	return ""
-}
-
-// readonlyEnvForces reports whether ODOO_READONLY tightens the instance to
-// read-only. Only 1/true/yes (case-insensitive) count; any other value is
-// ignored so the env gate can never loosen an explicit readonly:false.
-func readonlyEnvForces() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ODOO_READONLY"))) {
-	case "1", "true", "yes":
-		return true
-	default:
-		return false
-	}
-}
-
-// flatReadOnly resolves the flat/env layout default-deny flag: read-only
-// unless the flat `readonly` key is set explicitly in the file.
-// v.IsSet covers both the file key and ODOO_READONLY via AutomaticEnv, so a
-// set-but-not-tightening env value is hidden while resolving the file-only
-// value (restored via defer); otherwise ODOO_READONLY=0 would loosen the
-// default. A tightening value forces read-only regardless of the file.
-func flatReadOnly(v *viper.Viper) bool {
-	if readonlyEnvForces() {
-		return true
-	}
-	if _, ok := os.LookupEnv("ODOO_READONLY"); ok {
-		val := os.Getenv("ODOO_READONLY")
-		_ = os.Unsetenv("ODOO_READONLY")
-		defer func() { _ = os.Setenv("ODOO_READONLY", val) }()
-	}
-	if v.IsSet("readonly") {
-		return v.GetBool("readonly")
-	}
-	return true
-}
-
-// defaultAuditLog is <defaultDir>/audit.log, or ./odoo-audit.log when no
-// home directory is available.
-func defaultAuditLog() string {
-	if dir := defaultDir(); dir != "" {
-		return filepath.Join(dir, "audit.log")
-	}
-	return filepath.Join(".", "odoo-audit.log")
 }

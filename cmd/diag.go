@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -30,38 +29,29 @@ func opsPackCheckAccess(client *odoo.Client, model, operation string) (bool, err
 }
 
 func newDiagnoseAccessCmd() *cobra.Command {
-	var operation string
 	c := &cobra.Command{
 		Use:   "diagnose-access <model>",
-		Short: "Probe access rights for a model (check_access_rights + read probe)",
-		Long: `Probe access rights for a model using only Odoo 17-safe methods.
+		Short: "Probe read access for a model (check_access_rights + read probe)",
+		Long: `Probe read access for a model using only Odoo 17-safe read methods.
 
-Runs check_access_rights for read/write/create/unlink, then probes actual
-read access via fields_get and search_count.`,
+Runs check_access_rights for read, then probes actual read access via
+fields_get and search_count. The CLI is read-only: write/create/unlink
+rights are not probed and no write is ever sent.`,
 		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "diagnose_access"
 			model := args[0]
-			op := strings.ToLower(strings.TrimSpace(operation))
-			switch op {
-			case "read", "write", "create", "unlink":
-			default:
-				output.Fail(tool, fmt.Errorf("invalid --operation %q (want read|write|create|unlink)", operation))
-				return
-			}
 			client, _, err := opsPackClient()
 			if err != nil {
 				output.Fail(tool, err)
 				return
 			}
+			allowed, err := opsPackCheckAccess(client, model, "read")
 			rights := map[string]any{}
-			for _, o := range []string{"read", "write", "create", "unlink"} {
-				allowed, err := opsPackCheckAccess(client, model, o)
-				if err != nil {
-					rights[o] = map[string]any{"allowed": false, "error": err.Error()}
-					continue
-				}
-				rights[o] = map[string]any{"allowed": allowed}
+			if err != nil {
+				rights["read"] = map[string]any{"allowed": false, "error": err.Error()}
+			} else {
+				rights["read"] = map[string]any{"allowed": allowed}
 			}
 			probe := map[string]any{}
 			if fg, err := client.Execute(model, "fields_get", []any{[]any{}}, map[string]any{"attributes": []any{"string", "type"}}); err != nil {
@@ -78,20 +68,15 @@ read access via fields_get and search_count.`,
 			} else {
 				probe["search_count"] = map[string]any{"ok": false, "error": fmt.Sprintf("unexpected search_count response: %v", sc)}
 			}
-			allowed := false
-			if r, ok := rights[op].(map[string]any); ok {
-				allowed, _ = r["allowed"].(bool)
-			}
 			output.Ok(tool, map[string]any{
 				"model":     model,
-				"operation": op,
-				"allowed":   allowed,
+				"operation": "read",
+				"allowed":   allowed && err == nil,
 				"rights":    rights,
 				"probe":     probe,
 			}, 1)
 		},
 	}
-	c.Flags().StringVar(&operation, "operation", "read", "operation to check: read|write|create|unlink")
 	return c
 }
 
