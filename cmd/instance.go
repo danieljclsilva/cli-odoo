@@ -168,6 +168,9 @@ func opsPackPairID(v any) (id int64, name string, ok bool) {
 
 // opsPackOr builds a prefix-OR domain from single conditions.
 // Zero conditions yield an empty domain; one yields [cond].
+// N conditions yield N-1 "|" operators followed by the conditions:
+// ["|", "|", c0, c1, c2] for three. Verified against Odoo 17
+// expression.py: right-nested operand lists are rejected as leaves.
 func opsPackOr(conds []any) []any {
 	switch len(conds) {
 	case 0:
@@ -175,14 +178,11 @@ func opsPackOr(conds []any) []any {
 	case 1:
 		return []any{conds[0]}
 	}
-	var out any = conds[len(conds)-1]
-	for i := len(conds) - 2; i >= 0; i-- {
-		out = []any{"|", conds[i], out}
+	out := make([]any, 0, 2*len(conds)-1)
+	for range len(conds) - 1 {
+		out = append(out, "|")
 	}
-	if d, ok := out.([]any); ok {
-		return d
-	}
-	return []any{out}
+	return append(out, conds...)
 }
 
 // opsPackIDsFromNameSearch extracts ids from a name_search result
@@ -467,12 +467,12 @@ func newStatusCmd() *cobra.Command {
 				name = inst.Name
 			}
 			res := map[string]any{
-				"instance":      name,
-				"url":           inst.URL,
-				"db":            inst.DB,
-				"username":      inst.Username,
-				"transport":     inst.Transport,
-				"authenticated": true,
+				"instance":       name,
+				"url":            inst.URL,
+				"db":             inst.DB,
+				"username":       inst.Username,
+				"transport":      inst.Transport,
+				"authenticated":  true,
 				"server_version": ver,
 			}
 			if user, uerr := client.UserContext(); uerr != nil {

@@ -8,7 +8,7 @@ import (
 	"github.com/KomoriNoKage/cli-odoo/internal/output"
 )
 
-// Version is set at build time via -ldflags "-X main.version=...".
+// Version is set at build time via -ldflags "-X github.com/KomoriNoKage/cli-odoo/cmd.Version=…".
 var Version = "dev"
 
 func newVersionCmd() *cobra.Command {
@@ -22,7 +22,7 @@ func newVersionCmd() *cobra.Command {
 					v = info.Main.Version
 				}
 			}
-			output.Print(map[string]string{"version": v})
+			output.Ok("version", map[string]string{"version": v}, 0)
 		},
 	}
 }

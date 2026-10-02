@@ -13,17 +13,17 @@ import (
 
 // Instance holds one Odoo connection profile.
 type Instance struct {
-	URL          string `mapstructure:"url"`
-	DB           string `mapstructure:"db"`
-	Username     string `mapstructure:"username"`
-	Password     string `mapstructure:"password"`
-	APIKey       string `mapstructure:"api_key"`
-	Transport    string `mapstructure:"transport"` // xmlrpc (default) | json2
-	VerifySSL    bool   `mapstructure:"verify_ssl"`
-	TimeoutSecs  int    `mapstructure:"timeout"`
-	Lang         string `mapstructure:"lang"`
-	IsDefault    bool   `mapstructure:"-"`
-	Name         string `mapstructure:"-"`
+	URL         string `mapstructure:"url"`
+	DB          string `mapstructure:"db"`
+	Username    string `mapstructure:"username"`
+	Password    string `mapstructure:"password"`
+	APIKey      string `mapstructure:"api_key"`
+	Transport   string `mapstructure:"transport"` // xmlrpc (default) | json2
+	VerifySSL   bool   `mapstructure:"verify_ssl"`
+	TimeoutSecs int    `mapstructure:"timeout"`
+	Lang        string `mapstructure:"lang"`
+	IsDefault   bool   `mapstructure:"-"`
+	Name        string `mapstructure:"-"`
 }
 
 // Settings is the resolved runtime configuration.
@@ -73,7 +73,7 @@ func Load(cfgFile string) error {
 		Password:    first(v.GetString("password"), os.Getenv("ODOO_PASSWORD")),
 		APIKey:      first(v.GetString("api_key"), os.Getenv("ODOO_API_KEY")),
 		Transport:   first(v.GetString("transport"), os.Getenv("ODOO_TRANSPORT")),
-		Lang:        first(v.GetString("locale"), os.Getenv("ODOO_LOCALE")),
+		Lang:        first(v.GetString("lang"), v.GetString("locale"), os.Getenv("ODOO_LOCALE")),
 		VerifySSL:   true,
 		TimeoutSecs: 10,
 	}

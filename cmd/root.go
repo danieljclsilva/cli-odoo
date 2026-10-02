@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -59,9 +58,4 @@ func InstanceName() string {
 		return v
 	}
 	return ""
-}
-
-func fail(err error) {
-	fmt.Fprintf(os.Stderr, "error: %v\n", err)
-	os.Exit(1)
 }

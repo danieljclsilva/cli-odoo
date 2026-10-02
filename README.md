@@ -61,21 +61,23 @@ via `--format json` (default); `--format table|yaml` renders for humans.
 
 | CLI command | What it does | mcp-odoo equivalent |
 |---|---|---|
-| `odoo login` | Authenticate, print server version + uid | `health_check` / auth |
+| `odoo login --url … --db … --username …` | Save connection settings to the 0600 config file (verify with `status`) | client config helpers |
+| `odoo status` / `odoo health` | Auth check + server version / transport + user (no secrets) | `health_check` |
+| `odoo instances` | Named-instance discovery (credentials never shown) | `list_instances` |
 | `odoo search <model>` | `search_read` with `--domain` (JSON array), `--fields` (CSV), `--limit/--offset/--order` | `search_records` |
 | `odoo read <model> <id…>` | `read` records by ID with `--fields` | `read_record` |
-| `odoo schema <model>` | `fields_get` field listing | `inspect_model` / `fields_get` |
-| `odoo write create/update/delete <model>` | Gated mutations (see below) | approved `create`/`write`/`unlink` |
-| `odoo chatter post <model> <id>` | Post to `mail.thread` chatter | `chatter_post` |
-| `odoo attach <model> <id> <file>` | Upload `ir.attachment` (`datas`) | attachment tools |
-| `odoo diag <model>` | Diagnose a call / access rights | `diagnose_odoo_call`, `diagnose_access` |
-| `odoo acct …` | Receivable/payable aging, accounting health (`read_group`) | `receivable_payable_aging`, `accounting_health_summary` |
-| `odoo instance list/use` | Named-instance discovery and switching | `list_instances` |
+| `odoo models` | List registered models (`ir.model`) | `list_models` |
+| `odoo fields <model>` | `fields_get` field listing | `inspect_model` / `fields_get` |
+| `odoo schema` | Catalog models + field names (`--models`, `--query`, `--include-fields`) | `inspect_model` |
+| `odoo aggregate <model>` | `read_group` with `--groupby` + `--sum/--avg/--count` | aggregate helpers |
+| `odoo create <model>` / `write <model> <ids…>` / `unlink <model> <ids…>` | Gated mutations (see below) | approved `create`/`write`/`unlink` |
+| `odoo chatter-post <model> <id>` | Post to `mail.thread` chatter (`--body`, `--subtype`) | `chatter_post` |
+| `odoo attachment-add <model> <id>` / `attachment-get <id>` | Upload / download `ir.attachment` (`datas`) | attachment tools |
+| `odoo diagnose-access <model>` / `relations <model>` | Access-rights probe / relational-field map | `diagnose_odoo_call`, `diagnose_access` |
+| `odoo aging` / `acct-health` | Receivable/payable aging, accounting health (`read_group`) | `receivable_payable_aging`, `accounting_health_summary` |
+| `odoo dq-check <model>` / `kb-search <model>` | Null/duplicate scan / fuzzy text search | data-quality helpers |
 | `odoo call <model> <method>` | Low-level `execute_kw` escape hatch | `execute_custom_method` |
-| `odoo profile …` | Saved connection/profile helpers | client config helpers |
-
-Global flags (inherited from root): `--instance` (named instance),
-`--format json|table|yaml`, `--config`, `--verbose`.
+| `odoo profile` | Installed models + modules | client config helpers |
 
 ## Output formats
 
@@ -95,11 +97,11 @@ preview → confirm → execute:
 
 ```bash
 # 1. Preview (never mutates, always allowed):
-odoo write update res.partner 42 --values '{"phone":"+81-90-0000-0000"}' --dry-run
+odoo write res.partner 42 --values-json '{"phone":"+81-90-0000-0000"}' --dry-run
 
 # 2. Execute (requires BOTH the flag AND the env gate):
 export ODOO_WRITES_ENABLED=1
-odoo write update res.partner 42 --values '{"phone":"+81-90-0000-0000"}' --yes
+odoo write res.partner 42 --values-json '{"phone":"+81-90-0000-0000"}' --yes
 ```
 
 Rules:
@@ -107,7 +109,8 @@ Rules:
 - `--dry-run` previews the exact payload and bypasses all gates.
 - `--yes` confirms AND requires `ODOO_WRITES_ENABLED=1` in the environment.
 - Without both, the command refuses with a non-zero exit and a failure envelope.
-- Same gate applies to `chatter post`, `attach`, and destructive `acct` actions.
+- Same gate applies to `create`, `unlink`, `chatter-post`, `attachment-add`,
+  and destructive `call` methods.
 
 ## Multi-instance
 

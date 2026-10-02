@@ -267,21 +267,14 @@ text fields that exist (name/display_name/email/phone), using only Odoo
 			for _, f := range textFields {
 				conds = append(conds, []any{f, "ilike", q})
 			}
-			domain := opsPackOr(conds)
 			if len(nsIDs) > 0 {
 				idsAny := make([]any, 0, len(nsIDs))
 				for _, id := range nsIDs {
 					idsAny = append(idsAny, id)
 				}
-				if len(domain) == 0 {
-					domain = []any{[]any{"id", "in", idsAny}}
-				} else {
-					combined := make([]any, 0, len(domain)+2)
-					combined = append(combined, "|", []any{"id", "in", idsAny})
-					combined = append(combined, domain...)
-					domain = combined
-				}
+				conds = append([]any{[]any{"id", "in", idsAny}}, conds...)
 			}
+			domain := opsPackOr(conds)
 			if len(domain) == 0 {
 				output.Ok(tool, map[string]any{"model": model, "query": q, "results": []any{}}, 0)
 				return
@@ -300,7 +293,8 @@ text fields that exist (name/display_name/email/phone), using only Odoo
 				}
 				kwargs["fields"] = fa
 			}
-			sr, err := client.Execute(model, "search_read", []any{domain}, kwargs)
+			kwargs["domain"] = domain
+			sr, err := client.Execute(model, "search_read", nil, kwargs)
 			if err != nil {
 				output.Fail(tool, err)
 				return
