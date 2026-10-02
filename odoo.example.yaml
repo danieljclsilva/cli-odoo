@@ -1,0 +1,35 @@
+# Single-instance layout (simplest: one Odoo server).
+# Copy to config.yaml (~/.config/odoo-cli/config.yaml) or pass with --config,
+# or skip the file entirely and use ODOO_URL / ODOO_DB / ODOO_USERNAME /
+# ODOO_PASSWORD env vars instead.
+url: https://odoo.example.com
+db: mydb
+username: admin
+password: changeme
+# api_key: <Odoo API key — preferred over password when set>
+transport: xmlrpc   # xmlrpc (default, Odoo 17 compatible) | json2 (opt-in, Odoo 19+ only)
+timeout: 30         # seconds
+verify_ssl: true
+lang: en_US         # also accepted as `locale`; env override: ODOO_LOCALE
+
+# --- Multi-instance layout (uncomment to use named instances) ---
+# instances:
+#   prod:
+#     url: https://odoo.example.com
+#     db: prod
+#     username: admin
+#     password: changeme
+#     transport: xmlrpc
+#     timeout: 30
+#     verify_ssl: true
+#     lang: en_US
+#   staging:
+#     url: https://staging.example.com
+#     db: staging
+#     username: admin
+#     api_key: 0123456789abcdef
+#     transport: xmlrpc
+#     timeout: 30
+#     verify_ssl: true
+#     lang: en_US
+# default_instance: prod

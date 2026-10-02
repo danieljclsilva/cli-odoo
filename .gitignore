@@ -1,0 +1,36 @@
+# Binaries and build output
+odoo
+odoo.exe
+cli-odoo
+/dist/
+/bin/
+
+# Windows binaries
+*.exe
+
+# Local config (may contain credentials) — never commit
+config.yaml
+.env
+.env.*
+*.local.yaml
+odoo.yaml
+!odoo.example.yaml
+
+# Go test/coverage artifacts
+coverage.out
+coverage.html
+coverage.txt
+*.coverprofile
+*.test
+
+# Go build cache leftovers
+*.o
+*.a
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
