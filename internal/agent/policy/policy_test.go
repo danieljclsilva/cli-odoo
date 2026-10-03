@@ -38,8 +38,9 @@ func testSchemaView() testSchema {
 
 func validPolicy() *Policy {
 	return &Policy{
-		Version:  1,
-		Instance: "prod",
+		Version:        PolicyVersion,
+		Instance:       "prod",
+		SnapshotSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		Operations: map[Operation]bool{
 			OpSearch: true, OpRead: true, OpCount: true,
 			OpAggregate: true, OpMeta: true,
@@ -79,15 +80,26 @@ func TestZeroPolicyDenies(t *testing.T) {
 	}
 	for _, p := range []*Policy{
 		{},
-		{Version: 1, Instance: "prod"},
+		{Version: PolicyVersion, Instance: "prod"},
 		func() *Policy { p := validPolicy(); p.Version = 0; return p }(),
+		func() *Policy { p := validPolicy(); p.Version = PolicyVersion + 1; return p }(),
+		func() *Policy { p := validPolicy(); p.SnapshotSHA256 = ""; return p }(),
+		func() *Policy { p := validPolicy(); p.SnapshotSHA256 = "not-hex"; return p }(),
 		func() *Policy { p := validPolicy(); p.Instance = ""; return p }(),
 		func() *Policy { p := validPolicy(); p.Operations = nil; return p }(),
 		func() *Policy { p := validPolicy(); p.Models = nil; return p }(),
 		func() *Policy { p := validPolicy(); p.SharedRecords = "sometimes"; return p }(),
 		func() *Policy { p := validPolicy(); p.Budgets.MaxLimit = 0; return p }(),
+		func() *Policy { p := validPolicy(); p.Budgets.MaxCallsPerSession = -1; return p }(),
+		func() *Policy { p := validPolicy(); p.Budgets.MaxRowsPerSession = -1; return p }(),
 		func() *Policy { p := validPolicy(); p.Scope = CompanyScope{Enabled: []int{1}, Default: 1}; return p }(),
 		func() *Policy { p := validPolicy(); p.Scope = CompanyScope{Enabled: []int{1, 2}, Default: 9}; return p }(),
+		func() *Policy { p := validPolicy(); p.Scope = CompanyScope{Enabled: []int{1, 1}, Default: 1}; return p }(),
+		func() *Policy {
+			p := validPolicy()
+			p.Scope = CompanyScope{Enabled: []int{-1, 0}, Default: -1}
+			return p
+		}(),
 	} {
 		if d := p.Authorize(nil, validSearch()); d.Allow {
 			t.Fatalf("malformed policy allowed: %+v", d)
@@ -349,6 +361,15 @@ func TestValidateScopeAndCompanyDomain(t *testing.T) {
 	if err := ValidateScope(CompanyScope{Enabled: []int{1, 2}, Default: 9}); err == nil {
 		t.Fatal("default outside enabled must fail")
 	}
+	if err := ValidateScope(CompanyScope{Enabled: []int{1, 1}, Default: 1}); err == nil {
+		t.Fatal("duplicate scope [1,1] must fail")
+	}
+	if err := ValidateScope(CompanyScope{Enabled: []int{-1, 0}, Default: -1}); err == nil {
+		t.Fatal("non-positive scope [-1,0] must fail")
+	}
+	if err := ValidateScope(CompanyScope{Enabled: []int{0, 2}, Default: 2}); err == nil {
+		t.Fatal("zero id scope must fail")
+	}
 	frag, enforce := CompanyDomain(ModelRule{CompanyIndependent: true}, CompanyScope{Enabled: []int{1, 2}, Default: 1})
 	if frag != nil || enforce {
 		t.Fatalf("independent = (%v,%v), want (nil,false)", frag, enforce)
@@ -598,15 +619,22 @@ func TestValidateCentral(t *testing.T) {
 		mutate func(p *Policy)
 	}{
 		{"bad-version", func(p *Policy) { p.Version = 0 }},
+		{"future-version", func(p *Policy) { p.Version = PolicyVersion + 1 }},
+		{"missing-snapshot-binding", func(p *Policy) { p.SnapshotSHA256 = "" }},
+		{"malformed-snapshot-binding", func(p *Policy) { p.SnapshotSHA256 = "xyz" }},
 		{"bad-instance", func(p *Policy) { p.Instance = "" }},
 		{"empty-ops", func(p *Policy) { p.Operations = nil }},
 		{"empty-models", func(p *Policy) { p.Models = nil }},
 		{"unknown-shared", func(p *Policy) { p.SharedRecords = "sometimes" }},
 		{"bad-scope", func(p *Policy) { p.Scope = CompanyScope{Enabled: []int{1}, Default: 1} }},
+		{"duplicate-scope", func(p *Policy) { p.Scope = CompanyScope{Enabled: []int{1, 1}, Default: 1} }},
+		{"negative-scope", func(p *Policy) { p.Scope = CompanyScope{Enabled: []int{-1, 0}, Default: -1} }},
 		{"nonpositive-limit", func(p *Policy) { p.Budgets.MaxLimit = 0 }},
 		{"nonpositive-rows", func(p *Policy) { p.Budgets.MaxRowsPerCall = 0 }},
 		{"nonpositive-bytes", func(p *Policy) { p.Budgets.MaxResponseBytes = 0 }},
 		{"negative-offset", func(p *Policy) { p.Budgets.MaxOffset = -1 }},
+		{"negative-session-calls", func(p *Policy) { p.Budgets.MaxCallsPerSession = -2 }},
+		{"negative-session-rows", func(p *Policy) { p.Budgets.MaxRowsPerSession = -3 }},
 		{"contradictory-rule", func(p *Policy) {
 			p.Models["res.partner"] = ModelRule{Fields: []string{"name"}, CompanyField: "company_id", CompanyIndependent: true}
 		}},
@@ -671,22 +699,34 @@ func TestCompanylessFragment(t *testing.T) {
 	if !ok || len(leaf) != 3 || leaf[0] != "company_id" || leaf[1] != "in" {
 		t.Fatalf("scoped fragment shape = %#v", frag)
 	}
-	ids, ok := leaf[2].([]any)
-	if !ok || len(ids) != 2 {
+	scopedIDs, ok := leaf[2].([]any)
+	if !ok || len(scopedIDs) != 2 {
 		t.Fatalf("scoped fragment must carry BOTH enabled ids: %#v", frag)
 	}
-	// With the flag the fragment ORs in the companyless shape.
+	// With the flag the fragment is a FLAT three-element prefix expression
+	// ["|", leafIn, leafFalse] — not one nested ["|",...] list — so the
+	// broker's append-after-caller-domain ANDs correctly.
 	frag, enforce = CompanyDomain(ModelRule{CompanyField: "company_id", IncludeCompanyless: true}, scope)
-	if !enforce || len(frag) != 1 {
-		t.Fatalf("companyless = (%v,%v)", frag, enforce)
+	if !enforce || len(frag) != 3 {
+		t.Fatalf("companyless = (%v,%v), want 3 flat elements", frag, enforce)
 	}
-	or, ok := frag[0].([]any)
-	if !ok || len(or) != 3 || or[0] != "|" {
-		t.Fatalf("companyless fragment shape = %#v", frag)
+	if op, ok := frag[0].(string); !ok || op != "|" {
+		t.Fatalf("companyless prefix = %#v, want \"|\"", frag)
 	}
-	second, ok := or[2].([]any)
-	if !ok || len(second) != 3 || second[2] != false {
-		t.Fatalf("companyless OR-false branch = %#v", frag)
+	leafIn, ok := frag[1].([]any)
+	if !ok || len(leafIn) != 3 || leafIn[0] != "company_id" || leafIn[1] != "in" {
+		t.Fatalf("companyless leafIn = %#v", frag)
+	}
+	ids, ok := leafIn[2].([]any)
+	if !ok || len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+		t.Fatalf("companyless must carry BOTH enabled ids flat: %#v", frag)
+	}
+	leafFalse, ok := frag[2].([]any)
+	if !ok || len(leafFalse) != 3 || leafFalse[0] != "company_id" || leafFalse[1] != "=" || leafFalse[2] != false {
+		t.Fatalf("companyless OR-false branch = %#v, want [company_id = false]", frag)
+	}
+	if _, nested := frag[0].([]any); nested {
+		t.Fatalf("companyless fragment must be flat, got nested: %#v", frag)
 	}
 	// The companyless flag is admitted by Authorize on scoped models.
 	p := validPolicy()
@@ -711,6 +751,54 @@ func TestIndependentCompanyFieldContradiction(t *testing.T) {
 	r := Request{Operation: OpSearch, Model: "res.company", Fields: []string{"name"}, Limit: 5}
 	if d := p.Authorize(testSchemaView(), r); d.Allow {
 		t.Fatalf("independent with company field allowed: %+v", d)
+	}
+}
+
+func TestCompanyFieldValid(t *testing.T) {
+	schema := testSchemaView()
+	p := validPolicy()
+	// res.partner.company_id is many2one -> res.company: valid.
+	if err := p.CompanyFieldValid(schema, "res.partner"); err != nil {
+		t.Fatalf("company_id valid: %v", err)
+	}
+	// Non-company relation denies: partner_id points at res.partner.
+	bad := validPolicy()
+	bad.Models["res.partner"] = ModelRule{Fields: []string{"partner_id", "name"}, CompanyField: "partner_id"}
+	if err := bad.CompanyFieldValid(schema, "res.partner"); err == nil {
+		t.Fatal("non-company relation passed, want deny")
+	}
+	// Non-relational field denies: name has no relation.
+	bad.Models["res.partner"] = ModelRule{Fields: []string{"name"}, CompanyField: "name"}
+	if err := bad.CompanyFieldValid(schema, "res.partner"); err == nil {
+		t.Fatal("non-relational company field passed, want deny")
+	}
+	// Missing field denies; nil schema denies (unverifiable pre-credential).
+	bad.Models["res.partner"] = ModelRule{Fields: []string{"name"}, CompanyField: "company_id"}
+	if err := bad.CompanyFieldValid(testSchema{"res.partner": testModel{"name": {Name: "name", Type: "char"}}}, "res.partner"); err == nil {
+		t.Fatal("absent company field passed, want deny")
+	}
+	if err := p.CompanyFieldValid(nil, "res.partner"); err == nil {
+		t.Fatal("nil schema passed, want deny")
+	}
+	// Contradictory independent-with-field denies.
+	contra := validPolicy()
+	contra.Models["res.company"] = ModelRule{Fields: []string{"name"}, CompanyField: "company_id", CompanyIndependent: true}
+	if err := contra.CompanyFieldValid(schema, "res.company"); err == nil {
+		t.Fatal("contradictory rule passed CompanyFieldValid, want deny")
+	}
+	// Genuine independent without field passes trivially.
+	if err := p.CompanyFieldValid(schema, "res.company"); err != nil {
+		t.Fatalf("independent without field: %v", err)
+	}
+	// many2many company link also passes (company_ids multi-company).
+	m2m := validPolicy()
+	m2m.Models["res.partner"] = ModelRule{Fields: []string{"company_ids", "name"}, CompanyField: "company_ids"}
+	m2mSchema := testSchema{"res.partner": testModel{
+		"company_ids": {Name: "company_ids", Type: "many2many", Relation: "res.company"},
+		"name":        {Name: "name", Type: "char"},
+	}}
+	if err := m2m.CompanyFieldValid(m2mSchema, "res.partner"); err != nil {
+		t.Fatalf("company_ids many2many valid: %v", err)
 	}
 }
 

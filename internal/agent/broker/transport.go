@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/danieljclsilva/cli-odoo/internal/agent/policy"
+	"github.com/danieljclsilva/cli-odoo/internal/agent/snapshot"
 	"github.com/danieljclsilva/cli-odoo/internal/agent/workspace"
 	"github.com/danieljclsilva/cli-odoo/internal/config"
 	"github.com/danieljclsilva/cli-odoo/internal/odoo"
@@ -84,11 +85,23 @@ func checkLoopbackAddr(addr string) error {
 	return fmt.Errorf("broker: refusing non-loopback bind address %q (loopback only)", addr)
 }
 
+// PrivateAdminDir is the per-user private directory holding the admin unix
+// socket (e.g. /tmp/cli-odoo-agent-501 on Unix, keyed by euid so two users
+// never share it). ensurePrivateDir creates it 0700 and verifies ownership
+// before the admin listener binds. It is NOT the shared temp root itself:
+// passing os.TempDir() directly would fail closed on Linux (mode 1777) or,
+// worse, co-locate the socket with world-writable siblings.
+func PrivateAdminDir() string {
+	return filepath.Join(os.TempDir(), "cli-odoo-agent-"+adminDirSuffix())
+}
+
 // AdminSocketPath derives the deterministic admin unix-socket path for a
 // model listener addr (e.g. 127.0.0.1:8080 ->
-// $TMPDIR/cli-odoo-agent-127-0-0-1-8080.sock). The daemon creates it with
-// mode 0600; access control is filesystem-only (same-user posture, see
-// package header). Overridable via SetAdminSocket/--socket.
+// $TMPDIR/cli-odoo-agent-<user>/cli-odoo-agent-127-0-0-1-8080.sock). The
+// daemon creates the parent with ensurePrivateDir and the socket itself
+// with mode 0600; access control is filesystem-only (same-user posture, see
+// package header). Overridable via SetAdminSocket/--socket (still confined
+// to the serving admin dir resolved at Serve time).
 func AdminSocketPath(addr string) string {
 	var b strings.Builder
 	b.WriteString("cli-odoo-agent-")
@@ -101,10 +114,12 @@ func AdminSocketPath(addr string) string {
 		}
 	}
 	b.WriteString(".sock")
-	return filepath.Join(os.TempDir(), b.String())
+	return filepath.Join(PrivateAdminDir(), b.String())
 }
 
 // effectiveAdminSocket returns the override or the derived default.
+// Callers must still pass it through resolveAdminSocketPath so an explicit
+// --socket cannot escape the serving admin dir.
 func (b *Broker) effectiveAdminSocket(addr string) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -114,36 +129,259 @@ func (b *Broker) effectiveAdminSocket(addr string) string {
 	return AdminSocketPath(addr)
 }
 
+// maxServingFileBytes bounds every profile/snapshot file the serve boundary
+// loads before credential resolution (4 MiB, matching snapshot.MaxFileBytes;
+// malformed or over-cap input denies before secrets are touched).
+const maxServingFileBytes = 4 << 20
+
+// checkServeFile bounds one serve-boundary file load: it must be a regular
+// file, fit maxServingFileBytes, and read back at that bound. The caller
+// (Serve) runs this BEFORE credential resolution on every loading path.
+func checkServeFile(path string) ([]byte, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("broker: empty serving file path")
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("broker: serving file %q: %w", path, err)
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("broker: serving file %q is not a regular file", path)
+	}
+	if st.Size() > maxServingFileBytes {
+		return nil, fmt.Errorf("broker: serving file %q is %d bytes, over cap %d", path, st.Size(), maxServingFileBytes)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("broker: reading serving file %q: %w", path, err)
+	}
+	if int64(len(raw)) > maxServingFileBytes {
+		return nil, fmt.Errorf("broker: serving file %q is %d bytes, over cap %d", path, len(raw), maxServingFileBytes)
+	}
+	return raw, nil
+}
+
+// verifyServingDigest recomputes snapshot.CanonicalDigest(snap) and compares
+// it to the sealed policy binding BEFORE any credential resolves. A mismatch
+// (swapped, edited, or stale snapshot) denies; the daemon never serves an
+// unbound snapshot. The digest peer (snapshot slice) owns canonicalization;
+// the broker only compares.
+func verifyServingDigest(pol *policy.Policy, snap snapshot.Snapshot) error {
+	got, err := snapshot.CanonicalDigest(snap)
+	if err != nil {
+		return fmt.Errorf("broker: snapshot digest: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(pol.SnapshotSHA256)) {
+		return fmt.Errorf("broker: snapshot digest mismatch: sealed binding does not match loaded snapshot (re-seal via setup)")
+	}
+	return nil
+}
+
+// verifyCompanyFields runs policy.CompanyFieldValid for every allowlisted
+// model BEFORE credential resolution: scoped models must resolve their
+// CompanyField through the snapshot schema to a res.company
+// many2one/many2many relation, and contradictory independent-with-field
+// rules fail. Syntactically valid but semantically non-company fields deny
+// before secrets are touched.
+func verifyCompanyFields(pol *policy.Policy, snap snapshot.Snapshot) error {
+	for name := range pol.Models {
+		norm, ok := policy.NormalizeName(name)
+		if !ok {
+			return fmt.Errorf("broker: bad model name %q", name)
+		}
+		_ = norm
+		if err := pol.CompanyFieldValid(snap, name); err != nil {
+			return fmt.Errorf("broker: company field: %w", err)
+		}
+	}
+	return nil
+}
+
+// servingProtected collects the file/dir paths the workspace must be
+// confined against: the actual profile path, the actual snapshot path (or
+// the sealed policy's SnapshotPath when the serving override is empty), the
+// config dir, and the admin socket dir. Empty entries are dropped by
+// workspace.ValidateDedicatedDir anyway.
+func servingProtected(paths ServingPaths, pol *policy.Policy) []string {
+	snapPath := strings.TrimSpace(paths.SnapshotPath)
+	if snapPath == "" {
+		snapPath = strings.TrimSpace(pol.SnapshotPath)
+	}
+	return []string{
+		strings.TrimSpace(paths.ProfilePath),
+		snapPath,
+		strings.TrimSpace(paths.ConfigDir),
+		strings.TrimSpace(paths.AdminDir),
+	}
+}
+
+// resolveAdminSocketPath confines the effective admin socket path to the
+// serving admin dir: the parent dir is created 0700 if missing, and an
+// explicit override that escapes the dir denies. The returned path is the
+// only socket path Serve may bind or remove.
+func resolveAdminSocketPath(sockPath, adminDir string) (string, error) {
+	dir := strings.TrimSpace(adminDir)
+	if dir == "" {
+		dir = filepath.Dir(strings.TrimSpace(sockPath))
+	}
+	if err := ensurePrivateDir(dir); err != nil {
+		return "", err
+	}
+	absSock, err := filepath.Abs(sockPath)
+	if err != nil {
+		return "", fmt.Errorf("broker: admin socket path: %w", err)
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("broker: admin dir: %w", err)
+	}
+	rel, err := filepath.Rel(absDir, absSock)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("broker: admin socket %q escapes admin dir %q", sockPath, dir)
+	}
+	if filepath.Dir(absSock) != absDir {
+		return "", fmt.Errorf("broker: admin socket %q must sit directly in admin dir %q", sockPath, dir)
+	}
+	return absSock, nil
+}
+
+// ensurePrivateDir creates dir with 0700 when missing, then verifies it
+// resolves to a real directory owned by this uid with no group/other write
+// (0700-equivalent on Unix; Windows skips the mode check). Anything else
+// denies before the admin listener binds.
+func ensurePrivateDir(dir string) error {
+	if strings.TrimSpace(dir) == "" {
+		return fmt.Errorf("broker: empty admin dir")
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("broker: creating admin dir %q: %w", dir, err)
+	}
+	st, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("broker: admin dir %q: %w", dir, err)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("broker: admin dir %q is not a directory", dir)
+	}
+	if err := checkSocketOwner(st); err != nil {
+		return fmt.Errorf("broker: admin dir %q: %w", dir, err)
+	}
+	if st.Mode().Perm()&0077 != 0 {
+		return fmt.Errorf("broker: admin dir %q has mode %04o: group/other access refused", dir, st.Mode().Perm())
+	}
+	return nil
+}
+
+// removeOnlyOwnedSocket removes path ONLY when stat proves it is a unix
+// socket owned by this uid; anything else (regular file, dir, symlink,
+// foreign-owned) denies instead of unlinking. Stale-socket cleanup and
+// lifecycle teardown must go through this — never os.Remove on an arbitrary
+// --socket path. Missing path is a no-op so first boot succeeds.
+func removeOnlyOwnedSocket(path string) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("broker: admin socket %q: %w", path, err)
+	}
+	if st.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("broker: refusing to remove non-socket %q (mode %v)", path, st.Mode())
+	}
+	if err := checkSocketOwner(st); err != nil {
+		return fmt.Errorf("broker: refusing to remove foreign-owned socket %q: %w", path, err)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("broker: removing stale socket %q: %w", path, err)
+	}
+	return nil
+}
+
 // Serve binds the model listener on addr (loopback only) plus the admin
 // mux on a 0600 unix socket, and blocks. It resolves the keychain secret
 // and dials Odoo once here — never in New. No admin endpoints exist on the
 // TCP listener (typed tools + /healthz only).
 //
-// Serve re-validates the sealed policy and refuses to serve when the
-// snapshot disagrees with it (instance identity, exact enabled-company set
-// and default): a swapped or mismatched snapshot never reaches credential
-// resolution.
+// Serve order is load-bearing: BEFORE any credential resolves or any dial,
+// in order: (1) bounded profile+snapshot file checks (regular file,
+// <=4 MiB, on every loading path); (2) pol.Validate(); (3) recomputed
+// snapshot.CanonicalDigest(snap) vs pol.SnapshotSHA256 (mismatch denies);
+// (4) per-model CompanyFieldValid via the snapshot schema for scoped
+// models; (5) config Instance.Name == pol.Instance plus snapshot scope
+// match; (6) workspace.OpenValidated(wsDir, protected) where protected is
+// the actual profile path + snapshot path + config dir + admin socket dir.
+// Only then do credentials resolve, exec builds, and listeners bind.
 func (b *Broker) Serve(addr string) error {
 	if err := checkLoopbackAddr(addr); err != nil {
 		return err
 	}
 	b.mu.Lock()
 	pol := b.pol
-	b.mu.Unlock()
-	if err := pol.Validate(); err != nil {
-		return fmt.Errorf("broker: invalid policy: %w", err)
-	}
-	if err := b.checkScopeMatch(); err != nil {
-		return err
-	}
-	b.mu.Lock()
+	snap := b.snap
+	paths := b.paths
 	resolve := b.resolve
 	build := b.buildExec
 	instName := b.inst.Name
 	allowWS := b.pol.AllowWorkspace
 	wsDir := b.pol.WorkspaceDir
 	b.mu.Unlock()
+	// (1) Bounded serving-file loads first: reject over-cap/malformed
+	// profile and snapshot files before secrets are touched. Empty paths
+	// (in-process callers) skip the file check; the in-memory snap is
+	// still digest- and scope-checked below.
+	if strings.TrimSpace(paths.ProfilePath) != "" {
+		if _, err := checkServeFile(paths.ProfilePath); err != nil {
+			return err
+		}
+	}
+	snapPath := strings.TrimSpace(paths.SnapshotPath)
+	if snapPath == "" {
+		snapPath = strings.TrimSpace(pol.SnapshotPath)
+	}
+	if snapPath != "" {
+		if _, err := checkServeFile(snapPath); err != nil {
+			return err
+		}
+	}
+	// (2) Re-validate the sealed policy at serve time.
+	if err := pol.Validate(); err != nil {
+		return fmt.Errorf("broker: invalid policy: %w", err)
+	}
+	// (3) Digest binding: recompute and compare before credentials.
+	if err := verifyServingDigest(pol, snap); err != nil {
+		return err
+	}
+	// (4) Per-model company-field validity through the snapshot schema.
+	if err := verifyCompanyFields(pol, snap); err != nil {
+		return err
+	}
+	// (5) Instance + scope match (config name, snapshot instance/scope).
+	if err := b.checkScopeMatch(); err != nil {
+		return err
+	}
+	// Admin socket path: confined to the serving admin dir (override or
+	// derived default). Resolved BEFORE the workspace opens so the socket
+	// dir joins the protected set; bound AFTER credentials (below).
+	rawSock := b.effectiveAdminSocket(addr)
+	sockPath, err := resolveAdminSocketPath(rawSock, paths.AdminDir)
+	if err != nil {
+		return err
+	}
+	adminDir := filepath.Dir(sockPath)
+	// (6) Workspace opens validated against the real protected set.
+	if allowWS {
+		protected := servingProtected(paths, pol)
+		protected = append(protected, sockPath, adminDir)
+		ws, err := workspace.OpenValidated(wsDir, protected)
+		if err != nil {
+			return fmt.Errorf("broker: open workspace: %w", err)
+		}
+		b.mu.Lock()
+		b.ws = ws
+		b.mu.Unlock()
+	}
 
+	// Only now: resolve credentials and build exec.
 	resolved, err := resolve(instName)
 	if err != nil {
 		return fmt.Errorf("broker: resolve instance: %w", err)
@@ -157,25 +395,27 @@ func (b *Broker) Serve(addr string) error {
 	b.secrets = brokerSecrets(resolved)
 	b.mu.Unlock()
 
-	if allowWS {
-		ws, err := workspace.Open(wsDir)
-		if err != nil {
-			return fmt.Errorf("broker: open workspace: %w", err)
-		}
-		b.mu.Lock()
-		b.ws = ws
-		b.mu.Unlock()
+	// Stale-socket cleanup removes ONLY a proven-owned socket; an
+	// attacker-planted regular file at the path denies instead of unlinking.
+	if err := removeOnlyOwnedSocket(sockPath); err != nil {
+		return err
 	}
-
-	sockPath := b.effectiveAdminSocket(addr)
-	_ = os.Remove(sockPath) // stale socket from an unclean exit
 	adminLn, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return fmt.Errorf("broker: admin socket: %w", err)
 	}
+	// Chmod the actual listener socket 0600: umask-independent.
+	if err := os.Chmod(sockPath, 0600); err != nil {
+		_ = adminLn.Close()
+		_ = removeOnlyOwnedSocket(sockPath)
+		return fmt.Errorf("broker: admin socket mode: %w", err)
+	}
+	createdSock := true
 	defer func() {
 		_ = adminLn.Close()
-		_ = os.Remove(sockPath)
+		if createdSock {
+			_ = removeOnlyOwnedSocket(sockPath)
+		}
 	}()
 	adminErr := make(chan error, 1)
 	go func() {
@@ -200,12 +440,21 @@ func (b *Broker) Serve(addr string) error {
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
-	modelErr := modelSrv.ListenAndServe()
+	// Serve model+admin concurrently and propagate EITHER failure: an
+	// admin-listener failure never passes silently while the model
+	// listener keeps serving.
+	modelDone := make(chan error, 1)
+	go func() { modelDone <- modelSrv.ListenAndServe() }()
 	select {
 	case err := <-adminErr:
 		return fmt.Errorf("broker: admin socket: %w", err)
-	default:
-		return modelErr
+	case err := <-modelDone:
+		select {
+		case aerr := <-adminErr:
+			return fmt.Errorf("broker: admin socket: %w", aerr)
+		default:
+			return err
+		}
 	}
 }
 
@@ -226,6 +475,7 @@ func (b *Broker) modelMux() *http.ServeMux {
 	m.HandleFunc("/rpc/workspace/list", b.requirePost(b.handleWorkspaceList))
 	m.HandleFunc("/rpc/workspace/read", b.requirePost(b.handleWorkspaceRead))
 	m.HandleFunc("/rpc/workspace/write", b.requirePost(b.handleWorkspaceWrite))
+	m.HandleFunc("/rpc/workspace/mkdir", b.requirePost(b.handleWorkspaceMkdir))
 	return m
 }
 
@@ -243,7 +493,7 @@ func (b *Broker) adminMux() *http.ServeMux {
 func (b *Broker) requirePost(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			writeRPCError(w, http.StatusMethodNotAllowed, "method not allowed (POST only)")
+			b.writeError(w, r, http.StatusMethodNotAllowed, "method not allowed (POST only)")
 			return
 		}
 		h(w, r)
@@ -253,7 +503,7 @@ func (b *Broker) requirePost(h http.HandlerFunc) http.HandlerFunc {
 func (b *Broker) requireGet(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			writeRPCError(w, http.StatusMethodNotAllowed, "method not allowed (GET only)")
+			b.writeError(w, r, http.StatusMethodNotAllowed, "method not allowed (GET only)")
 			return
 		}
 		h(w, r)
@@ -261,8 +511,8 @@ func (b *Broker) requireGet(h http.HandlerFunc) http.HandlerFunc {
 }
 
 // handleHealthz is the only unauthenticated endpoint. No secret, no data.
-func (b *Broker) handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	writeRPCOK(w, map[string]any{"ok": true}, 0)
+func (b *Broker) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	b.writeEnvelope(w, r, "", map[string]any{"ok": true}, 0)
 }
 
 // bearerToken extracts the session token. Anything else => unknown token.
@@ -283,54 +533,57 @@ func bearerToken(r *http.Request) (string, error) {
 }
 
 // checkError maps session failures to HTTP status without echoing tokens.
-func checkError(w http.ResponseWriter, err error) bool {
+// Every branch routes through the single capped envelope writer so error
+// responses obey Budgets.MaxResponseBytes like success responses.
+func (b *Broker) checkError(w http.ResponseWriter, r *http.Request, err error) bool {
 	switch {
 	case err == nil:
 		return false
 	case errors.Is(err, ErrSessionUnknown), errors.Is(err, ErrSessionExpired):
-		writeRPCError(w, http.StatusUnauthorized, err.Error())
+		b.writeError(w, r, http.StatusUnauthorized, err.Error())
 	case errors.Is(err, ErrSessionBudget):
-		writeRPCError(w, http.StatusTooManyRequests, err.Error())
+		b.writeError(w, r, http.StatusTooManyRequests, err.Error())
 	default:
-		writeRPCError(w, http.StatusUnauthorized, ErrSessionUnknown.Error())
+		b.writeError(w, r, http.StatusUnauthorized, ErrSessionUnknown.Error())
 	}
 	return true
 }
 
 // decodeBody parses exactly one JSON object with unknown fields rejected (so
-// a caller-supplied context/CompanyIDs block fails closed) and a 1 MiB cap.
-// Trailing bytes beyond one complete object deny (trailing whitespace is
-// allowed; a second value, `null`, or garbage is not). A null body into a
-// struct denies: the target must stay a JSON object.
-func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+// a caller-supplied context/CompanyIDs block fails closed) and an explicit
+// 1 MiB byte cap enforced before decode. Trailing bytes beyond one complete
+// object deny (trailing whitespace is allowed; a second value, `null`, or
+// garbage is not). A null body into a struct denies: the target must stay a
+// JSON object. Denials route through the capped error writer.
+func (b *Broker) decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
-		writeRPCError(w, http.StatusBadRequest, "unreadable request body")
+		b.writeError(w, r, http.StatusBadRequest, "unreadable request body")
 		return false
 	}
 	if int64(len(body)) > maxBodyBytes {
-		writeRPCError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		b.writeError(w, r, http.StatusRequestEntityTooLarge, "request body too large")
 		return false
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
-		writeRPCError(w, http.StatusBadRequest, "invalid request: empty body")
+		b.writeError(w, r, http.StatusBadRequest, "invalid request: empty body")
 		return false
 	}
 	if string(bytes.TrimSpace(body)) == "null" {
-		writeRPCError(w, http.StatusBadRequest, "invalid request: null body")
+		b.writeError(w, r, http.StatusBadRequest, "invalid request: null body")
 		return false
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
-		writeRPCError(w, http.StatusBadRequest, fmt.Sprintf("invalid request: %v", sanitizeBrokerErr(err)))
+		b.writeError(w, r, http.StatusBadRequest, fmt.Sprintf("invalid request: %v", sanitizeBrokerErr(err)))
 		return false
 	}
 	// Exactly one JSON value: a second decode must hit EOF (trailing
 	// whitespace is consumed by Decode, so only real trailing data denies).
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); err != io.EOF {
-		writeRPCError(w, http.StatusBadRequest, "invalid request: trailing data after JSON object")
+		b.writeError(w, r, http.StatusBadRequest, "invalid request: trailing data after JSON object")
 		return false
 	}
 	return true
@@ -407,10 +660,10 @@ func (b *Broker) scopedArgs(rule policy.ModelRule, domain any) ([]any, map[strin
 // any Execute call; both failures are JSON errors, never partial data.
 func (b *Broker) authorize(w http.ResponseWriter, r *http.Request) (string, bool) {
 	tok, err := bearerToken(r)
-	if checkError(w, err) {
+	if b.checkError(w, r, err) {
 		return "", false
 	}
-	if checkError(w, b.Check(tok)) {
+	if b.checkError(w, r, b.Check(tok)) {
 		return "", false
 	}
 	return tok, true
@@ -421,12 +674,12 @@ func (b *Broker) authorize(w http.ResponseWriter, r *http.Request) (string, bool
 // selection. It mirrors the Authorize policy-listing branch without
 // depending on the injected test gate (fakes are allow-all stubs for the
 // data path, not the discovery authz).
-func (b *Broker) gateMeta(w http.ResponseWriter) bool {
+func (b *Broker) gateMeta(w http.ResponseWriter, r *http.Request) bool {
 	b.mu.Lock()
 	pol := b.pol
 	b.mu.Unlock()
 	if !pol.Operations[policy.OpMeta] {
-		writeRPCError(w, http.StatusForbidden, "denied: "+policy.ReasonOperationDenied)
+		b.writeError(w, r, http.StatusForbidden, "denied: "+policy.ReasonOperationDenied)
 		return false
 	}
 	return true
@@ -435,10 +688,10 @@ func (b *Broker) gateMeta(w http.ResponseWriter) bool {
 // gate checks the deny-by-default policy for one request. The rule lookup
 // uses the normalized model name so padded/case-variant input that the gate
 // allowed (NormalizeName trims) resolves to the same sealed rule.
-func (b *Broker) gate(w http.ResponseWriter, req policy.Request) (policy.ModelRule, bool) {
+func (b *Broker) gate(w http.ResponseWriter, r *http.Request, req policy.Request) (policy.ModelRule, bool) {
 	dec := b.gateAuth(req)
 	if !dec.Allow {
-		writeRPCError(w, http.StatusForbidden, "denied: "+dec.Reason)
+		b.writeError(w, r, http.StatusForbidden, "denied: "+dec.Reason)
 		return policy.ModelRule{}, false
 	}
 	name, _ := policy.NormalizeName(req.Model)
@@ -472,7 +725,7 @@ func (b *Broker) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in searchBody
-	if !decodeBody(w, r, &in) {
+	if !b.decodeBody(w, r, &in) {
 		b.release(tok)
 		return
 	}
@@ -480,7 +733,7 @@ func (b *Broker) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = defaultSearchLimit()
 	}
-	rule, ok := b.gate(w, policy.Request{
+	rule, ok := b.gate(w, r, policy.Request{
 		Operation: policy.OpSearch, Model: in.Model, Fields: in.Fields,
 		Domain: in.Domain, Order: in.Order, Limit: limit, Offset: in.Offset,
 	})
@@ -488,13 +741,13 @@ func (b *Broker) handleSearch(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
-	if !b.enforceable(w, rule) {
+	if !b.enforceable(w, r, rule) {
 		b.release(tok)
 		return
 	}
 	domain, kwargs, err := b.scopedArgs(rule, in.Domain)
 	if err != nil {
-		writeRPCError(w, http.StatusBadRequest, err.Error())
+		b.writeError(w, r, http.StatusBadRequest, err.Error())
 		b.release(tok)
 		return
 	}
@@ -513,26 +766,27 @@ func (b *Broker) handleSearch(w http.ResponseWriter, r *http.Request) {
 		kwargs["order"] = in.Order
 	}
 	// Atomic row reservation BEFORE the RPC: reserve the whole admitted
-	// limit; on success settleRows refunds the unused headroom, on RPC or
-	// output failure the attempt keeps its reservation (still billed).
+	// limit (deny when want exceeds remaining — never silently reserve a
+	// smaller min); on success settleRows refunds the unused headroom, on
+	// RPC or output failure the attempt keeps its reservation (billed).
 	reserved, err := b.reserveForLimit(tok, limit)
-	if checkError(w, err) {
+	if b.checkError(w, r, err) {
 		b.release(tok)
 		return
 	}
 	exec := b.execOf()
 	if exec == nil {
-		writeRPCError(w, http.StatusServiceUnavailable, "broker not serving")
+		b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
 		b.releaseReserve(tok, reserved)
 		return
 	}
 	res, err := exec.Execute(in.Model, "search_read", nil, kwargs)
 	if err != nil {
-		writeRPCError(w, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
+		b.writeError(w, r, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
 		return
 	}
 	if err := b.live(tok); err != nil {
-		checkError(w, err)
+		b.checkError(w, r, err)
 		return
 	}
 	b.writeRows(w, r, tok, res, reserved)
@@ -544,12 +798,12 @@ func (b *Broker) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in readBody
-	if !decodeBody(w, r, &in) {
+	if !b.decodeBody(w, r, &in) {
 		b.release(tok)
 		return
 	}
 	if len(in.IDs) == 0 {
-		writeRPCError(w, http.StatusBadRequest, "ids is required")
+		b.writeError(w, r, http.StatusBadRequest, "ids is required")
 		b.release(tok)
 		return
 	}
@@ -559,7 +813,7 @@ func (b *Broker) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 	// Never raw read: by-id converts to a scoped search_read so the
 	// company fragment still applies to every row.
-	rule, ok := b.gate(w, policy.Request{
+	rule, ok := b.gate(w, r, policy.Request{
 		Operation: policy.OpRead, Model: in.Model, Fields: in.Fields,
 		Domain: []any{[]any{"id", "in", ids}}, Limit: len(ids),
 	})
@@ -567,13 +821,13 @@ func (b *Broker) handleRead(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
-	if !b.enforceable(w, rule) {
+	if !b.enforceable(w, r, rule) {
 		b.release(tok)
 		return
 	}
 	domain, kwargs, err := b.scopedArgs(rule, []any{[]any{"id", "in", ids}})
 	if err != nil {
-		writeRPCError(w, http.StatusBadRequest, err.Error())
+		b.writeError(w, r, http.StatusBadRequest, err.Error())
 		b.release(tok)
 		return
 	}
@@ -587,23 +841,23 @@ func (b *Broker) handleRead(w http.ResponseWriter, r *http.Request) {
 	}
 	kwargs["fields"] = rfs
 	reserved, err := b.reserveForLimit(tok, len(ids))
-	if checkError(w, err) {
+	if b.checkError(w, r, err) {
 		b.release(tok)
 		return
 	}
 	exec := b.execOf()
 	if exec == nil {
-		writeRPCError(w, http.StatusServiceUnavailable, "broker not serving")
+		b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
 		b.releaseReserve(tok, reserved)
 		return
 	}
 	res, err := exec.Execute(in.Model, "search_read", nil, kwargs)
 	if err != nil {
-		writeRPCError(w, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
+		b.writeError(w, r, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
 		return
 	}
 	if err := b.live(tok); err != nil {
-		checkError(w, err)
+		b.checkError(w, r, err)
 		return
 	}
 	b.writeRows(w, r, tok, res, reserved)
@@ -615,12 +869,12 @@ func (b *Broker) handleCount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in countBody
-	if !decodeBody(w, r, &in) {
+	if !b.decodeBody(w, r, &in) {
 		b.release(tok)
 		return
 	}
 	// A count returns one scalar; authorize with zero paging.
-	rule, ok := b.gate(w, policy.Request{
+	rule, ok := b.gate(w, r, policy.Request{
 		Operation: policy.OpCount, Model: in.Model, Domain: in.Domain,
 	})
 	if !ok {
@@ -629,30 +883,38 @@ func (b *Broker) handleCount(w http.ResponseWriter, r *http.Request) {
 	}
 	domain, kwargs, err := b.scopedArgs(rule, in.Domain)
 	if err != nil {
-		writeRPCError(w, http.StatusBadRequest, err.Error())
+		b.writeError(w, r, http.StatusBadRequest, err.Error())
 		b.release(tok)
 		return
 	}
-	if !b.enforceable(w, rule) {
+	if !b.enforceable(w, r, rule) {
 		b.release(tok)
 		return
 	}
 	exec := b.execOf()
 	if exec == nil {
-		writeRPCError(w, http.StatusServiceUnavailable, "broker not serving")
+		b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
+		b.release(tok)
+		return
+	}
+	// A count result is one scalar row surface: reserve exactly 1 before
+	// dispatch so exhausted row budgets deny rather than serve unbilled.
+	// The attempt stays billed on RPC/output failure (no release).
+	reserved, err := b.reserveForLimit(tok, 1)
+	if b.checkError(w, r, err) {
 		b.release(tok)
 		return
 	}
 	res, err := exec.Execute(in.Model, "search_count", []any{domain}, kwargs)
 	if err != nil {
-		writeRPCError(w, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
+		b.writeError(w, r, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
 		return
 	}
 	if err := b.live(tok); err != nil {
-		checkError(w, err)
+		b.checkError(w, r, err)
 		return
 	}
-	b.record(tok, 1)
+	b.settleRows(tok, reserved, 1)
 	b.writeEnvelope(w, r, tok, res, 1)
 }
 
@@ -662,17 +924,17 @@ func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in aggregateBody
-	if !decodeBody(w, r, &in) {
+	if !b.decodeBody(w, r, &in) {
 		b.release(tok)
 		return
 	}
 	if len(in.GroupBy) == 0 {
-		writeRPCError(w, http.StatusBadRequest, "groupby is required")
+		b.writeError(w, r, http.StatusBadRequest, "groupby is required")
 		b.release(tok)
 		return
 	}
 	if len(in.Sum) == 0 && len(in.Avg) == 0 && !in.Count {
-		writeRPCError(w, http.StatusBadRequest, "at least one of sum, avg, count is required")
+		b.writeError(w, r, http.StatusBadRequest, "at least one of sum, avg, count is required")
 		b.release(tok)
 		return
 	}
@@ -684,14 +946,14 @@ func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
 	for _, g := range in.GroupBy {
 		head, suffix, _ := strings.Cut(g, ":")
 		if strings.TrimSpace(head) == "" {
-			writeRPCError(w, http.StatusBadRequest, "invalid groupby entry")
+			b.writeError(w, r, http.StatusBadRequest, "invalid groupby entry")
 			b.release(tok)
 			return
 		}
 		if suffix != "" {
-			for _, r := range suffix {
-				if !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_') {
-					writeRPCError(w, http.StatusBadRequest, "invalid groupby interval")
+			for _, ch := range suffix {
+				if !(ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '_') {
+					b.writeError(w, r, http.StatusBadRequest, "invalid groupby interval")
 					b.release(tok)
 					return
 				}
@@ -703,7 +965,7 @@ func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
 	plain = append(plain, in.Sum...)
 	plain = append(plain, in.Avg...)
 	limit := maxLimitOr(in.Limit, defaultSearchLimit())
-	rule, ok := b.gate(w, policy.Request{
+	rule, ok := b.gate(w, r, policy.Request{
 		Operation: policy.OpAggregate, Model: in.Model, Fields: plain,
 		Domain: in.Domain, GroupBy: plainGroup,
 		Limit: limit,
@@ -714,11 +976,11 @@ func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
 	}
 	domain, kwargs, err := b.scopedArgs(rule, in.Domain)
 	if err != nil {
-		writeRPCError(w, http.StatusBadRequest, err.Error())
+		b.writeError(w, r, http.StatusBadRequest, err.Error())
 		b.release(tok)
 		return
 	}
-	if !b.enforceable(w, rule) {
+	if !b.enforceable(w, r, rule) {
 		b.release(tok)
 		return
 	}
@@ -736,23 +998,23 @@ func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
 	kwargs["lazy"] = false
 	kwargs["limit"] = limit
 	reserved, err := b.reserveForLimit(tok, limit)
-	if checkError(w, err) {
+	if b.checkError(w, r, err) {
 		b.release(tok)
 		return
 	}
 	exec := b.execOf()
 	if exec == nil {
-		writeRPCError(w, http.StatusServiceUnavailable, "broker not serving")
+		b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
 		b.releaseReserve(tok, reserved)
 		return
 	}
 	res, err := exec.Execute(in.Model, "read_group", []any{domain, fields, gb}, kwargs)
 	if err != nil {
-		writeRPCError(w, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
+		b.writeError(w, r, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
 		return
 	}
 	if err := b.live(tok); err != nil {
-		checkError(w, err)
+		b.checkError(w, r, err)
 		return
 	}
 	b.writeRows(w, r, tok, res, reserved)
@@ -762,12 +1024,12 @@ func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
 // (neither company-independent nor companyless-opted) must carry an
 // enforceable company fragment, or the request denies even if Authorize
 // passed. Never serve no-fragment scoped models.
-func (b *Broker) enforceable(w http.ResponseWriter, rule policy.ModelRule) bool {
+func (b *Broker) enforceable(w http.ResponseWriter, r *http.Request, rule policy.ModelRule) bool {
 	if rule.CompanyIndependent {
 		if rule.CompanyField != "" {
 			// Contradictory (rejected by Validate, denied by Authorize):
 			// fail closed here too.
-			writeRPCError(w, http.StatusForbidden, "denied: company scope unenforceable for this model")
+			b.writeError(w, r, http.StatusForbidden, "denied: company scope unenforceable for this model")
 			return false
 		}
 		return true
@@ -777,11 +1039,11 @@ func (b *Broker) enforceable(w http.ResponseWriter, rule policy.ModelRule) bool 
 	b.mu.Unlock()
 	frag, enforce := b.frag(rule, scope)
 	if enforce && len(frag) == 0 {
-		writeRPCError(w, http.StatusForbidden, "denied: company scope unenforceable for this model")
+		b.writeError(w, r, http.StatusForbidden, "denied: company scope unenforceable for this model")
 		return false
 	}
 	if !enforce {
-		writeRPCError(w, http.StatusForbidden, "denied: company scope unenforceable for this model")
+		b.writeError(w, r, http.StatusForbidden, "denied: company scope unenforceable for this model")
 		return false
 	}
 	return true
@@ -798,13 +1060,13 @@ func (b *Broker) handleMeta(w http.ResponseWriter, r *http.Request) {
 	}
 	model := strings.TrimSpace(r.URL.Query().Get("model"))
 	if model != "" {
-		rule, ok := b.gate(w, policy.Request{Operation: policy.OpMeta, Model: model})
+		rule, ok := b.gate(w, r, policy.Request{Operation: policy.OpMeta, Model: model})
 		if !ok {
 			b.release(tok)
 			return
 		}
 		if err := b.live(tok); err != nil {
-			checkError(w, err)
+			b.checkError(w, r, err)
 			return
 		}
 		b.record(tok, 0)
@@ -814,12 +1076,12 @@ func (b *Broker) handleMeta(w http.ResponseWriter, r *http.Request) {
 		}, len(rule.Fields))
 		return
 	}
-	if !b.gateMeta(w) {
+	if !b.gateMeta(w, r) {
 		b.release(tok)
 		return
 	}
 	if err := b.live(tok); err != nil {
-		checkError(w, err)
+		b.checkError(w, r, err)
 		return
 	}
 	ops := make([]string, 0, len(b.pol.Operations))
@@ -852,12 +1114,12 @@ func (b *Broker) handleCompanies(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !b.gateMeta(w) {
+	if !b.gateMeta(w, r) {
 		b.release(tok)
 		return
 	}
 	if err := b.live(tok); err != nil {
-		checkError(w, err)
+		b.checkError(w, r, err)
 		return
 	}
 	b.mu.Lock()
@@ -886,54 +1148,158 @@ func (b *Broker) handleCompanies(w http.ResponseWriter, r *http.Request) {
 // Policy.Models; discoverable-only snapshot models list with
 // executable:false and are denied to read/call by the gate (unknown-model
 // deny), never auto-enabled.
+//
+// method_manifest is the snapshot-level MethodManifest (informational ONLY:
+// presence never authorizes execution and no Execute path takes a name from
+// it) plus per-field provenance: recorded per-field provenance when present,
+// else explicit "unknown" with an unknown_provenance entry listing the field.
 func (b *Broker) handleCatalog(w http.ResponseWriter, r *http.Request) {
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	if model != "" {
+		norm, ok := policy.NormalizeName(model)
+		if !ok {
+			b.writeError(w, r, http.StatusBadRequest, "invalid model name")
+			return
+		}
+		_ = norm
+		tok, ok := b.authorize(w, r)
+		if !ok {
+			return
+		}
+		if !b.gateMeta(w, r) {
+			b.release(tok)
+			return
+		}
+		if _, allowed := b.pol.Models[model]; !allowed {
+			if _, allowed := b.pol.Models[norm]; !allowed {
+				b.writeError(w, r, http.StatusForbidden, "denied: "+policy.ReasonUnknownModel)
+				b.release(tok)
+				return
+			}
+		}
+		if err := b.live(tok); err != nil {
+			b.checkError(w, r, err)
+			return
+		}
+		entry, _ := b.catalogEntry(model)
+		if entry == nil {
+			entry, _ = b.catalogEntry(norm)
+		}
+		if entry == nil {
+			b.writeError(w, r, http.StatusForbidden, "denied: "+policy.ReasonUnknownModel)
+			b.release(tok)
+			return
+		}
+		b.record(tok, 0)
+		b.writeEnvelope(w, r, tok, entry, 1)
+		return
+	}
 	tok, ok := b.authorize(w, r)
 	if !ok {
 		return
 	}
-	if !b.gateMeta(w) {
+	if !b.gateMeta(w, r) {
 		b.release(tok)
 		return
 	}
 	if err := b.live(tok); err != nil {
-		checkError(w, err)
+		b.checkError(w, r, err)
 		return
 	}
 	b.mu.Lock()
 	models := make(map[string]any, len(b.snap.Models)+len(b.pol.Models))
 	for name, meta := range b.snap.Models {
 		_, exec := b.pol.Models[name]
-		fields := make(map[string]any, len(meta.Fields))
-		for fname, f := range meta.Fields {
-			fields[fname] = map[string]any{
-				"type": f.Type, "relation": f.Relation,
-				"label": f.Label, "provenance": meta.Provenance,
-			}
-		}
-		models[name] = map[string]any{
+		fields, unknown := catalogFields(meta)
+		entry := map[string]any{
 			"label": meta.Label, "provenance": meta.Provenance,
 			"executable": exec, "fields": fields,
 		}
+		if len(unknown) > 0 {
+			entry["unknown_provenance"] = unknown
+		}
+		models[name] = entry
 	}
 	for name, rule := range b.pol.Models {
 		if _, seen := models[name]; seen {
 			continue
 		}
 		fields := make(map[string]any, len(rule.Fields))
+		unknown := make([]string, 0, len(rule.Fields))
 		for _, fname := range rule.Fields {
 			fields[fname] = map[string]any{
 				"type": "", "relation": "", "label": fname,
-				"provenance": "unknown",
+				"provenance": snapshot.ProvUnknown,
 			}
+			unknown = append(unknown, fname)
 		}
-		models[name] = map[string]any{
-			"label": name, "provenance": "unknown",
+		entry := map[string]any{
+			"label": name, "provenance": snapshot.ProvUnknown,
 			"executable": true, "fields": fields,
+			"unknown_provenance": unknown,
 		}
+		models[name] = entry
 	}
+	manifest := append([]string(nil), b.snap.MethodManifest...)
 	b.mu.Unlock()
 	b.record(tok, 0)
-	b.writeEnvelope(w, r, tok, map[string]any{"models": models}, len(models))
+	b.writeEnvelope(w, r, tok, map[string]any{"models": models, "method_manifest": manifest}, len(models))
+}
+
+// catalogFields renders one snapshot model's fields with per-field
+// provenance: the recorded per-field provenance when present, else explicit
+// "unknown". The second return lists fields with unknown provenance.
+func catalogFields(meta snapshot.ModelMeta) (map[string]any, []string) {
+	fields := make(map[string]any, len(meta.Fields))
+	var unknown []string
+	for fname, f := range meta.Fields {
+		prov := strings.TrimSpace(f.Provenance)
+		if prov == "" {
+			prov = snapshot.ProvUnknown
+			unknown = append(unknown, fname)
+		}
+		fields[fname] = map[string]any{
+			"type": f.Type, "relation": f.Relation,
+			"label": f.Label, "provenance": prov,
+		}
+	}
+	return fields, unknown
+}
+
+// catalogEntry renders one model's catalog entry (same shape as the
+// per-model values in handleCatalog, without the manifest wrapper).
+func (b *Broker) catalogEntry(name string) (map[string]any, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if meta, ok := b.snap.Models[name]; ok {
+		_, exec := b.pol.Models[name]
+		fields, unknown := catalogFields(meta)
+		entry := map[string]any{
+			"label": meta.Label, "provenance": meta.Provenance,
+			"executable": exec, "fields": fields,
+		}
+		if len(unknown) > 0 {
+			entry["unknown_provenance"] = unknown
+		}
+		return entry, true
+	}
+	if rule, ok := b.pol.Models[name]; ok {
+		fields := make(map[string]any, len(rule.Fields))
+		unknown := make([]string, 0, len(rule.Fields))
+		for _, fname := range rule.Fields {
+			fields[fname] = map[string]any{
+				"type": "", "relation": "", "label": fname,
+				"provenance": snapshot.ProvUnknown,
+			}
+			unknown = append(unknown, fname)
+		}
+		return map[string]any{
+			"label": name, "provenance": snapshot.ProvUnknown,
+			"executable": true, "fields": fields,
+			"unknown_provenance": unknown,
+		}, true
+	}
+	return nil, false
 }
 
 // ---------------------------------------------------------------------------
@@ -951,32 +1317,39 @@ func toSlice(v any) ([]any, bool) {
 	return nil, false
 }
 
-// writeRows caps rows (MaxRowsPerCall), settles the pre-RPC row reservation
-// (refunding unused headroom), and writes the success envelope through the
-// single MaxResponseBytes envelope cap. Row-trimming for the byte cap
-// happens BEFORE settle so the session keeps only delivered rows; an RPC
-// success that yields zero deliverable rows still bills the admitted call
-// (Check reservation stands, no release). Any output that cannot fit the
-// envelope denies instead of sending a partial payload.
+// writeRows settles the pre-RPC row reservation and writes the success
+// envelope through the single MaxResponseBytes envelope cap. There is NO
+// silent pagination or truncation here: when the RPC returns more rows than
+// the atomic reservation (or more than the MaxRowsPerCall cap), writeRows
+// DENIES with a budget error instead of false-completing a narrowed slice
+// (fail closed: a "success" envelope must never claim count=N for fewer
+// than N admitted rows). Row-trimming applies ONLY to the byte cap: while
+// the serialized envelope exceeds MaxResponseBytes the last row drops, and
+// settle bills only delivered rows; an RPC success that yields zero
+// deliverable rows still bills the admitted call (Check reservation stands,
+// no release). Any output that cannot fit the envelope denies instead of
+// sending a partial payload.
 func (b *Broker) writeRows(w http.ResponseWriter, r *http.Request, tok string, res any, reserved int) {
 	rows, ok := toSlice(res)
 	if !ok {
-		writeRPCError(w, http.StatusBadGateway, "unexpected result shape")
+		b.writeError(w, r, http.StatusBadGateway, "unexpected result shape")
 		return
 	}
 	b.mu.Lock()
 	maxRows := b.pol.Budgets.MaxRowsPerCall
 	b.mu.Unlock()
 	if maxRows > 0 && len(rows) > maxRows {
-		rows = rows[:maxRows]
+		b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+		return
 	}
 	if len(rows) > reserved {
-		rows = rows[:reserved]
+		b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+		return
 	}
 	for len(rows) > 0 {
 		n, err := json.Marshal(map[string]any{"success": true, "result": rows, "count": len(rows)})
 		if err != nil {
-			writeRPCError(w, http.StatusInternalServerError, "encode response")
+			b.writeError(w, r, http.StatusInternalServerError, "encode response")
 			return
 		}
 		b.mu.Lock()
@@ -1000,7 +1373,27 @@ func (b *Broker) writeRows(w http.ResponseWriter, r *http.Request, tok string, r
 func (b *Broker) writeEnvelope(w http.ResponseWriter, r *http.Request, tok string, result any, count int) {
 	_ = r
 	_ = tok
-	n, err := json.Marshal(map[string]any{"success": true, "result": result, "count": count})
+	b.writeEnvelopeRaw(w, http.StatusOK, map[string]any{"success": true, "result": result, "count": count})
+}
+
+// writeError is the single error-envelope writer: every model/admin error
+// response is JSON-capped by Budgets.MaxResponseBytes like success
+// envelopes. When even the error envelope exceeds the cap the message is
+// replaced with a short generic denial (never truncated JSON, never a bare
+// http.Error). The admitted call stays billed; callers must not release.
+func (b *Broker) writeError(w http.ResponseWriter, r *http.Request, code int, msg string) {
+	_ = r
+	b.writeEnvelopeRaw(w, code, map[string]any{"success": false, "error": msg})
+}
+
+// writeEnvelopeRaw marshals one success response and enforces the single
+// total serialized envelope cap (Budgets.MaxResponseBytes) for every
+// endpoint, including meta/companies/catalog/workspace/count. Over-cap
+// output denies with an error instead of sending; the admitted call stays
+// billed (no release-on-failure). It is the shared tail of writeEnvelope
+// (session-billed model responses) and writeError's fallback shape.
+func (b *Broker) writeEnvelopeRaw(w http.ResponseWriter, code int, body map[string]any) {
+	n, err := json.Marshal(body)
 	if err != nil {
 		writeRPCError(w, http.StatusInternalServerError, "encode response")
 		return
@@ -1009,10 +1402,26 @@ func (b *Broker) writeEnvelope(w http.ResponseWriter, r *http.Request, tok strin
 	maxBytes := b.pol.Budgets.MaxResponseBytes
 	b.mu.Unlock()
 	if maxBytes > 0 && len(n) > maxBytes {
+		if _, isErr := body["error"]; isErr {
+			writeRPCError(w, code, "request denied")
+			return
+		}
 		writeRPCError(w, http.StatusBadGateway, fmt.Sprintf("response %d bytes exceeds cap %d", len(n), maxBytes))
 		return
 	}
-	writeRPCOK(w, result, count)
+	if v, isErr := body["error"]; isErr {
+		errMsg, _ := v.(string)
+		if errMsg == "" {
+			errMsg = "request denied"
+		}
+		writeRPCError(w, code, errMsg)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if code != http.StatusOK {
+		w.WriteHeader(code)
+	}
+	_, _ = w.Write(n)
 }
 
 func maxLimitOr(v, d int) int {
@@ -1105,20 +1514,20 @@ type grantBody struct {
 // socket. Never on TCP.
 func (b *Broker) handleAdminGrant(w http.ResponseWriter, r *http.Request) {
 	var in grantBody
-	if !decodeBody(w, r, &in) {
+	if !b.decodeBody(w, r, &in) {
 		return
 	}
 	ttl := time.Duration(in.TTLSeconds) * time.Second
 	if in.TTLSeconds <= 0 {
-		writeRPCError(w, http.StatusBadRequest, "ttl_seconds must be positive")
+		b.writeError(w, r, http.StatusBadRequest, "ttl_seconds must be positive")
 		return
 	}
 	tok, err := b.Grant(ttl)
 	if err != nil {
-		writeRPCError(w, http.StatusBadRequest, err.Error())
+		b.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeRPCOK(w, map[string]any{"token": tok, "ttl_seconds": in.TTLSeconds}, 1)
+	b.writeEnvelope(w, r, "", map[string]any{"token": tok, "ttl_seconds": in.TTLSeconds}, 1)
 }
 
 // handleAdminRevoke revokes by full token or unambiguous prefix carried in
@@ -1129,7 +1538,7 @@ func (b *Broker) handleAdminRevoke(w http.ResponseWriter, r *http.Request) {
 		Token  string `json:"token"`
 		Prefix string `json:"prefix"`
 	}
-	if !decodeBody(w, r, &in) {
+	if !b.decodeBody(w, r, &in) {
 		return
 	}
 	target := in.Token
@@ -1137,27 +1546,27 @@ func (b *Broker) handleAdminRevoke(w http.ResponseWriter, r *http.Request) {
 		target = in.Prefix
 	}
 	if target == "" {
-		writeRPCError(w, http.StatusBadRequest, "token or prefix is required")
+		b.writeError(w, r, http.StatusBadRequest, "token or prefix is required")
 		return
 	}
 	if in.Token != "" {
 		if !b.hasSession(target) {
-			writeRPCError(w, http.StatusNotFound, ErrSessionUnknown.Error())
+			b.writeError(w, r, http.StatusNotFound, ErrSessionUnknown.Error())
 			return
 		}
 		b.Revoke(target)
-		writeRPCOK(w, map[string]any{"revoked": true}, 1)
+		b.writeEnvelope(w, r, "", map[string]any{"revoked": true}, 1)
 		return
 	}
 	if err := b.revokePrefix(target); err != nil {
 		if errors.Is(err, ErrSessionUnknown) {
-			writeRPCError(w, http.StatusNotFound, err.Error())
+			b.writeError(w, r, http.StatusNotFound, err.Error())
 			return
 		}
-		writeRPCError(w, http.StatusConflict, err.Error())
+		b.writeError(w, r, http.StatusConflict, err.Error())
 		return
 	}
-	writeRPCOK(w, map[string]any{"revoked": true}, 1)
+	b.writeEnvelope(w, r, "", map[string]any{"revoked": true}, 1)
 }
 
 // hasSession reports whether token names a live session.
@@ -1170,9 +1579,9 @@ func (b *Broker) hasSession(token string) bool {
 
 // handleAdminStatus returns counts/expiry only — never tokens or secrets.
 // Never on TCP.
-func (b *Broker) handleAdminStatus(w http.ResponseWriter, _ *http.Request) {
+func (b *Broker) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 	n, ttls, version, instance := b.sessionStats()
-	writeRPCOK(w, map[string]any{
+	b.writeEnvelope(w, r, "", map[string]any{
 		"sessions": n, "expires_in_seconds": ttls,
 		"policy_version": version, "instance": instance,
 	}, n)
@@ -1180,17 +1589,26 @@ func (b *Broker) handleAdminStatus(w http.ResponseWriter, _ *http.Request) {
 
 // ---------------------------------------------------------------------------
 // Workspace handlers (model TCP, gated by policy.AllowWorkspace).
+//
+// Row-budget semantics: list and read are billable row surfaces with atomic
+// reservations like the RPC row paths — list reserves its effective
+// max_entries want (deny when want exceeds remaining, never silently list
+// more than reserved) and settles to delivered rows; read reserves exactly
+// 1; mkdir reserves exactly 1 (one created directory = one billed row).
+// record() is NOT used for these row surfaces. Write bills no rows.
+// Metadata counts (envelope "count") never reserve or settle.
 // ---------------------------------------------------------------------------
 
 // handleWorkspaceList lists workspace entries (broker-confined reads).
 // Caller max_entries can only narrow the policy row cap, never widen it:
-// effective = min(caller-or-default, MaxRowsPerCall).
+// effective = min(caller-or-default, MaxRowsPerCall). The effective want is
+// reserved atomically BEFORE listing; over-remaining wants deny.
 func (b *Broker) handleWorkspaceList(w http.ResponseWriter, r *http.Request) {
 	tok, ok := b.authorize(w, r)
 	if !ok {
 		return
 	}
-	if !b.workspaceAllowed(w) {
+	if !b.workspaceAllowed(w, r) {
 		b.release(tok)
 		return
 	}
@@ -1198,13 +1616,13 @@ func (b *Broker) handleWorkspaceList(w http.ResponseWriter, r *http.Request) {
 		Path       string `json:"path"`
 		MaxEntries int    `json:"max_entries"`
 	}
-	if !decodeBody(w, r, &in) {
+	if !b.decodeBody(w, r, &in) {
 		b.release(tok)
 		return
 	}
 	ws := b.workspace()
 	if ws == nil {
-		writeRPCError(w, http.StatusServiceUnavailable, "workspace unavailable")
+		b.writeError(w, r, http.StatusServiceUnavailable, "workspace unavailable")
 		b.release(tok)
 		return
 	}
@@ -1219,40 +1637,55 @@ func (b *Broker) handleWorkspaceList(w http.ResponseWriter, r *http.Request) {
 	if capRows > 0 && maxEntries > capRows {
 		maxEntries = capRows
 	}
-	entries, err := ws.List(in.Path, maxEntries)
-	if err != nil {
-		writeRPCError(w, http.StatusBadRequest, b.redactErr(r.Context(), err).Error())
+	reserved, err := b.reserveForLimit(tok, maxEntries)
+	if b.checkError(w, r, err) {
 		b.release(tok)
 		return
 	}
-	if err := b.live(tok); err != nil {
-		checkError(w, err)
+	entries, err := ws.List(in.Path, maxEntries)
+	if err != nil {
+		b.writeError(w, r, http.StatusBadRequest, b.redactErr(r.Context(), err).Error())
 		return
 	}
-	b.record(tok, len(entries))
+	if err := b.live(tok); err != nil {
+		b.checkError(w, r, err)
+		return
+	}
+	if len(entries) > reserved {
+		b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+		return
+	}
+	b.settleRows(tok, reserved, len(entries))
 	b.writeEnvelope(w, r, tok, entries, len(entries))
 }
 
 // handleWorkspaceRead reads one workspace file, capped by policy budgets.
+// It reserves exactly 1 row before reading (deny when no headroom); the
+// admitted read stays billed even on read/output failure.
 func (b *Broker) handleWorkspaceRead(w http.ResponseWriter, r *http.Request) {
 	tok, ok := b.authorize(w, r)
 	if !ok {
 		return
 	}
-	if !b.workspaceAllowed(w) {
+	if !b.workspaceAllowed(w, r) {
 		b.release(tok)
 		return
 	}
 	var in struct {
 		Path string `json:"path"`
 	}
-	if !decodeBody(w, r, &in) {
+	if !b.decodeBody(w, r, &in) {
 		b.release(tok)
 		return
 	}
 	ws := b.workspace()
 	if ws == nil {
-		writeRPCError(w, http.StatusServiceUnavailable, "workspace unavailable")
+		b.writeError(w, r, http.StatusServiceUnavailable, "workspace unavailable")
+		b.release(tok)
+		return
+	}
+	reserved, err := b.reserveForLimit(tok, 1)
+	if b.checkError(w, r, err) {
 		b.release(tok)
 		return
 	}
@@ -1264,15 +1697,14 @@ func (b *Broker) handleWorkspaceRead(w http.ResponseWriter, r *http.Request) {
 	}
 	data, err := ws.Read(in.Path, maxBytes)
 	if err != nil {
-		writeRPCError(w, http.StatusBadRequest, b.redactErr(r.Context(), err).Error())
-		b.release(tok)
+		b.writeError(w, r, http.StatusBadRequest, b.redactErr(r.Context(), err).Error())
 		return
 	}
 	if err := b.live(tok); err != nil {
-		checkError(w, err)
+		b.checkError(w, r, err)
 		return
 	}
-	b.record(tok, 1)
+	b.settleRows(tok, reserved, 1)
 	b.writeEnvelope(w, r, tok, map[string]any{"path": in.Path, "content": string(data)}, 1)
 }
 
@@ -1282,7 +1714,7 @@ func (b *Broker) handleWorkspaceWrite(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !b.workspaceAllowed(w) {
+	if !b.workspaceAllowed(w, r) {
 		b.release(tok)
 		return
 	}
@@ -1290,36 +1722,80 @@ func (b *Broker) handleWorkspaceWrite(w http.ResponseWriter, r *http.Request) {
 		Path    string `json:"path"`
 		Content string `json:"content"`
 	}
-	if !decodeBody(w, r, &in) {
+	if !b.decodeBody(w, r, &in) {
 		b.release(tok)
 		return
 	}
 	ws := b.workspace()
 	if ws == nil {
-		writeRPCError(w, http.StatusServiceUnavailable, "workspace unavailable")
+		b.writeError(w, r, http.StatusServiceUnavailable, "workspace unavailable")
 		b.release(tok)
 		return
 	}
 	if err := ws.Write(in.Path, []byte(in.Content)); err != nil {
-		writeRPCError(w, http.StatusBadRequest, b.redactErr(r.Context(), err).Error())
+		b.writeError(w, r, http.StatusBadRequest, b.redactErr(r.Context(), err).Error())
 		b.release(tok)
 		return
 	}
 	if err := b.live(tok); err != nil {
-		checkError(w, err)
+		b.checkError(w, r, err)
 		return
 	}
 	b.record(tok, 0)
 	b.writeEnvelope(w, r, tok, map[string]any{"path": in.Path, "written": true}, 1)
 }
 
+// handleWorkspaceMkdir creates one directory (plus missing parents) inside
+// the workspace — the safe parent-creation workflow for tool flows that
+// need nested report directories without shell access. Bounded path/size
+// via ws.MkdirAll (os.Root-confined, 0700), bills exactly 1 row (reserved
+// atomically before creation), and writes through the capped envelope.
+func (b *Broker) handleWorkspaceMkdir(w http.ResponseWriter, r *http.Request) {
+	tok, ok := b.authorize(w, r)
+	if !ok {
+		return
+	}
+	if !b.workspaceAllowed(w, r) {
+		b.release(tok)
+		return
+	}
+	var in struct {
+		Path string `json:"path"`
+	}
+	if !b.decodeBody(w, r, &in) {
+		b.release(tok)
+		return
+	}
+	ws := b.workspace()
+	if ws == nil {
+		b.writeError(w, r, http.StatusServiceUnavailable, "workspace unavailable")
+		b.release(tok)
+		return
+	}
+	reserved, err := b.reserveForLimit(tok, 1)
+	if b.checkError(w, r, err) {
+		b.release(tok)
+		return
+	}
+	if err := ws.MkdirAll(in.Path); err != nil {
+		b.writeError(w, r, http.StatusBadRequest, b.redactErr(r.Context(), err).Error())
+		return
+	}
+	if err := b.live(tok); err != nil {
+		b.checkError(w, r, err)
+		return
+	}
+	b.settleRows(tok, reserved, 1)
+	b.writeEnvelope(w, r, tok, map[string]any{"path": in.Path, "created": true}, 1)
+}
+
 // workspaceAllowed denies when the sealed policy disables the workspace.
-func (b *Broker) workspaceAllowed(w http.ResponseWriter) bool {
+func (b *Broker) workspaceAllowed(w http.ResponseWriter, r *http.Request) bool {
 	b.mu.Lock()
 	allow := b.pol.AllowWorkspace
 	b.mu.Unlock()
 	if !allow {
-		writeRPCError(w, http.StatusForbidden, "denied: workspace disabled")
+		b.writeError(w, r, http.StatusForbidden, "denied: workspace disabled")
 		return false
 	}
 	return true

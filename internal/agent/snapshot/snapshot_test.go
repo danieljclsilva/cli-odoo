@@ -136,6 +136,13 @@ func TestLoadScopeConsistency(t *testing.T) {
 		"duplicate enabled": func(s *Snapshot) {
 			s.EnabledCompanies = []int{1, 1, 2}
 		},
+		"non-positive enabled": func(s *Snapshot) {
+			s.EnabledCompanies = []int{-1, 0}
+			s.DefaultCompany = -1
+		},
+		"zero enabled": func(s *Snapshot) {
+			s.EnabledCompanies = []int{0, 2}
+		},
 		"empty instance": func(s *Snapshot) {
 			s.Instance = ""
 		},
@@ -437,5 +444,92 @@ func TestWriteIsAtomicSecure0600(t *testing.T) {
 		if strings.HasPrefix(f.Name(), ".tmp-") {
 			t.Fatalf("staging file leaked: %s", f.Name())
 		}
+	}
+}
+
+func TestCanonicalDigestDeterminismAndMismatch(t *testing.T) {
+	// Same value digests equally across calls; any mutation (companies,
+	// fields, relations, company metadata, provenance) digests differently.
+	// This is the broker's recompute-and-compare binding: a tampered
+	// snapshot never matches the sealed Policy.SnapshotSHA256.
+	base := validTestSnapshot()
+	a, err := CanonicalDigest(base)
+	if err != nil {
+		t.Fatalf("CanonicalDigest: %v", err)
+	}
+	if len(a) != 64 {
+		t.Fatalf("digest = %q, want 64 hex chars", a)
+	}
+	b, err := CanonicalDigest(base)
+	if err != nil || a != b {
+		t.Fatalf("determinism: %q vs %q, err=%v", a, b, err)
+	}
+	mutants := map[string]func(*Snapshot){
+		"default company": func(s *Snapshot) {
+			s.EnabledCompanies = []int{1, 3}
+			s.DefaultCompany = 3
+		},
+		"field set": func(s *Snapshot) {
+			m := s.Models["res.partner"]
+			m.Fields["email"] = SFieldMeta{Name: "email", Type: "char", Label: "Email"}
+			s.Models["res.partner"] = m
+		},
+		"relation": func(s *Snapshot) {
+			m := s.Models["res.partner"]
+			m.Fields["company_id"] = SFieldMeta{Name: "company_id", Type: "many2one", Relation: "res.company", Label: "Company"}
+			s.Models["res.partner"] = m
+		},
+		"company field": func(s *Snapshot) {
+			m := s.Models["res.partner"]
+			m.CompanyField = "x_company_id"
+			s.Models["res.partner"] = m
+		},
+		"provenance": func(s *Snapshot) {
+			m := s.Models["res.partner"]
+			m.Provenance = ProvManifest
+			s.Models["res.partner"] = m
+		},
+	}
+	for name, mutate := range mutants {
+		t.Run(name, func(t *testing.T) {
+			s := validTestSnapshot()
+			s.CapturedAt = base.CapturedAt
+			mutate(&s)
+			got, err := CanonicalDigest(s)
+			if err != nil {
+				t.Fatalf("CanonicalDigest: %v", err)
+			}
+			baseAt := validTestSnapshot()
+			baseAt.CapturedAt = base.CapturedAt
+			want, _ := CanonicalDigest(baseAt)
+			if got == want {
+				t.Fatalf("mutation %q undetected: digest %q unchanged", name, got)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsNonPositiveScopeMirror(t *testing.T) {
+	// Snapshot validate() mirrors the policy scope rule (positive unique
+	// IDs, default in enabled) BEFORE any server use.
+	for name, scope := range map[string]struct {
+		enabled []int
+		def     int
+	}{
+		"duplicates": {[]int{1, 1, 2}, 1},
+		"negative":   {[]int{-1, 0}, -1},
+		"zero":       {[]int{0, 2}, 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := validTestSnapshot()
+			s.EnabledCompanies = scope.enabled
+			s.DefaultCompany = scope.def
+			if _, err := Load(writeRawSnapshot(t, s)); err == nil {
+				t.Fatalf("%s scope: expected deny, got allow", name)
+			}
+			if err := Write(filepath.Join(t.TempDir(), "bad.json"), s); err == nil {
+				t.Fatalf("%s scope: Write accepted invalid snapshot", name)
+			}
+		})
 	}
 }

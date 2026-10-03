@@ -39,7 +39,7 @@ odoo login --url https://my-odoo.example.com --db mydb --username admin
 odoo agent setup --companies 1,2 --default-company 1 \
   --model 'res.partner:name,email,company_id:company_id' \
   --model 'sale.order:name,amount_total,company_id:company_id:aggregate' \
-  --ops search,read,count,meta --workspace ~/.config/odoo-cli/agent-workspace
+  --ops search,read,count,meta --workspace ~/odoo-agent-workspace
 
 # Non-interactive (operators/tests): pass every choice as flags and the
 # admin password on stdin only.
@@ -47,7 +47,9 @@ printf '%s' "$ADMIN_PW" | odoo agent setup --companies 1,2 ... --admin-password-
 
 # 3. Inspect and refresh bounded metadata (human only, deliberate server reads).
 odoo agent companies [--live]
-odoo agent snapshot            # rebuild snapshot for approved models only
+odoo agent snapshot refresh        # rebuild + reseal (restamps snapshot digest)
+odoo agent snapshot import-catalog --file catalog.json    # operator-transcribed
+odoo agent snapshot import-manifest --file methods.json   # informational only
 odoo agent workspace           # show sealed workspace dir + bounded listing
 
 # 4. Serve (unlocks profile, resolves keychain once, dials Odoo once).
@@ -59,12 +61,13 @@ odoo agent status              # counts/expiry only, never tokens
 odoo agent revoke <token-or-prefix>
 ```
 
-Files (0600): `~/.config/odoo-cli/agent-profile.json` (sealed policy),
-`~/.config/odoo-cli/agent-snapshot.json` (approved metadata). Sealed with
-PBKDF2-SHA256 (600k) + AES-GCM from the standard library; a wrong password
-fails closed with no partial data. Revocation stops new requests; stop the
-daemon to end all model access. Never fall back to the unrestricted CLI for
-model traffic.
+Files (0600): `~/.config/odoo-cli/agent-profile.json` (sealed policy, embeds
+a SHA-256 digest of the exact sealed snapshot bytes — any snapshot swap or
+hand-edit fails closed at serve time until a human re-runs refresh/import and
+reseals),
+`~/.config/odoo-cli/agent-snapshot.json` (approved metadata). The workspace
+default is `~/odoo-agent-workspace` (never inside the config dir; the old
+config-nested path is rejected with a migration note). Sealed with
 
 Company scope: the broker ANDs the sealed company fragment into every
 domain **after** caller conditions and **overwrites** `allowed_company_ids`
@@ -109,15 +112,15 @@ sessions, and the HTTP server enforces read/write/idle timeouts.
 Shipped in-tree (implemented, not prose):
 
 - MCP stdio adapter: `odoo agent mcp [--broker URL]` — JSON-RPC 2.0 over
-  stdio with `initialize` / `tools/list` / `tools/call` for the 10 typed
+  stdio with `initialize` / `tools/list` / `tools/call` for the 11 typed
   broker tools only (search, read, count, aggregate, meta, companies,
-  catalog, workspace.list/read/write). The session token comes from
+  catalog, workspace.list/read/write/mkdir). The session token comes from
   `ODOO_BROKER_TOKEN` (env only, never logged or echoed). Codex stdio
   example: `codex mcp add odoo-broker -- odoo agent mcp
   --broker http://127.0.0.1:8471` with the token env var set.
-- OMP custom tool module: `tools/omp/odoo-broker.js` (CommonJS, 10 typed
-  tools, `fetch` POST to `ODOO_BROKER_URL` with `ODOO_BROKER_TOKEN`; no
-  shell). Reviewed config snippets: `odoo agent omp-init --dir <dir>`
+- OMP custom tool module: `tools/omp/odoo-broker.js` (CommonJS factory,
+  11 typed tools, `fetch` POST to `ODOO_BROKER_URL` with `ODOO_BROKER_TOKEN`;
+  no shell). Reviewed config snippets: `odoo agent omp-init --dir <dir>`
   writes OMP + Codex examples without secrets or touching user settings.
   End-to-end OMP loading is operator-verified at deploy time (no local OMP
   harness here); broker-side routing/denial is covered by in-process tests.

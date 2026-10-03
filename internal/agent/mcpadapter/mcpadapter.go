@@ -2,9 +2,14 @@
 // (JSON-RPC 2.0 on stdin/stdout) for runtimes that consume MCP servers.
 //
 // Typed tools only: search, read, count, aggregate, meta, companies,
-// catalog, workspace.list, workspace.read, workspace.write. There are no
-// admin, raw, exec, or shell tools: Grant/Revoke never cross this surface,
-// and the adapter never spawns a child process.
+// catalog, workspace.list, workspace.read, workspace.write, workspace.mkdir.
+// There are no admin, raw, exec, or shell tools: Grant/Revoke never cross
+// this surface, and the adapter never spawns a child process.
+//
+// The catalog tool is a read-only pass-through: the broker serves the
+// per-model catalog carrying MethodManifest (informational, never
+// executable) plus per-model/per-field provenance, and this adapter
+// forwards that envelope to MCP content unchanged.
 //
 // Auth: the broker session token comes from the ODOO_BROKER_TOKEN
 // environment variable (or the configured Token field, e.g. read from
@@ -69,6 +74,9 @@ type Tool struct {
 }
 
 // Tools lists the typed broker tools only. No admin/raw/exec entries.
+// workspace.mkdir matches the broker's POST /rpc/workspace/mkdir handler
+// (bounded MkdirAll); the catalog output carries MethodManifest plus
+// per-field/per-model provenance as read-only pass-through.
 func Tools() []Tool {
 	obj := func(props map[string]any, required ...string) map[string]any {
 		return map[string]any{"type": "object", "properties": props, "required": required}
@@ -91,7 +99,7 @@ func Tools() []Tool {
 			InputSchema: obj(map[string]any{"model": str})},
 		{Name: "companies", Description: "Company discovery: available/enabled/default (no record data).",
 			InputSchema: obj(map[string]any{})},
-		{Name: "catalog", Description: "Per-model catalog with executable flags (no record data).",
+		{Name: "catalog", Description: "Per-model catalog with MethodManifest and provenance (read-only pass-through, no record data).",
 			InputSchema: obj(map[string]any{})},
 		{Name: "workspace.list", Description: "List broker-confined workspace entries.",
 			InputSchema: obj(map[string]any{"path": str, "max_entries": num}, "path")},
@@ -99,6 +107,8 @@ func Tools() []Tool {
 			InputSchema: obj(map[string]any{"path": str}, "path")},
 		{Name: "workspace.write", Description: "Write one broker-confined workspace file.",
 			InputSchema: obj(map[string]any{"path": str, "content": str}, "path", "content")},
+		{Name: "workspace.mkdir", Description: "Create broker-confined workspace directories (bounded MkdirAll).",
+			InputSchema: obj(map[string]any{"path": str}, "path")},
 	}
 }
 
@@ -216,6 +226,9 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 }
 
 // endpoint maps a typed tool name to its broker path and HTTP method.
+// Every entry has a live broker counterpart in modelMux: search, read,
+// count, aggregate, meta, companies, catalog, workspace.list,
+// workspace.read, workspace.write, workspace.mkdir.
 func endpoint(name string) (method, path string, ok bool) {
 	switch name {
 	case "search":
@@ -238,11 +251,12 @@ func endpoint(name string) (method, path string, ok bool) {
 		return http.MethodPost, "/rpc/workspace/read", true
 	case "workspace.write":
 		return http.MethodPost, "/rpc/workspace/write", true
+	case "workspace.mkdir":
+		return http.MethodPost, "/rpc/workspace/mkdir", true
 	}
 	return "", "", false
 }
 
-// callTool validates the tool name (typed only), forwards to the broker
 // with the bearer token, and maps the broker envelope to MCP content.
 // Returns (text, isToolError, protocolError). Admin/raw names are unknown
 // methods, never forwarded.

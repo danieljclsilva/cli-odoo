@@ -29,6 +29,11 @@ import "strings"
 // and additionally gated by Policy.AllowWorkspace.
 type Operation string
 
+// PolicyVersion is the only sealed policy version Validate accepts. There
+// is no legacy fallback: a version skew denies and the human must re-seal
+// via setup.
+const PolicyVersion = 1
+
 // Typed operations on the model surface.
 const (
 	OpSearch    Operation = "search"
@@ -88,6 +93,11 @@ type Budgets struct {
 }
 
 // Policy is the sealed, human-built authorization policy.
+// SnapshotSHA256 binds the exact sealed snapshot bytes: the hex-encoded
+// SHA-256 of the canonical snapshot JSON (see snapshot.CanonicalDigest).
+// The setup slice stamps it after human review; the broker recomputes and
+// compares before serving. Empty denies so pre-binding profiles must be
+// re-sealed via setup.
 type Policy struct {
 	Version        int
 	Instance       string
@@ -99,6 +109,7 @@ type Policy struct {
 	AllowWorkspace bool
 	WorkspaceDir   string
 	SnapshotPath   string
+	SnapshotSHA256 string `json:"snapshot_sha256"`
 }
 
 // Request is a single model request awaiting authorization. Domain is the

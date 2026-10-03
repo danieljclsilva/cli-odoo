@@ -27,6 +27,7 @@ package snapshot
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -117,12 +118,18 @@ type SFieldMeta struct {
 // executable set (membership in Policy.Models) stays authoritative; a model
 // described here with Executable=false (the default for files written
 // before this flag existed) is denied to read/call by the broker.
+// IncludeCompanyless is data-only: it records the human's per-model
+// companyless opt-in for policy construction by the setup slice. It
+// authorizes nothing here — not even on CompanyIndependent models
+// (meaningless there, rejected later by policy Validate, same rule as
+// policy.ModelRule).
 type ModelMeta struct {
 	Name               string                `json:"name"`
 	Label              string                `json:"label"`
 	Fields             map[string]SFieldMeta `json:"fields"`
 	CompanyField       string                `json:"company_field"`
 	CompanyIndependent bool                  `json:"company_independent"`
+	IncludeCompanyless bool                  `json:"include_companyless"`
 	Provenance         string                `json:"provenance"`
 	Executable         bool                  `json:"executable"`
 }
@@ -286,10 +293,33 @@ func Write(path string, s Snapshot) error {
 	return nil
 }
 
+// CanonicalDigest returns the hex-encoded SHA-256 digest of the canonical
+// JSON encoding of the Snapshot value. Canonical here means exactly what
+// encoding/json emits for this shape: struct fields in declaration order,
+// map keys sorted lexicographically, no whitespace, integers exact, and
+// time in RFC 3339 — all deterministic for a fixed Snapshot value, so two
+// equal Snapshots digest equally and any mutation (companies, fields,
+// relations, company metadata, provenance) digests differently.
+//
+// The digest covers the Snapshot value only, not the on-disk envelope
+// version: version skew is rejected separately by Load, and the sealed
+// policy binds this digest via Policy.SnapshotSHA256. The setup slice
+// stamps CanonicalDigest output into the policy after human review; the
+// broker recomputes and compares before serving.
+func CanonicalDigest(s Snapshot) (string, error) {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return "", fmt.Errorf("snapshot: canonical digest: %w", err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // validate enforces snapshot shape: scope consistency (at least two enabled
-// companies mirroring the policy scope rule, default a member of enabled,
-// enabled a subset of discovered), sane companies, and per-model metadata
-// hygiene. It fills an empty model Label from the model name.
+// companies mirroring the policy scope rule — positive unique IDs, default
+// a member of enabled, enabled a subset of discovered — checked BEFORE any
+// server use), sane companies, and per-model metadata hygiene. It fills an
+// empty model Label from the model name.
 func (s *Snapshot) validate() error {
 	if strings.TrimSpace(s.Instance) == "" {
 		return fmt.Errorf("instance is empty")
@@ -315,6 +345,9 @@ func (s *Snapshot) validate() error {
 	}
 	enabled := map[int]bool{}
 	for _, id := range s.EnabledCompanies {
+		if id <= 0 {
+			return fmt.Errorf("enabled_companies: non-positive id %d", id)
+		}
 		if enabled[id] {
 			return fmt.Errorf("enabled_companies: duplicate id %d", id)
 		}
@@ -381,12 +414,18 @@ func (s *Snapshot) validate() error {
 // technical name plus the exact fields the human approved. Only these models
 // are ever described with fields_get; models outside this list are never
 // touched, even if named on a model path elsewhere.
+// IncludeCompanyless is the human's explicit per-model opt-in admitting
+// company_id=false records alongside scoped records. It is data only here:
+// carried into ModelMeta, meaningless on independent models, and rejected
+// later by policy Validate on independent models (same rule as
+// policy.ModelRule).
 type ModelSpec struct {
 	Name               string   `json:"name"`
 	Label              string   `json:"label"`
 	Fields             []string `json:"fields"`
 	CompanyField       string   `json:"company_field"`
 	CompanyIndependent bool     `json:"company_independent"`
+	IncludeCompanyless bool     `json:"include_companyless"`
 	AllowAggregate     bool     `json:"allow_aggregate"`
 }
 
@@ -413,18 +452,8 @@ func BuildFromServer(client *odoo.Client, instance string, scope policy.CompanyS
 	if strings.TrimSpace(instance) == "" {
 		return Snapshot{}, fmt.Errorf("snapshot: instance is empty")
 	}
-	if len(scope.Enabled) < 2 {
-		return Snapshot{}, fmt.Errorf("snapshot: need at least two enabled companies, got %d", len(scope.Enabled))
-	}
-	enabledSet := map[int]bool{}
-	for _, id := range scope.Enabled {
-		if enabledSet[id] {
-			return Snapshot{}, fmt.Errorf("snapshot: duplicate enabled company %d", id)
-		}
-		enabledSet[id] = true
-	}
-	if !enabledSet[scope.Default] {
-		return Snapshot{}, fmt.Errorf("snapshot: default company %d is not in enabled companies", scope.Default)
+	if err := policy.ValidateScope(scope); err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot: %w", err)
 	}
 	if len(specs) == 0 {
 		return Snapshot{}, fmt.Errorf("snapshot: at least one approved model is required")
@@ -466,10 +495,17 @@ func BuildFromServer(client *odoo.Client, instance string, scope policy.CompanyS
 				return Snapshot{}, fmt.Errorf("snapshot: specs %q: invalid company_field %q", norm, sp.CompanyField)
 			}
 		}
+		if sp.CompanyIndependent && sp.CompanyField != "" {
+			return Snapshot{}, fmt.Errorf("snapshot: specs %q contradictory: company-independent with company field", norm)
+		}
+		// NOTE: IncludeCompanyless on an independent model is NOT rejected
+		// here (data-only carry-through, same as ModelMeta): policy
+		// construction in the setup slice rejects it via policy Validate.
 		clean = append(clean, ModelSpec{
 			Name: norm, Label: label, Fields: fields,
 			CompanyField: cf, CompanyIndependent: sp.CompanyIndependent,
-			AllowAggregate: sp.AllowAggregate,
+			IncludeCompanyless: sp.IncludeCompanyless,
+			AllowAggregate:     sp.AllowAggregate,
 		})
 	}
 
@@ -565,7 +601,8 @@ func BuildFromServer(client *odoo.Client, instance string, scope policy.CompanyS
 		models[sp.Name] = ModelMeta{
 			Name: sp.Name, Label: label, Fields: fields,
 			CompanyField: sp.CompanyField, CompanyIndependent: sp.CompanyIndependent,
-			Provenance: ProvServer,
+			IncludeCompanyless: sp.IncludeCompanyless,
+			Provenance:         ProvServer,
 		}
 	}
 

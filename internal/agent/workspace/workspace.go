@@ -6,8 +6,8 @@
 // paths are cleaned and rejected when absolute or escaping (".." past the
 // root); os.Root then confines even symlink traversals to the root.
 // ValidateDedicatedDir (used by OpenValidated, setup, and the broker's
-// serve-time check) additionally requires a dedicated, canonical,
-// non-group/world-writable directory that overlaps no protected path.
+// serve-time check) additionally requires a dedicated, canonical, 0700
+// user-owned directory that overlaps no protected path.
 //
 // Trust and platform limits, stated honestly rather than hand-waved:
 //
@@ -25,11 +25,26 @@
 //     keeps the old content (the safe direction — the link never observes
 //     a half-written file). There is no in-place mutation.
 //   - Hardlinks: reads through a hardlink planted inside the root to an
-//     outside file are inherent (the link shares the inode; no path
-//     check can see through it). Posture is trusted-private-contents:
-//     the workspace dir is 0700 user-owned, so only the same user can
-//     plant such a link. Rejecting hardlinked WRITES is unnecessary:
-//     rename-write already breaks links instead of following them.
+//     outside file share the target's inode, so no path check can see
+//     through the link. Where the platform reports link counts (unix),
+//     Read refuses any held handle with more than one link, so a planted
+//     hardlink denies instead of leaking. Where the count is unattestable
+//     (Windows and other ports), posture is trusted-private-contents: the
+//     workspace dir is 0700 user-owned, so only the same user could plant
+//     such a link — never claimed as confinement. Writes are safe
+//     everywhere regardless: rename-write breaks (not follows) links.
+//   - FIFO blocking: opening a FIFO for reading blocks until a writer
+//     arrives, so a planted FIFO is a hang, not just a read. Read never
+//     lets that happen: it opens with O_NONBLOCK where the platform offers
+//     it (unix), so the open returns immediately, and the held-handle
+//     f.Stat then refuses the FIFO before any Read runs. There is no
+//     pre-open Stat: the name can be swapped between Stat and Open, so
+//     only the HELD handle is judged. On Windows O_NONBLOCK does not exist
+//     and a plain open is used; FIFO nodes cannot be planted in a Windows
+//     directory (named pipes live outside the filesystem namespace), so the
+//     raced-FIFO block class does not apply there, and the held-handle
+//     refusal still runs. (On GOOS=js os.Root confinement itself has TOCTOU
+//     races — see below.)
 //   - No mount/device/proxy confinement: os.Root does not prohibit
 //     filesystem-boundary traversal, bind mounts, /proc-style special
 //     files, or Unix device nodes. Workspace content is human-placed;
@@ -39,6 +54,12 @@
 //   - Chmod races: on Unix, Root.Chmod/Chown/Chtimes can be redirected by
 //     swapping the target for a symlink mid-call. Write avoids this by
 //     chmoding the still-open file handle (f.Chmod), not the path.
+//   - Ownership: ValidateDedicatedDir requires mode 0700 (any group/other
+//     permission bit refuses) and, on unix, that the directory is owned by
+//     the calling euid. On Windows neither check is attestable through
+//     os.Stat, so both are skipped there (documented limitation, not a
+//     silent approve); on js/plan9-class ports unattestable ownership
+//     fails closed.
 //   - Platform caveats (from os.Root): on GOOS=js, symlink validation has
 //     TOCTOU races and confinement cannot be ensured; on GOOS=plan9 and
 //     GOOS=js a Root tracks a directory name, not a handle, so renames of
@@ -46,9 +67,10 @@
 //
 // Caps (maxEntries, maxBytes) are enforced by denial: over-cap reads fail
 // instead of truncating, so a caller can never mistake a partial listing
-// for a complete one. Listings are additionally capped by the fixed
-// policy-side MaxListEntries: a caller max_entries only narrows, never
-// widens it.
+// for a complete one. List reads at most cap+1 entries through the held
+// directory handle and denies when the cap is exceeded, so enumeration cost
+// is bounded by the policy cap (MaxListEntries, which a caller cap only
+// narrows), never by directory size.
 package workspace
 
 import (
@@ -160,11 +182,19 @@ func isWithin(child, parent string) bool {
 
 // ValidateDedicatedDir checks that dir is a safe dedicated workspace:
 // canonicalized (EvalSymlinks) and rejected when empty, a broad/system
-// root, the home directory itself, missing, not a directory, group/other
-// writable (Unix only; Windows skips the mode check), or overlapping any
+// root, the home directory itself, missing, not a directory, carrying any
+// group/other permission bit (0700-equivalent, non-Windows), not owned by
+// the calling euid (unix only; see ownership note below), overlapping the
+// legacy config-nested default (with a migration note), or overlapping any
 // protected path (equal, parent-of, child-of, or symlink-alias-equal).
 // Protected paths are the resolved profile path, snapshot path, config
 // dir, and admin socket dir (plus the socket path itself).
+//
+// Ownership note: on unix the directory must be owned by the calling euid
+// (verified from the stat owner). On Windows neither mode bits nor
+// ownership are attestable through os.Stat, so both checks are skipped
+// there — a documented platform limitation, not a silent approve. On
+// js/plan9-class ports ownership is unattestable and fails closed.
 func ValidateDedicatedDir(dir string, protected []string) (string, error) {
 	if strings.TrimSpace(dir) == "" {
 		return "", fmt.Errorf("workspace: empty directory")
@@ -214,9 +244,38 @@ func ValidateDedicatedDir(dir string, protected []string) (string, error) {
 	if !st.IsDir() {
 		return "", fmt.Errorf("workspace: %q is not a directory", dir)
 	}
+	// 0700-equivalent: any group/other permission bit refuses. Skipped on
+	// Windows, where os.Stat cannot attest mode bits (documented
+	// limitation); enforced everywhere else (unix ownership check below
+	// pins the same-user requirement on top).
 	if runtime.GOOS != "windows" {
-		if st.Mode().Perm()&0022 != 0 {
-			return "", fmt.Errorf("workspace: %q has mode %04o: group/other write refused", dir, st.Mode().Perm())
+		if perm := st.Mode().Perm(); perm&0077 != 0 {
+			return "", fmt.Errorf("workspace: %q has mode %04o: want 0700 (no group/other bits)", dir, perm)
+		}
+	}
+	// Owner check: the directory must belong to the calling user, or a
+	// foreign-owned 0700-by-someone-else dir could gatekeep reads while
+	// passing the mode check.
+	if match, known := fileOwnerMatchesCurrent(st); !known {
+		if runtime.GOOS == "windows" {
+			// Documented skip: Windows ACL ownership is not attested
+			// here. Same-user posture only.
+		} else {
+			return "", fmt.Errorf("workspace: %q ownership unattestable on this platform", dir)
+		}
+	} else if !match {
+		return "", fmt.Errorf("workspace: %q is not owned by the current user", dir)
+	}
+	// Legacy overlapping default: the setup default used to suggest a
+	// workspace nested under ~/.config/odoo-cli (the config dir holding
+	// the profile and snapshot). Any workspace at or under that config
+	// dir rejects with a migration note — protected-overlap below would
+	// also deny it, but the note tells the human where to move instead
+	// of leaving them to guess.
+	if home, herr := os.UserHomeDir(); herr == nil && strings.TrimSpace(home) != "" {
+		legacyCfg := filepath.Join(home, ".config", "odoo-cli")
+		if lc, lerr := canonicalPath(legacyCfg); lerr == nil && (canon == lc || isWithin(canon, lc)) {
+			return "", fmt.Errorf("workspace: %q sits under the config dir %q (move it to ~/odoo-agent-workspace or another non-config directory)", dir, legacyCfg)
 		}
 	}
 	for _, p := range protected {
@@ -339,10 +398,10 @@ func (w *Workspace) List(rel string, maxEntries int) ([]Entry, error) {
 		return nil, fmt.Errorf("workspace: maxEntries must be positive, got %d", maxEntries)
 	}
 	// The caller cap only narrows: it can never widen the fixed
-	// policy-side MaxListEntries. ReadDir(-1) materializes the whole
-	// directory, so the readdir cost is bounded by policy-cap denial
-	// plus OS memory (documented, not streamed: os.Root has no ReadDirN
-	// streaming form).
+	// policy-side MaxListEntries. Enumeration is a single bounded
+	// ReadDir(cap+1) through the held handle: one extra entry proves
+	// over-cap, and cost is bounded by the policy cap, never by
+	// directory size.
 	effectiveMax := maxEntries
 	if effectiveMax > MaxListEntries {
 		effectiveMax = MaxListEntries
@@ -351,24 +410,30 @@ func (w *Workspace) List(rel string, maxEntries int) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := w.root.Stat(clean)
-	if err != nil {
-		return nil, fmt.Errorf("workspace: stat %q: %w", rel, err)
-	}
-	if !st.IsDir() {
-		return nil, fmt.Errorf("workspace: %q is not a directory", rel)
-	}
+	// Open the held handle first, then judge the handle: no pre-open
+	// Stat, so a swap between check and use cannot attest a name Open
+	// no longer resolves to. A dir/file swap still resolves to the
+	// replacement through the same held handle and denies below.
 	f, err := w.root.Open(clean)
 	if err != nil {
 		return nil, fmt.Errorf("workspace: opening %q: %w", rel, err)
 	}
 	defer f.Close()
-	infos, err := f.ReadDir(-1)
+	if fst, err := f.Stat(); err != nil {
+		return nil, fmt.Errorf("workspace: stat %q: %w", rel, err)
+	} else if !fst.IsDir() {
+		return nil, fmt.Errorf("workspace: %q is not a directory", rel)
+	}
+	// Bounded enumeration: read at most cap+1 names through the held
+	// handle. effectiveMax+1 always fits an int on every platform Go
+	// supports (effectiveMax <= MaxListEntries = 1000).
+	want := effectiveMax + 1
+	infos, err := f.ReadDir(want)
 	if err != nil {
 		return nil, fmt.Errorf("workspace: listing %q: %w", rel, err)
 	}
 	if len(infos) > effectiveMax {
-		return nil, fmt.Errorf("workspace: %q holds %d entries, over cap %d", rel, len(infos), effectiveMax)
+		return nil, fmt.Errorf("workspace: %q holds more than %d entries (over cap)", rel, effectiveMax)
 	}
 	out := make([]Entry, 0, len(infos))
 	for _, info := range infos {
@@ -389,12 +454,19 @@ func (w *Workspace) List(rel string, maxEntries int) ([]Entry, error) {
 
 // Read returns the full content of the regular file at rel. maxBytes must
 // be positive; a file larger than maxBytes denies instead of truncating.
-// After Open, the held handle is f.Stat'ed before reading and any
-// non-regular mode (directories, devices, sockets, pipes incl. FIFOs)
-// refuses, so Root.Open on a FIFO (which succeeds) never blocks in Read.
-// Residual risk (documented): the path entry can be swapped between the
-// pre-open Stat and Open; the post-open f.Stat closes the FIFO-block hole
-// but a swapped regular file still reads the replacement.
+// There is deliberately NO pre-open Stat: the name can be swapped between
+// Stat and Open, so only the HELD handle is judged. The open itself uses
+// O_NONBLOCK where the platform offers it (unix), so opening a planted
+// FIFO returns immediately instead of blocking for a writer; the
+// held-handle f.Stat then refuses the FIFO (and any other non-regular
+// file: directories, devices, sockets, pipes) before any Read runs. On
+// Windows O_NONBLOCK does not exist and a plain open is used — FIFO nodes
+// cannot be planted in a Windows directory, so that block class does not
+// apply there, and the held-handle refusal still runs. Where the platform
+// reports link counts (unix), a handle with more than one link (a hardlink
+// planted inside the root to an outside file shares the inode) refuses;
+// where unattestable the posture is trusted-private-contents (0700
+// user-owned dir), documented above, never claimed as confinement.
 func (w *Workspace) Read(rel string, maxBytes int) ([]byte, error) {
 	if w == nil || w.root == nil {
 		return nil, fmt.Errorf("workspace: closed")
@@ -409,23 +481,23 @@ func (w *Workspace) Read(rel string, maxBytes int) ([]byte, error) {
 	if clean == "." {
 		return nil, fmt.Errorf("workspace: refusing to read the workspace root")
 	}
-	if st, err := w.root.Stat(clean); err != nil {
-		return nil, fmt.Errorf("workspace: stat %q: %w", rel, err)
-	} else if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("workspace: %q is not a regular file", rel)
-	}
-	f, err := w.root.Open(clean)
+	// Single raced-open path: judge only what Open returned. (A pre-open
+	// Stat would attest a name that Open may no longer resolve to.)
+	f, err := w.root.OpenFile(clean, openReadNoBlock, 0)
 	if err != nil {
 		return nil, fmt.Errorf("workspace: opening %q: %w", rel, err)
 	}
 	defer f.Close()
-	// Held-handle check: refuse FIFOs/sockets/devices that Open let
-	// through, before any blocking Read.
+	// Held-handle check: refuse every non-regular file BEFORE any Read.
+	// Root.Open (and OpenFile) succeed on FIFOs, so judging the name
+	// first would still block; judging the handle cannot.
 	if fst, err := f.Stat(); err != nil {
 		return nil, fmt.Errorf("workspace: stat %q: %w", rel, err)
 	} else if mode := fst.Mode(); !mode.IsRegular() || mode&fs.ModeNamedPipe != 0 ||
 		mode&fs.ModeSocket != 0 || mode&fs.ModeDevice != 0 || mode&fs.ModeCharDevice != 0 {
 		return nil, fmt.Errorf("workspace: %q is not a regular file", rel)
+	} else if n, ok := fileLinkCount(fst); ok && n > 1 {
+		return nil, fmt.Errorf("workspace: %q is hardlinked (%d links): refusing", rel, n)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)+1))
 	if err != nil {

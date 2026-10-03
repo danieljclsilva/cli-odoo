@@ -56,30 +56,92 @@ func agentParent() *cobra.Command {
 	return p
 }
 
+// agentMaxProfileBytes bounds every sealed-profile read on the serve path:
+// 4 MiB, the same cap the lock package enforces on payloads and ciphertext.
+const agentMaxProfileBytes = 4 << 20
+
+// agentLoadProfileEnvelope reads profilePath with a strict decoder: the
+// file must be a regular file of at most agentMaxProfileBytes, hold
+// exactly one JSON object (unknown fields rejected, trailing data after
+// the document denied), and decode as a lock.Profile envelope. Every
+// serving-stack loading path funnels here so a swapped/ragged profile
+// fails closed before crypto runs.
+func agentLoadProfileEnvelope(profilePath string) (lock.Profile, error) {
+	var prof lock.Profile
+	st, err := os.Stat(profilePath)
+	if err != nil {
+		return prof, fmt.Errorf("reading profile: %w", err)
+	}
+	if !st.Mode().IsRegular() {
+		return prof, fmt.Errorf("reading profile %q: not a regular file", profilePath)
+	}
+	if st.Size() > agentMaxProfileBytes {
+		return prof, fmt.Errorf("reading profile %q: %d bytes exceeds cap %d", profilePath, st.Size(), agentMaxProfileBytes)
+	}
+	f, err := os.Open(profilePath)
+	if err != nil {
+		return prof, fmt.Errorf("reading profile: %w", err)
+	}
+	defer f.Close()
+	dec := json.NewDecoder(io.LimitReader(f, agentMaxProfileBytes+1))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&prof); err != nil {
+		return prof, fmt.Errorf("decoding profile: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return prof, fmt.Errorf("decoding profile: trailing data after document")
+	}
+	return prof, nil
+}
+
+// agentServingPaths resolves the broker's serve-time protected set from the
+// actual loading inputs: the profile file, the sealed snapshot path, the
+// config dir holding them, and the per-user private admin dir (plus the
+// derived socket path itself, computed for the serving address by the
+// broker). The admin dir is broker.PrivateAdminDir(), never the shared temp
+// root: the shared root is world-writable and would fail the serve-time
+// ensurePrivateDir check (fail closed) on Linux.
+func agentServingPaths(profilePath string, pol *policy.Policy) broker.ServingPaths {
+	cfgDir := ""
+	if abs, err := filepath.Abs(profilePath); err == nil {
+		cfgDir = filepath.Dir(abs)
+	}
+	return broker.ServingPaths{
+		ProfilePath:  profilePath,
+		SnapshotPath: pol.SnapshotPath,
+		ConfigDir:    cfgDir,
+		AdminDir:     broker.PrivateAdminDir(),
+	}
+}
+
 // loadServingStack opens profilePath with the admin password, decodes the
 // sealed policy JSON, and loads the snapshot it points at. It resolves
 // nothing and dials nothing: broker.Serve does that on the human machine.
-func loadServingStack(profilePath, adminPassword string) (*policy.Policy, *config.Instance, snapshot.Snapshot, error) {
-	raw, err := os.ReadFile(profilePath)
+// The profile envelope is strictly decoded (regular file, 4 MiB cap,
+// exactly one JSON object); the sealed policy JSON is strictly decoded
+// the same way (unknown fields rejected, trailing data denied).
+func loadServingStack(profilePath, adminPassword string) (*policy.Policy, *config.Instance, snapshot.Snapshot, broker.ServingPaths, error) {
+	prof, err := agentLoadProfileEnvelope(profilePath)
 	if err != nil {
-		return nil, nil, snapshot.Snapshot{}, fmt.Errorf("reading profile: %w", err)
-	}
-	var prof lock.Profile
-	if err := json.Unmarshal(raw, &prof); err != nil {
-		return nil, nil, snapshot.Snapshot{}, fmt.Errorf("decoding profile: %w", err)
+		return nil, nil, snapshot.Snapshot{}, broker.ServingPaths{}, err
 	}
 	opened, err := prof.Open(adminPassword)
 	if err != nil {
-		return nil, nil, snapshot.Snapshot{}, err
+		return nil, nil, snapshot.Snapshot{}, broker.ServingPaths{}, err
 	}
 	var pol policy.Policy
 	dec := json.NewDecoder(bytes.NewReader(opened))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&pol); err != nil {
-		return nil, nil, snapshot.Snapshot{}, fmt.Errorf("decoding sealed policy: %w", err)
+		return nil, nil, snapshot.Snapshot{}, broker.ServingPaths{}, fmt.Errorf("decoding sealed policy: %w", err)
 	}
-	if pol.Version != 1 {
-		return nil, nil, snapshot.Snapshot{}, fmt.Errorf("unsupported sealed policy version %d", pol.Version)
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, nil, snapshot.Snapshot{}, broker.ServingPaths{}, fmt.Errorf("decoding sealed policy: trailing data after document")
+	}
+	if pol.Version != policy.PolicyVersion {
+		return nil, nil, snapshot.Snapshot{}, broker.ServingPaths{}, fmt.Errorf("unsupported sealed policy version %d", pol.Version)
 	}
 	snapPath := pol.SnapshotPath
 	if strings.TrimSpace(snapPath) == "" {
@@ -87,14 +149,14 @@ func loadServingStack(profilePath, adminPassword string) (*policy.Policy, *confi
 	}
 	snap, err := snapshot.Load(snapPath)
 	if err != nil {
-		return nil, nil, snapshot.Snapshot{}, err
+		return nil, nil, snapshot.Snapshot{}, broker.ServingPaths{}, err
 	}
 	inst, err := config.ResolveNoAuth(pol.Instance)
 	if err != nil {
-		return nil, nil, snapshot.Snapshot{}, err
+		return nil, nil, snapshot.Snapshot{}, broker.ServingPaths{}, err
 	}
 	out := *inst
-	return &pol, &out, snap, nil
+	return &pol, &out, snap, agentServingPaths(profilePath, &pol), nil
 }
 
 // readAdminPassword unifies the two password sources: --admin-password-stdin
@@ -122,11 +184,11 @@ func newAgentServeCmd() *cobra.Command {
 			if err != nil {
 				output.Fail(tool, err)
 			}
-			pol, inst, snap, err := loadServingStack(profilePath, pw)
+			pol, inst, snap, paths, err := loadServingStack(profilePath, pw)
 			if err != nil {
 				output.Fail(tool, err)
 			}
-			b, err := broker.New(pol, inst, snap)
+			b, err := broker.New(pol, inst, snap, paths)
 			if err != nil {
 				output.Fail(tool, err)
 			}
@@ -141,7 +203,7 @@ func newAgentServeCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&profilePath, "profile", "", "sealed profile path (default "+DefaultAgentProfilePath()+")")
 	c.Flags().StringVar(&addr, "addr", "127.0.0.1:8471", "loopback bind address (127.0.0.1, ::1, or localhost only)")
-	c.Flags().StringVar(&socketPath, "socket", "", "admin unix-socket path (default derived from --addr)")
+	c.Flags().StringVar(&socketPath, "socket", "", "admin unix-socket path override (must sit directly in the serving private admin dir; default derived from --addr)")
 	c.Flags().BoolVar(&stdinFlag, "admin-password-stdin", false, "read admin password from stdin (never args/env)")
 	return c
 }
@@ -318,7 +380,10 @@ func newAgentMCPCmd() *cobra.Command {
 // newAgentOMPInitCmd writes a reviewed OMP tools config snippet plus a Codex
 // MCP config snippet into --dir (examples only; never user settings). The
 // snippet references the broker URL placeholder and the token env var; no
-// secrets are written.
+// secrets are written. The OMP snippet loads the REAL factory module:
+// tools/omp/odoo-broker.js exports a CustomToolFactory (a function taking
+// the OMP CustomToolAPI and returning tools) for tools placed under
+// .omp/tools — it is not a static { tools } list.
 func newAgentOMPInitCmd() *cobra.Command {
 	var dir, brokerURL string
 	c := &cobra.Command{
@@ -336,12 +401,12 @@ func newAgentOMPInitCmd() *cobra.Command {
 				output.Fail(tool, err)
 			}
 			ompSnippet := "// Reviewed OMP wiring for the cli-odoo Odoo broker (generated by `agent omp-init`).\n" +
-				"// Copy odoo-broker.js from tools/omp/ beside this file, then require it:\n" +
-				"//   const { tools } = require('./odoo-broker.js');\n" +
+				"// Copy odoo-broker.js from tools/omp/ into .omp/tools/ (the loader scans\n" +
+				"// .omp/tools/ for factory modules), e.g. .omp/tools/odoo-broker.js.\n" +
+				"// OMP loads it as a CustomToolFactory: module.exports = (pi) => [...tools].\n" +
 				"// Broker: " + brokerURL + " (set ODOO_BROKER_URL to override).\n" +
 				"// Auth: export ODOO_BROKER_TOKEN in the OMP process env (never write the token here).\n" +
-				"// Typed tools only: odoo.search/read/count/aggregate/meta/companies/catalog/workspace.*.\n" +
-				"module.exports = { brokerURL: " + fmt.Sprintf("%q", brokerURL) + " };\n"
+				"// Typed tools only: odoo.search/read/count/aggregate/meta/companies/catalog/workspace.* (incl. workspace.mkdir).\n"
 			codexSnippet := "# Codex MCP config snippet (generated by `agent omp-init`; merge by hand).\n" +
 				"# Restricted: typed broker tools only, token via env var, no secrets written.\n" +
 				"#   codex mcp add odoo-broker -- cli-odoo agent mcp --url " + brokerURL + "\n" +

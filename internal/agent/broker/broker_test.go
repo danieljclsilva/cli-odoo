@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,11 @@ func (f *fakeExec) Execute(model, method string, args []any, kwargs map[string]a
 }
 
 func testPolicy() *policy.Policy {
+	snap := testSnapshot()
+	digest, err := snapshot.CanonicalDigest(snap)
+	if err != nil {
+		panic("test digest: " + err.Error())
+	}
 	return &policy.Policy{
 		Version:    1,
 		Instance:   "test",
@@ -68,15 +74,40 @@ func testPolicy() *policy.Policy {
 		Models: map[string]policy.ModelRule{
 			"res.partner": {Fields: []string{"name"}, MaxLimit: 50, CompanyField: "company_id"},
 		},
-		Scope:         policy.CompanyScope{Enabled: []int{1, 2}, Default: 1},
-		SharedRecords: policy.SharedDeny,
-		Budgets:       policy.Budgets{MaxLimit: 100, MaxOffset: 1000, MaxRowsPerCall: 10, MaxResponseBytes: 1 << 20, MaxCallsPerSession: 100, MaxRowsPerSession: 1000},
+		Scope:          policy.CompanyScope{Enabled: []int{1, 2}, Default: 1},
+		SharedRecords:  policy.SharedDeny,
+		Budgets:        policy.Budgets{MaxLimit: 100, MaxOffset: 1000, MaxRowsPerCall: 10, MaxResponseBytes: 1 << 20, MaxCallsPerSession: 100, MaxRowsPerSession: 1000},
+		SnapshotSHA256: digest,
+	}
+}
+
+// testSnapshot is the human-built metadata backing testPolicy's digest
+// binding: res.partner.company_id resolves to a res.company many2one so
+// CompanyFieldValid passes, and mixed field provenance exercises the
+// catalog's per-field provenance + unknown-provenance entries.
+func testSnapshot() snapshot.Snapshot {
+	return snapshot.Snapshot{
+		Instance:           "test",
+		AvailableCompanies: []snapshot.Company{{ID: 1, Name: "A"}, {ID: 2, Name: "B"}},
+		EnabledCompanies:   []int{1, 2},
+		DefaultCompany:     1,
+		Models: map[string]snapshot.ModelMeta{
+			"res.partner": {
+				Name: "res.partner", Label: "Partner", Provenance: snapshot.ProvServer,
+				CompanyField: "company_id",
+				Fields: map[string]snapshot.SFieldMeta{
+					"name":       {Name: "name", Type: "char", Label: "Name"},
+					"company_id": {Name: "company_id", Type: "many2one", Relation: "res.company", Label: "Company", Provenance: snapshot.ProvServer},
+				},
+			},
+		},
+		MethodManifest: []string{"search_read", "read"},
 	}
 }
 
 func testBroker(t *testing.T, gate *fakeGate, exec *fakeExec) *Broker {
 	t.Helper()
-	b, err := New(testPolicy(), &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, err := New(testPolicy(), &config.Instance{Name: "test"}, testSnapshot())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -109,7 +140,7 @@ func post(t *testing.T, b *Broker, path, token, body string) *httptest.ResponseR
 }
 
 func TestGrantCheckExpiryRevocation(t *testing.T) {
-	b, err := New(testPolicy(), &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, err := New(testPolicy(), &config.Instance{Name: "test"}, testSnapshot())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -146,7 +177,7 @@ func TestGrantCheckExpiryRevocation(t *testing.T) {
 }
 
 func TestRevokePrefixUnambiguousOnly(t *testing.T) {
-	b, _ := New(testPolicy(), &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, _ := New(testPolicy(), &config.Instance{Name: "test"}, testSnapshot())
 	a, _ := b.Grant(time.Hour)
 	// Full tokens always work.
 	if err := b.revokePrefix(a); err != nil {
@@ -188,7 +219,7 @@ func TestRevokePrefixUnambiguousOnly(t *testing.T) {
 func TestSessionBudgetHeadroom(t *testing.T) {
 	p := testPolicy()
 	p.Budgets.MaxCallsPerSession = 1
-	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, _ := New(p, &config.Instance{Name: "test"}, testSnapshot())
 	tok, _ := b.Grant(time.Hour)
 	if err := b.Check(tok); err != nil {
 		t.Fatalf("pre-call Check: %v", err)
@@ -241,8 +272,8 @@ func TestDeniedBeforeRPCOrdering(t *testing.T) {
 	b := testBroker(t, gate, exec)
 	tok := grantToken(t, b)
 	for _, tc := range []struct{ path, body string }{
-		{"/rpc/search", `{"model":"res.partner"}`},
-		{"/rpc/read", `{"model":"res.partner","ids":[1]}`},
+		{"/rpc/search", `{"model":"res.partner","fields":["name"]}`},
+		{"/rpc/read", `{"model":"res.partner","ids":[1],"fields":["name"]}`},
 		{"/rpc/count", `{"model":"res.partner"}`},
 		{"/rpc/aggregate", `{"model":"res.partner","groupby":["name"],"count":true}`},
 	} {
@@ -269,7 +300,7 @@ func TestContextOverwrite(t *testing.T) {
 	if len(exec.calls) != 0 {
 		t.Fatal("Execute called with caller context")
 	}
-	rec = post(t, b, "/rpc/search", tok, `{"model":"res.partner","domain":[["name","=","acme"]]}`)
+	rec = post(t, b, "/rpc/search", tok, `{"model":"res.partner","fields":["name"],"domain":[["name","=","acme"]]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("search code = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -306,7 +337,7 @@ func TestContextOverwrite(t *testing.T) {
 // Reviewer-driven: the company fragment must AND, never OR, with caller
 // prefix operators. An arity-incomplete domain denies at the real gate
 func TestPrefixCaptureDeniedAtRealGate(t *testing.T) {
-	b, err := New(testPolicy(), &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, err := New(testPolicy(), &config.Instance{Name: "test"}, testSnapshot())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -316,9 +347,9 @@ func TestPrefixCaptureDeniedAtRealGate(t *testing.T) {
 		t.Fatalf("Grant: %v", err)
 	}
 	for _, body := range []string{
-		`{"model":"res.partner","domain":["|",["name","=","x"]]}`,
-		`{"model":"res.partner","domain":["!"]}`,
-		`{"model":"res.partner","domain":[["name","=","x"],"|"]}`,
+		`{"model":"res.partner","fields":["name"],"domain":["|",["name","=","x"]]}`,
+		`{"model":"res.partner","fields":["name"],"domain":["!"]}`,
+		`{"model":"res.partner","fields":["name"],"domain":[["name","=","x"],"|"]}`,
 	} {
 		rec := post(t, b, "/rpc/search", tok, body)
 		if rec.Code != http.StatusForbidden {
@@ -335,7 +366,7 @@ func TestReadConvertsToSearchRead(t *testing.T) {
 	exec := &fakeExec{rows: []any{map[string]any{"id": 7}}}
 	b := testBroker(t, gate, exec)
 	tok := grantToken(t, b)
-	rec := post(t, b, "/rpc/read", tok, `{"model":"res.partner","ids":[7,8]}`)
+	rec := post(t, b, "/rpc/read", tok, `{"model":"res.partner","ids":[7,8],"fields":["name"]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("read code = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -367,7 +398,7 @@ func TestReadConvertsToSearchRead(t *testing.T) {
 	}
 }
 
-func TestOversizedResponseCap(t *testing.T) {
+func TestOversizedResultDeniesInsteadOfFalseComplete(t *testing.T) {
 	p := testPolicy()
 	p.Budgets.MaxRowsPerCall = 2
 	p.Budgets.MaxResponseBytes = 1 << 20
@@ -376,25 +407,25 @@ func TestOversizedResponseCap(t *testing.T) {
 	for i := range rows {
 		rows[i] = map[string]any{"id": i}
 	}
-	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, _ := New(p, &config.Instance{Name: "test"}, testSnapshot())
 	b.authz = gate
 	b.frag = policy.CompanyDomain
 	b.exec = &fakeExec{rows: rows}
 	tok := grantToken(t, b)
+	// Five rows against a MaxRowsPerCall=2 cap: no silent truncation to a
+	// false-complete count=2 — the request denies (fail closed, still billed).
 	rec := post(t, b, "/rpc/search", tok, `{"model":"res.partner"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code = %d", rec.Code)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, want 429 deny (no silent truncation)", rec.Code)
 	}
-	var env struct {
-		Success bool             `json:"success"`
-		Result  []map[string]any `json:"result"`
-		Count   int              `json:"count"`
+	if len(b.exec.(*fakeExec).calls) != 1 {
+		t.Fatalf("calls = %d, want 1 (denial is post-RPC, attempt billed)", len(b.exec.(*fakeExec).calls))
 	}
-	if err := json.NewDecoder(rec.Body).Decode(&env); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if env.Count != 2 || len(env.Result) != 2 {
-		t.Fatalf("count = %d rows = %d, want capped at 2", env.Count, len(env.Result))
+	b.mu.Lock()
+	rowsBilled := b.sessions[tok].rows
+	b.mu.Unlock()
+	if rowsBilled <= 0 {
+		t.Fatalf("rows = %d, want billed reservation kept on deny", rowsBilled)
 	}
 }
 
@@ -407,7 +438,7 @@ func TestByteCapTrimsRows(t *testing.T) {
 		map[string]any{"id": 1, "name": "abcdefghijklmnopqrstuvwxyz"},
 		map[string]any{"id": 2, "name": "abcdefghijklmnopqrstuvwxyz"},
 	}
-	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, _ := New(p, &config.Instance{Name: "test"}, testSnapshot())
 	b.authz = gate
 	b.frag = policy.CompanyDomain
 	b.exec = &fakeExec{rows: rows}
@@ -455,7 +486,7 @@ func TestRedactMirrorsSanitize(t *testing.T) {
 			t.Fatalf("secrets missing %q: %v", want, got)
 		}
 	}
-	b, _ := New(testPolicy(), &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, _ := New(testPolicy(), &config.Instance{Name: "test"}, testSnapshot())
 	b.secrets = got
 	err := b.sanitizeBrokerErr(fmt.Errorf("dial failed with s3cret-pw at host"))
 	if strings.Contains(err.Error(), "s3cret-pw") {
@@ -481,18 +512,18 @@ func TestMethodGuards(t *testing.T) {
 func TestNewRejectsInvalidPolicy(t *testing.T) {
 	bad := testPolicy()
 	bad.Budgets.MaxResponseBytes = 0
-	if _, err := New(bad, &config.Instance{Name: "test"}, snapshot.Snapshot{}); err == nil {
+	if _, err := New(bad, &config.Instance{Name: "test"}, testSnapshot()); err == nil {
 		t.Fatal("New accepted zero MaxResponseBytes")
 	}
 	contra := testPolicy()
 	contra.Models["res.partner"] = policy.ModelRule{Fields: []string{"name"}, CompanyIndependent: true, CompanyField: "company_id"}
-	if _, err := New(contra, &config.Instance{Name: "test"}, snapshot.Snapshot{}); err == nil {
+	if _, err := New(contra, &config.Instance{Name: "test"}, testSnapshot()); err == nil {
 		t.Fatal("New accepted contradictory rule")
 	}
 }
 
 func TestSessionTTLClampedAndCapped(t *testing.T) {
-	b, err := New(testPolicy(), &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, err := New(testPolicy(), &config.Instance{Name: "test"}, testSnapshot())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -509,7 +540,7 @@ func TestSessionTTLClampedAndCapped(t *testing.T) {
 func TestReserveRowsDeniedWhenExhausted(t *testing.T) {
 	p := testPolicy()
 	p.Budgets.MaxRowsPerSession = 2
-	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, _ := New(p, &config.Instance{Name: "test"}, testSnapshot())
 	tok, _ := b.Grant(time.Hour)
 	if err := b.Check(tok); err != nil {
 		t.Fatalf("Check: %v", err)
@@ -598,32 +629,39 @@ func TestStrictDecodeRejectsTrailingData(t *testing.T) {
 
 func TestCheckScopeMatchRefusesMismatch(t *testing.T) {
 	p := testPolicy()
-	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{Instance: "other"})
+	snap := testSnapshot()
+	snap.Instance = "other"
+	digest, _ := snapshot.CanonicalDigest(snap)
+	p.SnapshotSHA256 = digest
+	b, _ := New(p, &config.Instance{Name: "test"}, snap)
 	if err := b.checkScopeMatch(); err == nil {
 		t.Fatal("instance mismatch accepted")
 	}
-	b2, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{
-		Instance: "test", EnabledCompanies: []int{1, 2}, DefaultCompany: 9,
-		AvailableCompanies: []snapshot.Company{{ID: 1, Name: "a"}, {ID: 2, Name: "b"}},
-	})
+	snap2 := testSnapshot()
+	snap2.DefaultCompany = 9
+	digest2, _ := snapshot.CanonicalDigest(snap2)
+	p.SnapshotSHA256 = digest2
+	b2, _ := New(p, &config.Instance{Name: "test"}, snap2)
 	if err := b2.checkScopeMatch(); err == nil {
 		t.Fatal("default mismatch accepted")
 	}
+	b3, _ := New(testPolicy(), &config.Instance{Name: "wrong"}, testSnapshot())
+	if err := b3.checkScopeMatch(); err == nil {
+		t.Fatal("config instance mismatch accepted")
+	}
 }
-
 func TestDiscoveryCatalogMarksExecutable(t *testing.T) {
 	p := testPolicy()
-	snap := snapshot.Snapshot{
-		Instance:           "test",
-		AvailableCompanies: []snapshot.Company{{ID: 1, Name: "A"}, {ID: 2, Name: "B"}},
-		EnabledCompanies:   []int{1, 2}, DefaultCompany: 1,
-		Models: map[string]snapshot.ModelMeta{
-			"res.partner": {Name: "res.partner", Label: "Partner", Provenance: snapshot.ProvServer,
-				Fields: map[string]snapshot.SFieldMeta{"name": {Name: "name", Type: "char", Label: "Name"}}},
-			"discover.only": {Name: "discover.only", Label: "Only", Provenance: snapshot.ProvServer,
-				Fields: map[string]snapshot.SFieldMeta{"name": {Name: "name", Type: "char", Label: "Name"}}},
-		},
+	snap := testSnapshot()
+	snap.Models["discover.only"] = snapshot.ModelMeta{
+		Name: "discover.only", Label: "Only", Provenance: snapshot.ProvServer,
+		Fields: map[string]snapshot.SFieldMeta{"name": {Name: "name", Type: "char", Label: "Name"}},
 	}
+	digest, err := snapshot.CanonicalDigest(snap)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	p.SnapshotSHA256 = digest
 	gate := &fakeGate{allow: true}
 	b, _ := New(p, &config.Instance{Name: "test"}, snap)
 	b.authz = gate
@@ -662,8 +700,12 @@ func TestDiscoveryCatalogMarksExecutable(t *testing.T) {
 		Success bool `json:"success"`
 		Result  struct {
 			Models map[string]struct {
-				Executable bool `json:"executable"`
+				Executable        bool           `json:"executable"`
+				Fields            map[string]any `json:"fields"`
+				UnknownProvenance []string       `json:"unknown_provenance"`
+				Provenance        string         `json:"provenance"`
 			} `json:"models"`
+			MethodManifest []string `json:"method_manifest"`
 		} `json:"result"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&env); err != nil {
@@ -675,14 +717,35 @@ func TestDiscoveryCatalogMarksExecutable(t *testing.T) {
 	if env.Result.Models["discover.only"].Executable {
 		t.Fatal("discover.only must list executable:false")
 	}
+	// Per-model MethodManifest is present and informational (never
+	// executable): the manifest lists method names only.
+	if len(env.Result.MethodManifest) == 0 {
+		t.Fatal("catalog method_manifest missing")
+	}
+	for _, m := range env.Result.MethodManifest {
+		if _, isModel := env.Result.Models[m]; isModel && m != "read" {
+			t.Fatalf("manifest method %q must not resolve as an executable model entry point", m)
+		}
+	}
+	// Per-field provenance: server-attested company_id carries its
+	// provenance; unattested name lands in unknown_provenance.
+	partner := env.Result.Models["res.partner"]
+	if partner.UnknownProvenance == nil {
+		t.Fatal("res.partner must carry unknown_provenance for unattested fields")
+	}
 	// Discoverable-only model read denies (unknown-model at the gate).
 	b.authz = &fakeGate{allow: false, reason: "unknown-model"}
-	denied := post(t, b, "/rpc/read", tok, `{"model":"discover.only","ids":[1]}`)
+	denied := post(t, b, "/rpc/read", tok, `{"model":"discover.only","ids":[1],"fields":["name"]}`)
 	if denied.Code != http.StatusForbidden {
 		t.Fatalf("discover-only read = %d, want 403", denied.Code)
 	}
 	if len(b.exec.(*fakeExec).calls) != 0 {
 		t.Fatal("Execute ran for discoverable-only model")
+	}
+	// Unknown-model catalog queries still deny.
+	unknown := get("/rpc/catalog?model=no.such.model")
+	if unknown.Code != http.StatusForbidden {
+		t.Fatalf("unknown-model catalog = %d, want 403", unknown.Code)
 	}
 }
 
@@ -691,7 +754,7 @@ func TestEnvelopeCapDeniesInsteadOfSending(t *testing.T) {
 	p.Budgets.MaxRowsPerCall = 100
 	p.Budgets.MaxResponseBytes = 40 // smaller than any success envelope
 	gate := &fakeGate{allow: true}
-	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b, _ := New(p, &config.Instance{Name: "test"}, testSnapshot())
 	b.authz = gate
 	b.exec = &fakeExec{rows: []any{map[string]any{"id": 1}}}
 	tok := grantToken(t, b)
@@ -708,8 +771,7 @@ func TestWorkspaceCallerCannotWidenCap(t *testing.T) {
 	p := testPolicy()
 	p.AllowWorkspace = true
 	p.Budgets.MaxRowsPerCall = 2
-	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{})
-	b.authz = &fakeGate{allow: true}
+	b, _ := New(p, &config.Instance{Name: "test"}, testSnapshot())
 	ws, err := workspace.Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("workspace.Open: %v", err)
@@ -727,5 +789,120 @@ func TestWorkspaceCallerCannotWidenCap(t *testing.T) {
 	// the clamp the caller would have widened to 100 and succeeded.
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("widened list = %d, want 400 deny", rec.Code)
+	}
+}
+
+func TestReserveForLimitDeniesBeforeDispatch(t *testing.T) {
+	// Reservation-deny-before-dispatch: when the requested want exceeds the
+	// remaining row budget, the reservation denies and the handler returns
+	// before Execute (no dispatch). The fakeExec dispatch recorder proves
+	// no RPC ran; settle keeps only delivered rows.
+	p := testPolicy()
+	p.Budgets.MaxRowsPerSession = 3
+	p.Budgets.MaxRowsPerCall = 100
+	gate := &fakeGate{allow: true}
+	exec := &fakeExec{rows: []any{map[string]any{"id": 1}}}
+	b, err := New(p, &config.Instance{Name: "test"}, testSnapshot())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	b.authz = gate
+	b.exec = exec
+	tok := grantToken(t, b)
+	// Consume 2 rows directly: the admitted search reserves its want.
+	if err := b.Check(tok); err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if err := b.ReserveRows(tok, 2); err != nil {
+		t.Fatalf("ReserveRows: %v", err)
+	}
+	before := len(exec.calls)
+	// Remaining = 1, want = 5: reservation must deny; handler path denies
+	// 429 without dispatch.
+	if _, err := b.reserveForLimit(tok, 5); !errors.Is(err, ErrSessionBudget) {
+		t.Fatalf("reserveForLimit over-remaining = %v, want budget deny", err)
+	}
+	b.release(tok)
+	rec := post(t, b, "/rpc/search", tok, `{"model":"res.partner","fields":["name"],"limit":5}`)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-remaining search = %d, want 429 deny-before-dispatch", rec.Code)
+	}
+	if len(exec.calls) != before {
+		t.Fatalf("Execute dispatched despite budget deny: %d calls", len(exec.calls))
+	}
+}
+
+func TestAdminSocketPathRefusal(t *testing.T) {
+	// Admin-path refusal: stale-socket cleanup and teardown remove ONLY a
+	// proven-owned unix socket. A regular file (or anything non-socket) at
+	// the socket path denies instead of unlinking.
+	dir := t.TempDir()
+	sockPath := dir + "/admin.sock"
+	if err := os.WriteFile(sockPath, []byte("planted"), 0600); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := removeOnlyOwnedSocket(sockPath); err == nil {
+		t.Fatal("removeOnlyOwnedSocket unlinked a regular file")
+	}
+	if _, err := os.Stat(sockPath); err != nil {
+		t.Fatalf("planted file removed: %v", err)
+	}
+	if err := removeOnlyOwnedSocket(dir + "/missing.sock"); err != nil {
+		t.Fatalf("missing socket should be a no-op: %v", err)
+	}
+	// An explicit --socket escaping the admin dir denies at resolve time.
+	if _, err := resolveAdminSocketPath(dir+"/../escape.sock", dir); err == nil {
+		t.Fatal("escaping socket path accepted")
+	}
+}
+
+func TestServingDigestMismatchDenies(t *testing.T) {
+	// Digest-mismatch deny with the real CanonicalDigest: the sealed
+	// binding covers testSnapshot(); any mutation (here: an added model)
+	// must fail verification before credentials resolve.
+	p := testPolicy()
+	mutated := testSnapshot()
+	mutated.Models["x.extra"] = snapshot.ModelMeta{
+		Name: "x.extra", Label: "Extra", Provenance: snapshot.ProvServer,
+		Fields: map[string]snapshot.SFieldMeta{"name": {Name: "name", Type: "char", Label: "Name"}},
+	}
+	if err := verifyServingDigest(p, mutated); err == nil {
+		t.Fatal("mutated snapshot passed digest verification")
+	}
+	if err := verifyServingDigest(p, testSnapshot()); err != nil {
+		t.Fatalf("bound snapshot denied: %v", err)
+	}
+}
+
+func TestWorkspaceMkdirBillsOneRow(t *testing.T) {
+	// Typed mkdir: bounded MkdirAll through the capped envelope, billing
+	// exactly 1 row via the atomic reservation (settle to 1 on success).
+	p := testPolicy()
+	p.AllowWorkspace = true
+	b, _ := New(p, &config.Instance{Name: "test"}, testSnapshot())
+	b.authz = &fakeGate{allow: true}
+	base := t.TempDir()
+	wsDir := base + "/ws"
+	if err := os.Mkdir(wsDir, 0700); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	ws, err := workspace.Open(wsDir)
+	if err != nil {
+		t.Fatalf("workspace.Open: %v", err)
+	}
+	b.ws = ws
+	tok := grantToken(t, b)
+	rec := post(t, b, "/rpc/workspace/mkdir", tok, `{"path":"reports/2026/10"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mkdir = %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(wsDir + "/reports/2026/10"); err != nil {
+		t.Fatalf("directory not created: %v", err)
+	}
+	b.mu.Lock()
+	rows := b.sessions[tok].rows
+	b.mu.Unlock()
+	if rows != 1 {
+		t.Fatalf("rows = %d, want 1 (mkdir bills one row)", rows)
 	}
 }

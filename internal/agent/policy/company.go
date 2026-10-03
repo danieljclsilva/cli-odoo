@@ -3,27 +3,43 @@ package policy
 import "fmt"
 
 // ValidateScope rejects any company scope that would let the model imply or
-// select a company context: fewer than two enabled companies, or a default
-// outside the enabled set. Authorize treats an invalid scope as a malformed
-// policy and denies everything.
+// select a company context: fewer than two enabled companies, any
+// non-positive ID, any duplicate ID, or a default outside the enabled set.
+// Authorize treats an invalid scope as a malformed policy and denies
+// everything.
 func ValidateScope(s CompanyScope) error {
 	if len(s.Enabled) < 2 {
 		return fmt.Errorf("policy: company scope must enable at least two companies, got %d", len(s.Enabled))
 	}
+	seen := make(map[int]bool, len(s.Enabled))
 	for _, id := range s.Enabled {
-		if id == s.Default {
-			return nil
+		if id <= 0 {
+			return fmt.Errorf("policy: company scope has non-positive company id %d", id)
 		}
+		if seen[id] {
+			return fmt.Errorf("policy: company scope has duplicate company id %d", id)
+		}
+		seen[id] = true
 	}
-	return fmt.Errorf("policy: default company %d not in enabled set", s.Default)
+	if !seen[s.Default] {
+		return fmt.Errorf("policy: default company %d not in enabled set", s.Default)
+	}
+	return nil
 }
 
 // CompanyFilterFragment builds the enforcing company fragment the broker
-// ANDs into the caller domain AFTER the caller domain. The scoped shapes
-// are [[CompanyField, "in", Enabled]] without the companyless opt-in, and
-// [["|", [CompanyField, "in", Enabled], [CompanyField, "=", false]]]
-// with ModelRule.IncludeCompanyless (explicit per-model opt-in admitting
-// company_id=false records alongside scoped records).
+// ANDs into the caller domain by appending AFTER the arity-complete caller
+// domain (see checkDomain: the caller expression must reduce to exactly one
+// complete expression so an appended fragment always further narrows via
+// implicit AND). The scoped shape without the companyless opt-in is a single
+// leaf [CompanyField, "in", Enabled]. With ModelRule.IncludeCompanyless
+// (explicit per-model opt-in admitting company_id=false records alongside
+// scoped records) the shape is a FLAT three-element prefix expression
+// ["|", leafIn, leafFalse] — three appended elements, NOT one nested list:
+// the "|" prefix operator applies to the two following leaves at the same
+// domain level, so the whole fragment stays arity-complete and the broker's
+// append-after-caller-domain ANDs correctly. (A nested [["|", ...]] list
+// would be misclassified as a leaf by Odoo domain parsing.)
 //
 // enforce=false only for human-reviewed company-independent models
 // (rule.CompanyIndependent): no fragment is needed because the model holds
@@ -55,7 +71,9 @@ func CompanyFilterFragment(rule ModelRule, scope CompanyScope) (frag []any, enfo
 		ids = append(ids, id)
 	}
 	if rule.IncludeCompanyless {
-		return []any{[]any{"|", []any{field, "in", ids}, []any{field, "=", false}}}, true
+		leafIn := []any{field, "in", ids}
+		leafFalse := []any{field, "=", false}
+		return []any{"|", leafIn, leafFalse}, true
 	}
 	return []any{[]any{field, "in", ids}}, true
 }
@@ -76,4 +94,56 @@ func CompanyDomain(rule ModelRule, scope CompanyScope) (frag []any, enforce bool
 		return nil, true
 	}
 	return CompanyFilterFragment(rule, scope)
+}
+
+// CompanyFieldValid verifies that rule CompanyField (for model) normalizes
+// AND resolves via schema to a relational field whose relation is a company
+// model. Accepted: Relation == "res.company" with Type many2one or
+// many2many — the direct company link (company_id) or the multi-company link
+// (company_ids). A res.users company-field chain root is NOT accepted here:
+// it names users, not companies, and would let a scoped rule pass on a
+// field that does not itself filter by company. The broker calls this
+// pre-credential (before any credential resolution or RPC) so a scoped rule
+// with a syntactically valid but semantically non-company field denies
+// before secrets are touched. Company-independent rules without a
+// CompanyField pass trivially (nothing to verify); a contradictory
+// independent rule WITH a CompanyField fails.
+func (p *Policy) CompanyFieldValid(schema SchemaView, model string) error {
+	if p == nil {
+		return fmt.Errorf("policy: nil policy")
+	}
+	rule, ok := p.Models[model]
+	if !ok {
+		return fmt.Errorf("policy: unknown model %q", model)
+	}
+	if rule.CompanyIndependent {
+		if rule.CompanyField != "" {
+			return fmt.Errorf("policy: model %q contradictory: company-independent with company field", model)
+		}
+		return nil
+	}
+	field, ok := NormalizeName(rule.CompanyField)
+	if !ok || field == "" {
+		return fmt.Errorf("policy: model %q has no usable company field", model)
+	}
+	if schema == nil {
+		return fmt.Errorf("policy: model %q company field %q unverifiable without schema", model, field)
+	}
+	mv, ok := schema.Model(model)
+	if !ok {
+		return fmt.Errorf("policy: model %q not in schema", model)
+	}
+	fm, ok := mv.Field(field)
+	if !ok {
+		return fmt.Errorf("policy: model %q company field %q not in schema", model, field)
+	}
+	if fm.Relation != "res.company" {
+		return fmt.Errorf("policy: model %q company field %q relation %q is not res.company", model, field, fm.Relation)
+	}
+	switch fm.Type {
+	case "many2one", "many2many":
+		return nil
+	default:
+		return fmt.Errorf("policy: model %q company field %q type %q is not a company relation", model, field, fm.Type)
+	}
 }

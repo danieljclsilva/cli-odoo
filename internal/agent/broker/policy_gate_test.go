@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danieljclsilva/cli-odoo/internal/agent/snapshot"
 	"github.com/danieljclsilva/cli-odoo/internal/config"
 )
 
@@ -16,7 +15,7 @@ import (
 // exact outgoing field projection, never Odoo semantics.
 func realGateBroker(t *testing.T, exec *fakeExec) *Broker {
 	t.Helper()
-	b, err := NewForTest(testPolicy(), &config.Instance{Name: "test"}, snapshot.Snapshot{}, nil, exec)
+	b, err := NewForTest(testPolicy(), &config.Instance{Name: "test"}, testSnapshot(), nil, exec)
 	if err != nil {
 		t.Fatalf("NewForTest: %v", err)
 	}

@@ -64,13 +64,20 @@ func testBrokerServer(t *testing.T, gate *stubGate, exec *stubExec) (*httptest.S
 	}
 	snap := snapshot.Snapshot{
 		Instance:           "test",
+		CapturedAt:         time.Now(),
 		AvailableCompanies: []snapshot.Company{{ID: 1, Name: "A"}, {ID: 2, Name: "B"}},
 		EnabledCompanies:   []int{1, 2}, DefaultCompany: 1,
 		Models: map[string]snapshot.ModelMeta{
 			"res.partner": {Name: "res.partner", Label: "Partner", Provenance: snapshot.ProvServer,
 				Fields: map[string]snapshot.SFieldMeta{"name": {Name: "name", Type: "char", Label: "Name"}}},
 		},
+		MethodManifest: []string{"search_read"},
 	}
+	digest, derr := snapshot.CanonicalDigest(snap)
+	if derr != nil {
+		t.Fatalf("CanonicalDigest: %v", derr)
+	}
+	p.SnapshotSHA256 = digest
 	b, err := broker.NewForTest(p, &config.Instance{Name: "test"}, snap, gate, exec)
 	if err != nil {
 		t.Fatalf("broker test setup: %v", err)
@@ -106,7 +113,7 @@ func TestToolsListTypedOnly(t *testing.T) {
 	for _, tool := range Tools() {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"search", "read", "count", "aggregate", "meta", "companies", "catalog", "workspace.list", "workspace.read", "workspace.write"} {
+	for _, want := range []string{"search", "read", "count", "aggregate", "meta", "companies", "catalog", "workspace.list", "workspace.read", "workspace.write", "workspace.mkdir"} {
 		if !names[want] {
 			t.Fatalf("missing typed tool %q", want)
 		}
@@ -115,6 +122,11 @@ func TestToolsListTypedOnly(t *testing.T) {
 		if names[banned] {
 			t.Fatalf("forbidden tool %q listed", banned)
 		}
+	}
+	// workspace.mkdir must map to the broker's POST /rpc/workspace/mkdir:
+	// every documented endpoint needs a live caller on this surface.
+	if m, p, ok := endpoint("workspace.mkdir"); !ok || m != "POST" || p != "/rpc/workspace/mkdir" {
+		t.Fatalf("endpoint(workspace.mkdir) = %q %q %v, want POST /rpc/workspace/mkdir true", m, p, ok)
 	}
 	// initialize + tools/list over stdio.
 	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
@@ -126,8 +138,8 @@ func TestToolsListTypedOnly(t *testing.T) {
 	res = roundTrip(t, srv2, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
 	result, _ := res["result"].(map[string]any)
 	tools, _ := result["tools"].([]any)
-	if len(tools) != 10 {
-		t.Fatalf("tools/list = %d tools, want 10", len(tools))
+	if len(tools) != 11 {
+		t.Fatalf("tools/list = %d tools, want 11", len(tools))
 	}
 }
 
@@ -156,6 +168,48 @@ func TestCallSearchRoutes(t *testing.T) {
 	}
 	if len(exec.calls) != 1 || exec.calls[0] != "res.partner/search_read" {
 		t.Fatalf("routing = %v, want [res.partner/search_read]", exec.calls)
+	}
+}
+
+func TestCatalogCarriesManifestAndProvenance(t *testing.T) {
+	// The catalog tool is a read-only pass-through: MethodManifest plus
+	// per-model/per-field provenance must survive the adapter unchanged.
+	// A catalog that dropped them would hide the informational manifest
+	// and the origin labels the human reviews.
+	exec := &stubExec{}
+	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
+	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"catalog","arguments":{}}}`)
+	result, _ := res["result"].(map[string]any)
+	if result["isError"] == true {
+		t.Fatalf("catalog isError: %+v", res)
+	}
+	content, _ := result["content"].([]any)
+	if len(content) == 0 {
+		t.Fatalf("catalog: empty content: %+v", res)
+	}
+	text, _ := content[0].(map[string]any)["text"].(string)
+	var out struct {
+		Models map[string]struct {
+			Provenance string `json:"provenance"`
+			Fields     map[string]struct {
+				Provenance string `json:"provenance"`
+			} `json:"fields"`
+		} `json:"models"`
+		MethodManifest []string `json:"method_manifest"`
+	}
+	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		t.Fatalf("catalog text is not JSON: %v (%q)", err, text)
+	}
+	if len(out.MethodManifest) == 0 {
+		t.Fatal("catalog: method_manifest missing from pass-through")
+	}
+	pm, ok := out.Models["res.partner"]
+	if !ok || pm.Provenance == "" {
+		t.Fatalf("catalog: model provenance missing: %+v", out.Models)
+	}
+	if pm.Fields["name"].Provenance == "" {
+		t.Fatalf("catalog: field provenance missing: %+v", pm.Fields)
 	}
 }
 

@@ -68,6 +68,18 @@ func (g policyGate) Authorize(s policy.SchemaView, r policy.Request) policy.Deci
 	return g.p.Authorize(s, r)
 }
 
+// ServingPaths threads the human-side file locations through New into Serve
+// so the serve boundary can bound-check the exact files it serves from and
+// confine the workspace against them. Empty fields mean "unknown": Serve
+// skips the corresponding file check (in-process tests) and falls back to
+// the sealed policy's SnapshotPath and the derived admin socket path.
+type ServingPaths struct {
+	ProfilePath  string
+	SnapshotPath string
+	ConfigDir    string
+	AdminDir     string
+}
+
 // Broker holds the sealed policy in memory and mints revocable session
 // tokens. New stores policy and client params only: it never touches the
 // keychain and never dials. Serve (human path) resolves the secret and
@@ -77,6 +89,7 @@ type Broker struct {
 	pol      *policy.Policy
 	inst     *config.Instance
 	snap     snapshot.Snapshot
+	paths    ServingPaths
 	sessions map[string]*sess
 
 	authz     authorizer
@@ -95,7 +108,12 @@ type Broker struct {
 // anything invalid fails here so the daemon never serves an undefined
 // allowlist. Snapshot-vs-policy scope matching is a Serve-time check (the
 // snapshot is compared right before credentials resolve).
-func New(p *policy.Policy, inst *config.Instance, snap snapshot.Snapshot) (*Broker, error) {
+//
+// The optional ServingPaths (at most one; the first wins) threads the
+// human-side file locations into Serve so the serve boundary can bound-check
+// the exact profile/snapshot files it serves from and confine the workspace
+// against them. Callers without files (in-process tests) omit it.
+func New(p *policy.Policy, inst *config.Instance, snap snapshot.Snapshot, paths ...ServingPaths) (*Broker, error) {
 	if p == nil {
 		return nil, errors.New("broker: nil policy")
 	}
@@ -105,10 +123,15 @@ func New(p *policy.Policy, inst *config.Instance, snap snapshot.Snapshot) (*Brok
 	if inst == nil {
 		return nil, errors.New("broker: nil instance")
 	}
+	var sp ServingPaths
+	if len(paths) > 0 {
+		sp = paths[0]
+	}
 	return &Broker{
 		pol:       p,
 		inst:      inst,
 		snap:      snap,
+		paths:     sp,
 		sessions:  map[string]*sess{},
 		authz:     policyGate{p: p},
 		frag:      policy.CompanyDomain,
@@ -134,8 +157,8 @@ func (b *Broker) ModelMuxForTest() http.Handler {
 
 // NewForTest builds a broker with injected gate/exec seams for in-process
 // protocol tests (no keychain, no network). The policy still Validate()s.
-func NewForTest(p *policy.Policy, inst *config.Instance, snap snapshot.Snapshot, authz authorizer, exec executor) (*Broker, error) {
-	b, err := New(p, inst, snap)
+func NewForTest(p *policy.Policy, inst *config.Instance, snap snapshot.Snapshot, authz authorizer, exec executor, paths ...ServingPaths) (*Broker, error) {
+	b, err := New(p, inst, snap, paths...)
 	if err != nil {
 		return nil, err
 	}
@@ -262,13 +285,14 @@ func (b *Broker) Check(token string) error {
 
 // ReserveRows atomically reserves n result rows against
 // Budgets.MaxRowsPerSession AFTER a request was admitted (Check) and
-// authorized (gate). n is the effective row want,
-// min(limit-effective, remainingRows); n < 1 or no remaining headroom
-// denies with ErrSessionBudget. The reservation is rolled back ONLY when
-// the RPC never executes (releaseReserve); once the RPC has executed the
-// attempted rows stay billed even on RPC/output failure (no
-// release-on-failure), with settleRows refunding only the unused headroom
-// on success.
+// authorized (gate). n is the exact row want: count/workspace-read bill 1,
+// read bills len(ids), search/aggregate bill the Authorize-admitted limit.
+// Metadata counts (success-envelope "count") never reserve or settle rows:
+// only actually dispatched rows (delivered or attempted) consume the row
+// budget. The reservation is rolled back ONLY when the RPC never executes
+// (releaseReserve); once the RPC has executed the attempted rows stay billed
+// even on RPC/output failure (no release-on-failure), with settleRows
+// refunding only the unused headroom on success.
 func (b *Broker) ReserveRows(token string, n int) error {
 	if token == "" {
 		return ErrSessionUnknown
@@ -298,10 +322,12 @@ func (b *Broker) ReserveRows(token string, n int) error {
 	return nil
 }
 
-// reserveForLimit reserves min(want, remainingRows) and reports the
-// reserved n. want is the effective per-call row want (already within the
-// Authorize-admitted limit); a non-positive want or exhausted row budget
-// denies.
+// reserveForLimit atomically reserves the REQUESTED want against
+// Budgets.MaxRowsPerSession and reports it back. When want exceeds the
+// remaining rows it DENIES with ErrSessionBudget — it never silently
+// reserves a smaller min while the handler still sends the original want
+// (that would under-bill and let sessions overshoot). A non-positive want
+// or exhausted budget denies.
 func (b *Broker) reserveForLimit(token string, want int) (int, error) {
 	if want < 1 {
 		return 0, ErrSessionBudget
@@ -316,18 +342,13 @@ func (b *Broker) reserveForLimit(token string, want int) (int, error) {
 		delete(b.sessions, token)
 		return 0, ErrSessionExpired
 	}
-	n := want
 	if maxRows := b.pol.Budgets.MaxRowsPerSession; maxRows > 0 {
-		rem := maxRows - s.rows
-		if rem < 1 {
+		if rem := maxRows - s.rows; int64(want) > rem {
 			return 0, ErrSessionBudget
 		}
-		if int64(n) > rem {
-			n = int(rem)
-		}
 	}
-	s.rows += int64(n)
-	return n, nil
+	s.rows += int64(want)
+	return want, nil
 }
 
 // release rolls back one Check reservation (deny/error before any row
@@ -409,12 +430,19 @@ func (b *Broker) record(token string, rows int) {
 	}
 }
 
-// checkScopeMatch refuses to serve when the snapshot disagrees with the
-// sealed policy: instance identity and the exact company scope (ordered
-// enabled set plus default) must match before any credential resolves.
+// checkScopeMatch refuses to serve when the snapshot or the resolved config
+// instance disagrees with the sealed policy: config Instance.Name, snapshot
+// instance, and the exact company scope (ordered enabled set plus default)
+// must match before any credential resolves.
 func (b *Broker) checkScopeMatch() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.inst == nil {
+		return fmt.Errorf("broker: nil instance")
+	}
+	if b.inst.Name != b.pol.Instance {
+		return fmt.Errorf("broker: config instance %q != policy instance %q", b.inst.Name, b.pol.Instance)
+	}
 	if b.snap.Instance != b.pol.Instance {
 		return fmt.Errorf("broker: snapshot instance %q != policy instance %q", b.snap.Instance, b.pol.Instance)
 	}

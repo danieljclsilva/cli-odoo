@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -55,13 +56,19 @@ const (
 )
 
 // Validate rejects a contradictory or malformed policy centrally so the
-// broker (New and Serve) and Authorize share one seal check: bad
-// version/instance, empty operations/models, unknown SharedRecords
-// (only deny|allow-classified), invalid CompanyScope, non-positive
-// MaxLimit/MaxRowsPerCall/MaxResponseBytes, negative MaxOffset, and any
-// per-model defect — empty Fields, a field name failing NormalizeName, a
-// CompanyField failing NormalizeName when set, CompanyIndependent combined
-// with a CompanyField, IncludeCompanyless on a CompanyIndependent model
+// broker (New and Serve) and Authorize share one seal check: unknown
+// version (exactly PolicyVersion is accepted, no legacy fallback — old
+// profiles must be re-sealed via setup), empty instance, missing or
+// malformed snapshot binding (SnapshotSHA256 must be the 64-char hex
+// CanonicalDigest of the sealed snapshot; empty denies so pre-binding
+// profiles must be re-sealed), empty operations/models, unknown
+// SharedRecords (only deny|allow-classified), invalid CompanyScope,
+// non-positive MaxLimit/MaxRowsPerCall/MaxResponseBytes, negative
+// MaxOffset, negative session budgets (MaxCallsPerSession/MaxRowsPerSession
+// — zero means unbounded, negative is malformed), and any per-model defect
+// — empty Fields, a field name failing NormalizeName, a CompanyField
+// failing NormalizeName when set, CompanyIndependent combined with a
+// CompanyField, IncludeCompanyless on a CompanyIndependent model
 // (meaningless there), or a negative per-model MaxLimit. A scoped model
 // without a CompanyField is NOT a Validate error: the policy is
 // well-formed but Authorize denies every request for that model with
@@ -70,11 +77,17 @@ func (p *Policy) Validate() error {
 	if p == nil {
 		return fmt.Errorf("policy: nil policy")
 	}
-	if p.Version <= 0 {
-		return fmt.Errorf("policy: bad version %d", p.Version)
+	if p.Version != PolicyVersion {
+		return fmt.Errorf("policy: unsupported version %d (want %d): re-seal via setup", p.Version, PolicyVersion)
 	}
 	if strings.TrimSpace(p.Instance) == "" {
 		return fmt.Errorf("policy: empty instance")
+	}
+	if len(p.SnapshotSHA256) != 64 {
+		return fmt.Errorf("policy: snapshot binding must be 64 hex chars, got %d: re-seal via setup", len(p.SnapshotSHA256))
+	}
+	if _, err := hex.DecodeString(p.SnapshotSHA256); err != nil {
+		return fmt.Errorf("policy: malformed snapshot binding: re-seal via setup")
 	}
 	if len(p.Operations) == 0 {
 		return fmt.Errorf("policy: no operations allowlisted")
@@ -96,6 +109,12 @@ func (p *Policy) Validate() error {
 	}
 	if p.Budgets.MaxOffset < 0 {
 		return fmt.Errorf("policy: negative MaxOffset %d", p.Budgets.MaxOffset)
+	}
+	if p.Budgets.MaxCallsPerSession < 0 {
+		return fmt.Errorf("policy: negative MaxCallsPerSession %d", p.Budgets.MaxCallsPerSession)
+	}
+	if p.Budgets.MaxRowsPerSession < 0 {
+		return fmt.Errorf("policy: negative MaxRowsPerSession %d", p.Budgets.MaxRowsPerSession)
 	}
 	if err := ValidateScope(p.Scope); err != nil {
 		return err

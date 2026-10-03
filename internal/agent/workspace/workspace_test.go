@@ -3,8 +3,10 @@ package workspace
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // openTestWorkspace creates a real temp dir with the workspace isolated in
@@ -407,8 +409,77 @@ func TestReadRefusesFifo(t *testing.T) {
 	if err := makeFifo(fifo); err != nil {
 		t.Skipf("fifos unsupported: %v", err)
 	}
-	if _, err := w.Read("pipe", 1024); err == nil {
-		t.Fatal("Read(fifo): expected denial, got content (would block)")
+	// The open must return (O_NONBLOCK) so the refusal below proves
+	// non-blocking refusal, not a hang: finish the whole read in a
+	// goroutine and demand a fast denial with no writer ever arriving.
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.Read("pipe", 1024)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Read(fifo): expected denial, got content (would block)")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read(fifo): blocked over 5s with no writer — nonblocking open missing")
+	}
+}
+
+func TestValidateRejectsGroupReadableAndLegacyDefault(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode checks are documented-skipped on windows")
+	}
+	base := t.TempDir()
+	// Group/other-readable (even without write) refuses: 0750 carries
+	// group bits, so trusted-private-contents cannot hold.
+	loose := filepath.Join(base, "loose")
+	if err := os.Mkdir(loose, 0750); err != nil {
+		t.Fatal(err)
+	}
+	// Mkdir honors umask: pin the mode so the assertion is exact.
+	if err := os.Chmod(loose, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateDedicatedDir(loose, nil); err == nil {
+		t.Fatal("ValidateDedicatedDir(0750): expected denial for group-readable dir")
+	}
+	// A legacy config-nested workspace rejects with a migration note,
+	// not a bare overlap error. Faked HOME isolates the test from the
+	// real ~/.config/odoo-cli.
+	fakeHome := t.TempDir()
+	legacy := filepath.Join(fakeHome, ".config", "odoo-cli")
+	if err := os.MkdirAll(legacy, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", fakeHome)
+	if _, verr := ValidateDedicatedDir(legacy, nil); verr == nil {
+		t.Fatal("ValidateDedicatedDir(config dir): expected denial")
+	} else if !strings.Contains(strings.ToLower(verr.Error()), "move it") {
+		t.Fatalf("legacy default denial must carry a migration note, got: %v", verr)
+	}
+}
+
+func TestReadRefusesHardlinkedFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("link-count refusal is unix-attestable (windows uses trusted-private-contents)")
+	}
+	w, dir := openTestWorkspace(t)
+	if err := w.Write("doc.txt", []byte("v1")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	link := filepath.Join(dir, "alias.txt")
+	if err := os.Link(filepath.Join(dir, "doc.txt"), link); err != nil {
+		t.Skipf("hardlinks unsupported: %v", err)
+	}
+	// The alias shares the inode (2 links): reading through it must deny
+	// rather than leak outside-planted content.
+	if _, err := w.Read("alias.txt", 1024); err == nil {
+		t.Fatal("Read(hardlink): expected denial, got content")
+	}
+	if _, err := w.Read("doc.txt", 1024); err == nil {
+		t.Fatal("Read(linked original): expected denial once linked, got content")
 	}
 }
 

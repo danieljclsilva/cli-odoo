@@ -48,12 +48,16 @@ type catalogField struct {
 
 // catalogModel is one human-transcribed model entry. Executable is
 // display-only (see package comment); it is preserved as transcribed.
+// IncludeCompanyless is data-only (carried into ModelMeta for policy
+// construction by the setup slice); policy Validate later rejects it on
+// independent models, same rule as policy.ModelRule.
 type catalogModel struct {
 	Label              string                  `json:"label"`
 	Provenance         string                  `json:"provenance"`
 	Executable         bool                    `json:"executable"`
 	CompanyField       string                  `json:"company_field"`
 	CompanyIndependent bool                    `json:"company_independent"`
+	IncludeCompanyless bool                    `json:"include_companyless"`
 	Fields             map[string]catalogField `json:"fields"`
 }
 
@@ -235,10 +239,15 @@ func ImportCatalog(path string) (Snapshot, error) {
 				return Snapshot{}, fmt.Errorf("snapshot: catalog models %q: invalid company_field %q", key, cm.CompanyField)
 			}
 		}
+		// Data-only carry (same as the server path): independent+field
+		// contradiction and independent+companyless are rejected at policy
+		// construction via policy Validate, not here. The snapshot records
+		// human metadata; the policy gate decides.
 		models[norm] = ModelMeta{
 			Name: norm, Label: label, Fields: fields,
 			CompanyField: cf, CompanyIndependent: cm.CompanyIndependent,
-			Provenance: prov, Executable: cm.Executable,
+			IncludeCompanyless: cm.IncludeCompanyless,
+			Provenance:         prov, Executable: cm.Executable,
 		}
 	}
 	manifest := make([]string, 0, len(f.MethodManifest))

@@ -16,8 +16,10 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,7 +37,28 @@ import (
 	"github.com/danieljclsilva/cli-odoo/internal/output"
 )
 
-// DefaultAgentProfilePath is the default sealed-policy file. The broker's
+// DefaultAgentWorkspaceDir is the suggested human workspace directory: a
+// dedicated sibling of the home directory, deliberately OUTSIDE
+// ~/.config/odoo-cli (which holds the sealed profile and snapshot).
+// ValidateDedicatedDir rejects any workspace at or under that config dir
+// with a migration note pointing here.
+func DefaultAgentWorkspaceDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+	return filepath.Join(home, "odoo-agent-workspace")
+}
+
+// agentSetupDefaultWorkspaceDir resolves the interactive workspace
+// suggestion: the non-overlapping home default.
+func agentSetupDefaultWorkspaceDir() string {
+	if d := DefaultAgentWorkspaceDir(); strings.TrimSpace(d) != "" {
+		return d
+	}
+	return filepath.Join(".", "odoo-agent-workspace")
+}
+
 // serve path resolves the same default (same package, shared symbol).
 func DefaultAgentProfilePath() string {
 	home, err := os.UserHomeDir()
@@ -207,11 +230,15 @@ func agentSetupInt(v any) (int, error) {
 }
 
 // agentSetupParseModelSpec parses one --model value:
-// name:field1,field2[:company_id|company_ids|independent][:aggregate]
+// name:field1,field2[:company_id|company_ids|companyless|independent][:aggregate][:companyless]
+// The "companyless" qualifier admits company_id=false records alongside
+// scoped records on this model (policy.IncludeCompanyless); it is
+// meaningless combined with "independent" and rejected at seal time.
+// Up to five parts are accepted so scope+companyless+aggregate composes.
 func agentSetupParseModelSpec(spec string) (snapshot.ModelSpec, error) {
 	parts := strings.Split(spec, ":")
-	if len(parts) < 2 || len(parts) > 4 {
-		return snapshot.ModelSpec{}, fmt.Errorf("invalid --model %q: want name:fields[:company_id|company_ids|independent][:aggregate]", spec)
+	if len(parts) < 2 || len(parts) > 5 {
+		return snapshot.ModelSpec{}, fmt.Errorf("invalid --model %q: want name:fields[:company_id|company_ids|companyless|independent][:aggregate][:companyless]", spec)
 	}
 	name, ok := policy.NormalizeName(parts[0])
 	if !ok {
@@ -240,6 +267,8 @@ func agentSetupParseModelSpec(spec string) (snapshot.ModelSpec, error) {
 		case "":
 		case "company_id", "company_ids":
 			out.CompanyField = strings.TrimSpace(extra)
+		case "companyless":
+			out.IncludeCompanyless = true
 		case "independent":
 			out.CompanyIndependent = true
 		case "aggregate":
@@ -247,6 +276,9 @@ func agentSetupParseModelSpec(spec string) (snapshot.ModelSpec, error) {
 		default:
 			return snapshot.ModelSpec{}, fmt.Errorf("invalid --model %q: unknown qualifier %q", spec, extra)
 		}
+	}
+	if out.CompanyIndependent && out.IncludeCompanyless {
+		return snapshot.ModelSpec{}, fmt.Errorf("invalid --model %q: companyless is meaningless on an independent model", spec)
 	}
 	return out, nil
 }
@@ -301,6 +333,11 @@ func agentSetupPromptModelsWith(ask func(string) (string, error)) ([]snapshot.Mo
 			sp.CompanyIndependent = strings.EqualFold(indep, "y") || strings.EqualFold(indep, "yes")
 		case "company_id", "company_ids":
 			sp.CompanyField = strings.TrimSpace(cfRaw)
+			clRaw, err := ask("  Also include companyless (company_id=false) records you reviewed? (y/N): ")
+			if err != nil {
+				return nil, err
+			}
+			sp.IncludeCompanyless = strings.EqualFold(clRaw, "y") || strings.EqualFold(clRaw, "yes")
 		default:
 			return nil, fmt.Errorf("invalid company field %q: want company_id|company_ids|empty", cfRaw)
 		}
@@ -343,8 +380,9 @@ func agentSetupProtectedPaths(profilePath, snapshotPath string) []string {
 }
 
 // agentSetupPrintSummary prints the effective setup on stderr before commit:
-// companies enabled/default, shared policy, models/fields/ops, budgets, and
-// workspace. Guided setup requires explicit confirmation of exactly this.
+// companies enabled/default, shared policy, models/fields/ops (with
+// per-model companyless opt-in), budgets, and workspace. Guided setup
+// requires explicit confirmation of exactly this.
 func agentSetupPrintSummary(instance string, scope policy.CompanyScope, specs []snapshot.ModelSpec, ops map[policy.Operation]bool, shared string, b policy.Budgets, workspaceDir string, allowWorkspace bool) {
 	opNames := make([]string, 0, len(ops))
 	for op := range ops {
@@ -356,8 +394,8 @@ func agentSetupPrintSummary(instance string, scope policy.CompanyScope, specs []
 	fmt.Fprintf(os.Stderr, "  shared_records: %s\n", shared)
 	fmt.Fprintf(os.Stderr, "  operations: %s\n", strings.Join(opNames, ","))
 	for _, sp := range specs {
-		fmt.Fprintf(os.Stderr, "  model %s: fields=%s company_field=%q independent=%v aggregate=%v\n",
-			sp.Name, strings.Join(sp.Fields, ","), sp.CompanyField, sp.CompanyIndependent, sp.AllowAggregate)
+		fmt.Fprintf(os.Stderr, "  model %s: fields=%s company_field=%q independent=%v include_companyless=%v aggregate=%v\n",
+			sp.Name, strings.Join(sp.Fields, ","), sp.CompanyField, sp.CompanyIndependent, sp.IncludeCompanyless, sp.AllowAggregate)
 	}
 	fmt.Fprintf(os.Stderr, "  budgets: limit=%d offset=%d rows/call=%d response=%d calls/session=%d rows/session=%d\n",
 		b.MaxLimit, b.MaxOffset, b.MaxRowsPerCall, b.MaxResponseBytes, b.MaxCallsPerSession, b.MaxRowsPerSession)
@@ -581,7 +619,9 @@ func agentSetupCheckPassword(profilePath, adminPassword string) error {
 
 // agentSetupOpenPolicy reads a sealed profile and unseals its policy JSON.
 // The profile file is size-capped (agentSetupMaxProfileBytes) and must be
-// a regular file; anything over cap fails closed before decode or crypto.
+// a regular file holding exactly one JSON object (unknown fields rejected,
+// trailing data denied); the sealed policy decodes strictly the same way.
+// Anything over cap or off-shape fails closed before decode or crypto runs.
 func agentSetupOpenPolicy(profilePath, adminPassword string) (policy.Policy, error) {
 	var pol policy.Policy
 	st, err := os.Stat(profilePath)
@@ -598,22 +638,34 @@ func agentSetupOpenPolicy(profilePath, adminPassword string) (policy.Policy, err
 	if err != nil {
 		return pol, fmt.Errorf("reading profile %q: %w (run: odoo agent setup)", profilePath, err)
 	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
 	var prof lock.Profile
-	if err := json.Unmarshal(b, &prof); err != nil {
+	if err := dec.Decode(&prof); err != nil {
 		return pol, fmt.Errorf("decoding profile %q: %w", profilePath, err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return pol, fmt.Errorf("decoding profile %q: trailing data after document", profilePath)
 	}
 	raw, err := prof.Open(adminPassword)
 	if err != nil {
 		return pol, fmt.Errorf("unlocking profile: %w", err)
 	}
-	if err := json.Unmarshal(raw, &pol); err != nil {
+	pdec := json.NewDecoder(bytes.NewReader(raw))
+	pdec.DisallowUnknownFields()
+	if err := pdec.Decode(&pol); err != nil {
 		return pol, fmt.Errorf("decoding sealed policy: %w", err)
+	}
+	if err := pdec.Decode(&extra); err != io.EOF {
+		return pol, fmt.Errorf("decoding sealed policy: trailing data after document")
 	}
 	return pol, nil
 }
 
 // agentSetupPolicySpecs converts sealed policy models back into builder
-// specs for snapshot refresh.
+// specs for snapshot refresh. The per-model companyless opt-in round-trips
+// so refresh preserves the human's reviewed choice.
 func agentSetupPolicySpecs(pol policy.Policy) []snapshot.ModelSpec {
 	specs := make([]snapshot.ModelSpec, 0, len(pol.Models))
 	for name, rule := range pol.Models {
@@ -622,7 +674,8 @@ func agentSetupPolicySpecs(pol policy.Policy) []snapshot.ModelSpec {
 		specs = append(specs, snapshot.ModelSpec{
 			Name: name, Label: name, Fields: fields,
 			CompanyField: rule.CompanyField, CompanyIndependent: rule.CompanyIndependent,
-			AllowAggregate: rule.AllowAggregate,
+			IncludeCompanyless: rule.IncludeCompanyless,
+			AllowAggregate:     rule.AllowAggregate,
 		})
 	}
 	sort.Slice(specs, func(i, j int) bool { return specs[i].Name < specs[j].Name })
@@ -648,7 +701,7 @@ instance (--instance flag or ODOO_INSTANCE) with its keychain secret
      the default from the enabled set (--companies 1,2 --default-company 1,
      or interactive prompts);
   2. approves models/fields (--model name:fields[:scope][:aggregate],
-     repeatable; scope is company_id|company_ids|independent) or
+     repeatable; scope is company_id|company_ids|companyless|independent) or
      interactively; only approved models are ever described with fields_get;
   3. approves operations (--ops), budgets, and shared-record handling
      (--shared-records deny|allow-classified);
@@ -802,7 +855,7 @@ MethodManifest in the snapshot is informational only, never executable.`,
 			}
 
 			if strings.TrimSpace(workspaceDir) == "" {
-				suggest := filepath.Join(filepath.Dir(snapshotPath), "agent-workspace")
+				suggest := agentSetupDefaultWorkspaceDir()
 				raw, err := ask("Workspace directory [" + suggest + "]: ")
 				if err != nil {
 					output.Fail(tool, err)
@@ -820,7 +873,9 @@ MethodManifest in the snapshot is informational only, never executable.`,
 			}
 			// Dedicated-dir validation against protected paths
 			// (profile, snapshot, config dir, admin socket dir+path):
-			// rejects broad roots, group-writable dirs, and overlap.
+			// rejects broad roots, group/other-readable dirs, foreign
+			// owners, legacy config-nested defaults (with a migration
+			// note), and overlap.
 			protected := agentSetupProtectedPaths(profilePath, snapshotPath)
 			if wsAbs, err = workspace.ValidateDedicatedDir(wsAbs, protected); err != nil {
 				output.Fail(tool, err)
@@ -842,10 +897,11 @@ MethodManifest in the snapshot is informational only, never executable.`,
 					Fields: fields, MaxLimit: perModel,
 					AllowAggregate: sp.AllowAggregate,
 					CompanyField:   sp.CompanyField, CompanyIndependent: sp.CompanyIndependent,
+					IncludeCompanyless: sp.IncludeCompanyless,
 				}
 			}
 			pol := policy.Policy{
-				Version: 1, Instance: instanceName,
+				Version: policy.PolicyVersion, Instance: instanceName,
 				Operations: ops, Models: models, Scope: scope,
 				SharedRecords: shared,
 				Budgets: policy.Budgets{
@@ -886,6 +942,18 @@ MethodManifest in the snapshot is informational only, never executable.`,
 			}
 			if err := snapshot.Write(snapshotPath, snap); err != nil {
 				output.Fail(tool, err)
+				return
+			}
+			// written: the broker recomputes CanonicalDigest at serve time
+			// and refuses a swapped snapshot.
+			digest, err := snapshot.CanonicalDigest(snap)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			pol.SnapshotSHA256 = digest
+			if err := pol.Validate(); err != nil {
+				output.Fail(tool, fmt.Errorf("sealing invalid policy: %w", err))
 				return
 			}
 
@@ -960,21 +1028,95 @@ MethodManifest in the snapshot is informational only, never executable.`,
 }
 
 func newAgentSnapshotCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "snapshot",
+		Short: "Human-only bounded snapshot import/refresh/reseal from the live server",
+		Long: `Human-only snapshot administration. Unlocks the sealed profile
+with the admin password (TTY no-echo prompt, or --admin-password-stdin
+only). Subcommands:
+
+  refresh: rebuilds metadata from the live server for exactly the approved
+    models in the sealed policy (--model overrides the model set with the
+    same name:fields[:scope][:aggregate] syntax), rewrites the snapshot
+    file 0600, and RESEALS the profile so its snapshot_sha256 binding
+    matches the new bytes. Without the reseal the broker would refuse the
+    refreshed snapshot as swapped.
+  import-catalog: converts a human-transcribed offline catalog file into a
+    snapshot (snapshot.ImportCatalog), writes it 0600, and reseals the
+    profile binding the same way.
+  import-manifest: inspects a human-authored method list
+    (snapshot.ImportManifest, informational only — never executable) and
+    prints the entries for review; it writes nothing and reseals nothing.
+
+Only human-approved models are ever described with fields_get; custom
+models outside the approved set are never touched. Refresh and
+import-catalog always require human unlock; the sealed policy is never
+rewritten without the admin password.`,
+	}
+	c.AddCommand(newAgentSnapshotRefreshCmd())
+	c.AddCommand(newAgentSnapshotImportCatalogCmd())
+	c.AddCommand(newAgentSnapshotImportManifestCmd())
+	return c
+}
+
+// agentSnapshotReseal stamps the digest of snap into pol, validates,
+// re-seals under the already-verified admin password, and atomically
+// replaces the profile. Every seal/reseal path funnels here so the
+// snapshot_sha256 binding can never be forgotten.
+func agentSnapshotReseal(profilePath, adminPassword string, pol policy.Policy, snap snapshot.Snapshot) error {
+	digest, err := snapshot.CanonicalDigest(snap)
+	if err != nil {
+		return err
+	}
+	pol.SnapshotSHA256 = digest
+	if err := pol.Validate(); err != nil {
+		return fmt.Errorf("resealing invalid policy: %w", err)
+	}
+	policyJSON, err := json.Marshal(pol)
+	if err != nil {
+		return fmt.Errorf("encoding policy: %w", err)
+	}
+	if int64(len(policyJSON)) > agentSetupMaxProfileBytes {
+		return fmt.Errorf("sealed policy %d bytes exceeds cap %d", len(policyJSON), agentSetupMaxProfileBytes)
+	}
+	prof, err := lock.Seal(policyJSON, adminPassword)
+	if err != nil {
+		return err
+	}
+	profJSON, err := json.MarshalIndent(prof, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encoding profile: %w", err)
+	}
+	if err := agentSetupEnsureParent(profilePath); err != nil {
+		return err
+	}
+	if err := agentSetupSecureReplace(profilePath, append(profJSON, '\n')); err != nil {
+		return fmt.Errorf("writing profile: %w", err)
+	}
+	return nil
+}
+
+// agentSnapshotBoundedWrite validates the snapshot size before the 0600
+// atomic Write, so oversized human inputs fail before touching disk.
+func agentSnapshotBoundedWrite(snapshotPath string, snap snapshot.Snapshot) error {
+	if int64(len(mustJSONSetup(snap))) > agentSetupMaxSnapshotBytes {
+		return fmt.Errorf("snapshot exceeds cap %d", agentSetupMaxSnapshotBytes)
+	}
+	if err := agentSetupEnsureParent(snapshotPath); err != nil {
+		return err
+	}
+	return snapshot.Write(snapshotPath, snap)
+}
+
+func newAgentSnapshotRefreshCmd() *cobra.Command {
 	var profilePath, snapshotPath string
 	var modelFlags []string
 	var adminStdin bool
 	c := &cobra.Command{
-		Use:   "snapshot",
-		Short: "Human-only bounded metadata import/refresh from the live server",
-		Long: `Human-only snapshot refresh. Unlocks the sealed profile with the
-admin password (TTY no-echo prompt, or --admin-password-stdin only),
-rebuilds metadata from the live server for exactly the approved models
-in the sealed policy (--model overrides the model set with the same
-name:fields[:scope][:aggregate] syntax), and rewrites the snapshot file
-0600. Only human-approved models are described with fields_get; custom
-models outside the approved set are never touched.`,
+		Use:   "refresh",
+		Short: "Human-only: rebuild snapshot from the live server and reseal",
 		Run: func(cmd *cobra.Command, args []string) {
-			const tool = "agent_snapshot"
+			const tool = "agent_snapshot_refresh"
 			if profilePath == "" {
 				profilePath = DefaultAgentProfilePath()
 			}
@@ -1025,17 +1167,24 @@ models outside the approved set are never touched.`,
 				output.Fail(tool, err)
 				return
 			}
-			if err := agentSetupEnsureParent(snapshotPath); err != nil {
+			if err := agentSnapshotBoundedWrite(snapshotPath, snap); err != nil {
 				output.Fail(tool, err)
 				return
 			}
-			if err := snapshot.Write(snapshotPath, snap); err != nil {
+			pol.SnapshotPath = snapshotPath
+			if err := agentSnapshotReseal(profilePath, adminPassword, pol, snap); err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			digest, err := snapshot.CanonicalDigest(snap)
+			if err != nil {
 				output.Fail(tool, err)
 				return
 			}
 			output.Ok(tool, map[string]any{
 				"instance": pol.Instance, "snapshot": snapshotPath,
-				"models": len(specs), "enabled_companies": pol.Scope.Enabled,
+				"snapshot_sha256": digest,
+				"models":          len(specs), "enabled_companies": pol.Scope.Enabled,
 				"default_company": pol.Scope.Default,
 			}, len(specs))
 		},
@@ -1044,6 +1193,135 @@ models outside the approved set are never touched.`,
 	c.Flags().StringVar(&snapshotPath, "snapshot-path", "", "snapshot output path (default: path recorded in the sealed policy)")
 	c.Flags().StringSliceVar(&modelFlags, "model", nil, "override model set, same syntax as setup --model (default: sealed policy set)")
 	c.Flags().BoolVar(&adminStdin, "admin-password-stdin", false, "read admin password from stdin (never args/env)")
+	return c
+}
+
+func newAgentSnapshotImportCatalogCmd() *cobra.Command {
+	var profilePath, snapshotPath, catalogPath string
+	var adminStdin bool
+	c := &cobra.Command{
+		Use:   "import-catalog",
+		Short: "Human-only: import an offline catalog into a snapshot and reseal",
+		Long: `Human-only bounded import: converts a human-transcribed offline
+catalog file (snapshot.ImportCatalog: regular file, max 4 MiB, strict
+decoding, capped models/fields/companies/manifest entries) into a
+snapshot, writes it 0600, and RESEALS the profile binding
+snapshot_sha256 to the new bytes. Requires the admin password (human
+unlock); the sealed policy is never rewritten without it.`,
+		Run: func(cmd *cobra.Command, args []string) {
+			const tool = "agent_snapshot_import_catalog"
+			if profilePath == "" {
+				profilePath = DefaultAgentProfilePath()
+			}
+			if strings.TrimSpace(catalogPath) == "" {
+				output.Fail(tool, fmt.Errorf("--catalog is required"))
+				return
+			}
+			adminPassword, err := agentSetupAdminPassword(adminStdin, false)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			pol, err := agentSetupOpenPolicy(profilePath, adminPassword)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			snap, err := snapshot.ImportCatalog(catalogPath)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			if strings.TrimSpace(snapshotPath) == "" {
+				snapshotPath = pol.SnapshotPath
+			}
+			if strings.TrimSpace(snapshotPath) == "" {
+				snapshotPath = DefaultAgentSnapshotPath()
+			}
+			if err := agentSnapshotBoundedWrite(snapshotPath, snap); err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			pol.SnapshotPath = snapshotPath
+			for name, meta := range snap.Models {
+				fields := make([]string, 0, len(meta.Fields))
+				for fname := range meta.Fields {
+					fields = append(fields, fname)
+				}
+				sort.Strings(fields)
+				rule, ok := pol.Models[name]
+				if !ok {
+					// Catalog-only models are quarantined: recorded in the
+					// snapshot as discoverable, never inserted into the sealed
+					// allowlist, so they stay denied to read/call until a
+					// human explicitly approves them via setup/refresh.
+					continue
+				}
+				// Existing models: intersect transcribed fields with the
+				// already-approved set — import never widens the allowlist.
+				approved := make(map[string]bool, len(rule.Fields))
+				for _, f := range rule.Fields {
+					approved[f] = true
+				}
+				kept := make([]string, 0, len(fields))
+				for _, f := range fields {
+					if approved[f] {
+						kept = append(kept, f)
+					}
+				}
+				rule.Fields = kept
+				if meta.IncludeCompanyless {
+					rule.IncludeCompanyless = true
+				}
+				pol.Models[name] = rule
+			}
+			if err := agentSnapshotReseal(profilePath, adminPassword, pol, snap); err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			digest, err := snapshot.CanonicalDigest(snap)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			output.Ok(tool, map[string]any{
+				"instance": pol.Instance, "snapshot": snapshotPath,
+				"snapshot_sha256": digest, "models": len(snap.Models),
+			}, len(snap.Models))
+		},
+	}
+	c.Flags().StringVar(&profilePath, "profile", "", "sealed profile path (default "+DefaultAgentProfilePath()+")")
+	c.Flags().StringVar(&snapshotPath, "snapshot-path", "", "snapshot output path (default: path recorded in the sealed policy)")
+	c.Flags().StringVar(&catalogPath, "catalog", "", "human-transcribed catalog file to import (required)")
+	c.Flags().BoolVar(&adminStdin, "admin-password-stdin", false, "read admin password from stdin (never args/env)")
+	return c
+}
+
+func newAgentSnapshotImportManifestCmd() *cobra.Command {
+	var manifestPath string
+	c := &cobra.Command{
+		Use:   "import-manifest",
+		Short: "Human-only: inspect a method manifest (informational, never executable)",
+		Long: `Human-only bounded inspection: reads a human-authored method
+list (snapshot.ImportManifest: regular file, max 4 MiB, strict {"methods":
+[...]} decoding, capped entries) and prints the entries for review. The
+result is informational only — no Execute path may take a name from it.
+Writes nothing and reseals nothing.`,
+		Run: func(cmd *cobra.Command, args []string) {
+			const tool = "agent_snapshot_import_manifest"
+			if strings.TrimSpace(manifestPath) == "" {
+				output.Fail(tool, fmt.Errorf("--manifest is required"))
+				return
+			}
+			methods, err := snapshot.ImportManifest(manifestPath)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			output.Ok(tool, map[string]any{"methods": methods}, len(methods))
+		},
+	}
+	c.Flags().StringVar(&manifestPath, "manifest", "", "human-authored method-list file to inspect (required)")
 	return c
 }
 
