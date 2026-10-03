@@ -105,8 +105,6 @@ one.
 Server-side, still give the Odoo user least-privilege access rights /
 record rules: the CLI guarantee is defense in depth, not the only boundary.
 
-## Notes for model/agent operators
-
 "Read-only" above refers to Odoo method names: the CLI never sends a write
 RPC. It does not mean the tool is side-effect free on the operator host:
 `login`/`logout` write the OS keychain, and `attachment-get` writes the
@@ -152,6 +150,20 @@ Pair this with a dedicated least-privilege Odoo user (access rights +
 record rules scoped to the models the agent may see). Server ACLs and
 custom addons are your deployment's responsibility — the CLI does not
 verify them.
+
+## Agent boundary (human-unlocked broker)
+
+The commands above are the human interface: they use the keychain
+credential directly and let the caller name any model. **Models never get
+them.** For model access, the human seals a deny-by-default policy and
+serves a loopback-only typed broker: `odoo agent setup`, then
+`odoo agent serve`, `grant`, `revoke`, `status`. The model receives only a
+revocable session token — never the Odoo secret or admin password. Full
+setup, model API, company scoping, and runtime wiring (Codex/OMP):
+[`docs/agent-broker.md`](docs/agent-broker.md). The broker is an
+application-level gate, not same-user OS isolation: see the honest posture
+statement there before deploying.
+
 
 ## Multi-instance
 
