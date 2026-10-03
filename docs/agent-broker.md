@@ -66,66 +66,72 @@ fails closed with no partial data. Revocation stops new requests; stop the
 daemon to end all model access. Never fall back to the unrestricted CLI for
 model traffic.
 
-Company scope: the broker ANDs `[[CompanyField,"in",Enabled]]` into every
+Company scope: the broker ANDs the sealed company fragment into every
 domain **after** caller conditions and **overwrites** `allowed_company_ids`
 / `company_id`. The model cannot select companies. `read` by ID is converted
 to a scoped `search_read` so company scoping always applies. Models without
 a usable company field deny unless a human classified them
 company-independent *and* the policy allows classified shared records.
+Per-model `IncludeCompanyless` (default deny, human-reviewed) additionally
+permits `company_id=false` records via an OR-false fragment. Field
+projection is explicit: search/read require a non-empty exact projection
+(omitted/nil/[] deny — Odoo has no default-all through this broker) and the
+broker sends exactly the approved list plus structural `id` (`EnsureID`).
+Dotted traversal denies by default; an approved dotted path requires the
+terminal field explicitly allowlisted on an enforceable target model.
 
 ## Model API (loopback TCP, bearer session token)
 
 Typed JSON only — no generic `call`, no method/args/kwargs forwarding, no
-`context` field (unknown JSON fields are rejected):
+`context` field (unknown JSON fields are rejected; exactly one JSON object
+per body, trailing data denies):
 
 - `POST /rpc/search` `{model, domain, fields, order, limit, offset}` → `search_read`
 - `POST /rpc/read` `{model, ids, fields}` → scoped `search_read` (never raw `read`)
 - `POST /rpc/count` `{model, domain}` → `search_count`
 - `POST /rpc/aggregate` `{model, domain, groupby, sum, avg, count, limit}` → `read_group`
 - `GET /rpc/meta[?model=]` — sealed allowlist only; discoverable, never executable
-- `POST /rpc/workspace/{list,read,write}` — only if the policy enables the
-  workspace; confined to the sealed directory via `os.Root`
+- `GET /rpc/companies` — available vs enabled companies + default (sealed scope)
+- `GET /rpc/catalog` — model/field catalog with `executable` provenance
+  (discoverable-only entries stay denied to read/call, never auto-enabled)
+- `POST /rpc/workspace/{list,read,write,mkdir}` — only if the policy enables the
+  workspace; confined to the sealed directory via `os.Root` (caller caps only narrow)
 - `GET /healthz` — no auth, no data
 
-Every request: bearer check → `policy.Authorize` → budgets → company scoping
-→ `Execute` → row/byte caps → secret redaction. Denial happens before any
-RPC. Responses are capped (`max-rows-per-call`, `max-response-bytes` trim
-trailing rows rather than truncating) and sessions are budgeted
-(`max-calls/rows-per-session`).
-
-Group-by interval suffixes (`date_order:month`) and `field:sum`/`field:avg`
-specifiers are validated (`[A-Za-z0-9_]+`) and stripped before the gate; the
-underlying field must be allowlisted.
-
+Every request: bearer check → `policy.Authorize` (Validate-first) →
+call+row reservation → company scoping → `Execute` → revoke/expiry re-check
+before write → single total envelope cap (`max-response-bytes` on ALL model
+outputs). Denial happens before any RPC; attempted admitted calls stay billed
+even on RPC/output failure. Sessions clamp TTL to [1m, 24h], cap 64 live
+sessions, and the HTTP server enforces read/write/idle timeouts.
 ## Wiring a runtime to the broker
 
-The human mints a token and places it into the agent's tool config; the
-model endpoint is plain typed JSON-RPC POST (curl-consumable), so any
-runtime that can POST HTTP with a bearer header can use it.
+Shipped in-tree (implemented, not prose):
 
-**Codex (verified with installed CLI):** `codex mcp add --help` supports
-`--url <URL>` for a streamable HTTP MCP server plus `--bearer-token-env-var`.
-This broker serves **plain JSON-RPC, not MCP**, so Codex consumes it through
-a small MCP shim that forwards typed tools to the broker with the session
-token in `Authorization: Bearer`. Keep the shim's tool list exactly the
-typed endpoints above (no generic forwarder). Runtime allowlists
+- MCP stdio adapter: `odoo agent mcp [--broker URL]` — JSON-RPC 2.0 over
+  stdio with `initialize` / `tools/list` / `tools/call` for the 10 typed
+  broker tools only (search, read, count, aggregate, meta, companies,
+  catalog, workspace.list/read/write). The session token comes from
+  `ODOO_BROKER_TOKEN` (env only, never logged or echoed). Codex stdio
+  example: `codex mcp add odoo-broker -- odoo agent mcp
+  --broker http://127.0.0.1:8471` with the token env var set.
+- OMP custom tool module: `tools/omp/odoo-broker.js` (CommonJS, 10 typed
+  tools, `fetch` POST to `ODOO_BROKER_URL` with `ODOO_BROKER_TOKEN`; no
+  shell). Reviewed config snippets: `odoo agent omp-init --dir <dir>`
+  writes OMP + Codex examples without secrets or touching user settings.
+  End-to-end OMP loading is operator-verified at deploy time (no local OMP
+  harness here); broker-side routing/denial is covered by in-process tests.
+
+Restrict the session to the broker tools plus only the built-ins the task
+needs (`--tools`), disable everything else (`--no-tools` baseline +
+explicit `--tools` list, `--no-pty` unless the task needs a shell), and
+never give the agent the workspace dir, profile paths, admin password, or
+keychain access. Tool-surface control is not filesystem isolation: verify
+no alternate tool, subagent, extension, or computer-use path crosses the
+boundary before declaring the profile enforced. Runtime allowlists
 (`enabled_tools`, `features.shell_tool=false`, permission deny-read) are
 defense in depth; enforcement was tested at the broker (denial before RPC),
 not delegated to them.
-
-**OMP v18.2.6 (verified with installed CLI):** `--help` shows
-`--no-tools` / `--tools=<list>` (tool gating), `--extension`/`--hook`
-(TypeScript custom-tool modules) and no MCP client flags — MCP consumption
-is unverified in this version. The supported path is a custom tool module
-(`~/.omp/agent/tools/`, `.omp/tools`, or an explicit path) whose `execute`
-POSTs to the loopback broker with the session token; see the custom-tools
-docs for the module contract. Restrict the session to the broker tools plus
-only the built-ins the task needs (`--tools`), disable everything else
-(`--no-tools` baseline + explicit `--tools` list, `--no-pty` unless the task
-needs a shell), and never give the agent the workspace dir, profile paths,
-admin password, or keychain access. Tool-surface control is not filesystem
-isolation: verify no alternate tool, subagent, extension, or computer-use
-path crosses the boundary before declaring the profile enforced.
 
 ## Live compatibility
 

@@ -11,6 +11,15 @@
 // limit/offset, caller-supplied company selection, unenforceable company
 // scope) denies. Decision.Reason values are fixed strings and carry no
 // secrets — field/model names at most, never domain values or credentials.
+//
+// Field-projection invariant: search/read require a non-empty explicit
+// projection (omitted, nil, or empty Fields deny; there is no default-all).
+// Every entry must normalize, must not be a wildcard, and dotted entries
+// resolve via the same policy-gated traversal check as domains. Odoo
+// implicitly returns `id` on search_read even when unrequested; the broker
+// sends exactly the authorized list and MUST append `id` if absent (see
+// EnsureID). Authorize therefore accepts projections lacking `id` as
+// legitimate exact projections — `id` need not be requested to be returned.
 package policy
 
 import "strings"
@@ -41,15 +50,20 @@ const (
 )
 
 // ModelRule is the per-model allowlist entry. Fields holds exact Odoo
-// technical names (sorted by convention). CompanyField names the enforcing
-// field (e.g. "company_id" or "company_ids"); "" means unknown.
-// CompanyIndependent marks human-reviewed shared/global data.
+// technical names (sorted by convention) for top-level returnable fields.
+// CompanyField names the enforcing field (e.g. "company_id" or
+// "company_ids"); "" means unknown. CompanyIndependent marks human-reviewed
+// shared/global data. IncludeCompanyless is an explicit per-model opt-in
+// (default false) permitting company_id=false (companyless) records in
+// scoped models via an OR-false enforcing fragment; it is meaningless on
+// CompanyIndependent models and rejected by Validate.
 type ModelRule struct {
 	Fields             []string
 	MaxLimit           int
 	AllowAggregate     bool
 	CompanyField       string
 	CompanyIndependent bool
+	IncludeCompanyless bool
 }
 
 // CompanyScope is the human-chosen company set. At least two companies must
@@ -148,4 +162,19 @@ func NormalizeName(s string) (string, bool) {
 		return "", false
 	}
 	return t, true
+}
+
+// EnsureID enforces the field-projection invariant on the broker side:
+// Odoo implicitly returns `id` on search_read even when unrequested, so
+// the broker sends exactly the authorized projection and appends `id`
+// when absent. Lists already containing `id` are returned unchanged.
+func EnsureID(fields []string) []string {
+	for _, f := range fields {
+		if nf, ok := NormalizeName(f); ok && nf == "id" {
+			return fields
+		}
+	}
+	out := make([]string, 0, len(fields)+1)
+	out = append(out, fields...)
+	return append(out, "id")
 }

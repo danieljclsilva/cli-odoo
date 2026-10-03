@@ -1,6 +1,10 @@
 package policy
 
-import "strings"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 // Stable, secret-free decision reasons. Reasons name operations, models, or
 // fields at most — never domain values, tokens, credentials, or company IDs.
@@ -9,7 +13,7 @@ const (
 	ReasonAllow = "allow"
 	// ReasonInvalidPolicy marks a zero-value or malformed policy
 	// (bad version/instance, empty operations/models, unknown
-	// SharedRecords, non-positive global MaxLimit).
+	// SharedRecords, non-positive global MaxLimit, invalid CompanyScope).
 	ReasonInvalidPolicy = "invalid-policy"
 	// ReasonInvalidScope marks a policy whose CompanyScope fails
 	// ValidateScope.
@@ -23,7 +27,9 @@ const (
 	// ReasonAggregateDenied marks an aggregate request on a model whose
 	// rule forbids aggregation.
 	ReasonAggregateDenied = "aggregate-denied"
-	// ReasonFieldDenied marks a requested field outside the model rule.
+	// ReasonFieldDenied marks a missing/empty field projection on
+	// search/read, or a requested field outside the model rule
+	// (wildcards, unallowlisted names, unapproved traversals).
 	ReasonFieldDenied = "field-denied"
 	// ReasonDomainDenied marks a malformed domain or one referencing a
 	// field outside the model rule (dot-path traversals included).
@@ -48,23 +54,107 @@ const (
 	ReasonCompanyDenied = "company-denied"
 )
 
+// Validate rejects a contradictory or malformed policy centrally so the
+// broker (New and Serve) and Authorize share one seal check: bad
+// version/instance, empty operations/models, unknown SharedRecords
+// (only deny|allow-classified), invalid CompanyScope, non-positive
+// MaxLimit/MaxRowsPerCall/MaxResponseBytes, negative MaxOffset, and any
+// per-model defect — empty Fields, a field name failing NormalizeName, a
+// CompanyField failing NormalizeName when set, CompanyIndependent combined
+// with a CompanyField, IncludeCompanyless on a CompanyIndependent model
+// (meaningless there), or a negative per-model MaxLimit. A scoped model
+// without a CompanyField is NOT a Validate error: the policy is
+// well-formed but Authorize denies every request for that model with
+// company-denied until a human supplies an enforcing field.
+func (p *Policy) Validate() error {
+	if p == nil {
+		return fmt.Errorf("policy: nil policy")
+	}
+	if p.Version <= 0 {
+		return fmt.Errorf("policy: bad version %d", p.Version)
+	}
+	if strings.TrimSpace(p.Instance) == "" {
+		return fmt.Errorf("policy: empty instance")
+	}
+	if len(p.Operations) == 0 {
+		return fmt.Errorf("policy: no operations allowlisted")
+	}
+	if len(p.Models) == 0 {
+		return fmt.Errorf("policy: no models allowlisted")
+	}
+	if p.SharedRecords != SharedDeny && p.SharedRecords != SharedAllowClassified {
+		return fmt.Errorf("policy: unknown shared-records classification %q", p.SharedRecords)
+	}
+	if p.Budgets.MaxLimit <= 0 {
+		return fmt.Errorf("policy: non-positive global MaxLimit %d", p.Budgets.MaxLimit)
+	}
+	if p.Budgets.MaxRowsPerCall <= 0 {
+		return fmt.Errorf("policy: non-positive MaxRowsPerCall %d", p.Budgets.MaxRowsPerCall)
+	}
+	if p.Budgets.MaxResponseBytes <= 0 {
+		return fmt.Errorf("policy: non-positive MaxResponseBytes %d", p.Budgets.MaxResponseBytes)
+	}
+	if p.Budgets.MaxOffset < 0 {
+		return fmt.Errorf("policy: negative MaxOffset %d", p.Budgets.MaxOffset)
+	}
+	if err := ValidateScope(p.Scope); err != nil {
+		return err
+	}
+	for name, rule := range p.Models {
+		if _, ok := NormalizeName(name); !ok {
+			return fmt.Errorf("policy: bad model name %q", name)
+		}
+		if len(rule.Fields) == 0 {
+			return fmt.Errorf("policy: model %q has no fields", name)
+		}
+		for _, f := range rule.Fields {
+			if _, ok := NormalizeName(f); !ok {
+				return fmt.Errorf("policy: model %q bad field %q", name, f)
+			}
+		}
+		if rule.CompanyField != "" {
+			if _, ok := NormalizeName(rule.CompanyField); !ok {
+				return fmt.Errorf("policy: model %q bad company field %q", name, rule.CompanyField)
+			}
+		}
+		if rule.CompanyIndependent && rule.CompanyField != "" {
+			return fmt.Errorf("policy: model %q contradictory: company-independent with company field", name)
+		}
+		if rule.CompanyIndependent && rule.IncludeCompanyless {
+			return fmt.Errorf("policy: model %q meaningless companyless opt-in on independent model", name)
+		}
+		if rule.MaxLimit < 0 {
+			return fmt.Errorf("policy: model %q negative MaxLimit %d", name, rule.MaxLimit)
+		}
+	}
+	return nil
+}
+
 // Authorize is the deny-by-default gate. It is pure: no network, keychain,
 // or filesystem access. Denial precedes everything, enforced in order:
 //
-//  1. Zero-value/malformed policy denies (nil receiver, bad
+//  1. The sealed policy must Validate (nil receiver, bad
 //     version/instance, empty operations/models, unknown SharedRecords,
-//     non-positive global MaxLimit, invalid CompanyScope).
+//     non-positive budgets, invalid CompanyScope, contradictory model
+//     rules). Scope failures report invalid-scope; all other seal
+//     failures report invalid-policy.
 //  2. The operation must be allowlisted in Policy.Operations.
 //  3. The model name must normalize (NormalizeName) and be present in
 //     Policy.Models. Aggregate additionally requires
 //     ModelRule.AllowAggregate.
-//  4. Every requested field must normalize and be an exact member of the
-//     model rule's Fields (top-level names; dotted entries match only if
-//     literally listed).
+//  4. Field projection: search/read require a non-empty explicit
+//     projection (omitted, nil, or empty Fields deny — there is no
+//     default-all-fields). Every entry must normalize, must not contain
+//     a wildcard, and dotted entries resolve via checkPath (root
+//     allowlisted, intermediates relational, terminal explicitly
+//     approved on an enforceable target). Single `id` is structural and
+//     always permitted; a projection lacking `id` is a legitimate exact
+//     projection — the broker appends `id` (see EnsureID) because Odoo
+//     implicitly returns it on search_read.
 //  5. Every field referenced in Domain, Order, and GroupBy must resolve
-//     (dot-paths via checkPath: root allowlisted, every intermediate
-//     segment relational through SchemaView, terminal present). Malformed
-//     domain/order shapes deny.
+//     (dot-paths via checkPath with the same traversal rules).
+//     Malformed domain/order shapes — including unknown operators and
+//     unbounded operands — deny.
 //  6. Limit/Offset must sit within budgets. Over-max DENIES — it never
 //     clamps, because clamping would silently return a narrower slice
 //     than the caller asked for and mask budget bypasses. Row-returning
@@ -76,26 +166,26 @@ const (
 //  7. Non-empty CompanyIDs denies: the model cannot select companies; the
 //     broker injects the enforced scope after authorization.
 //  8. Company rule: a human-reviewed CompanyIndependent model under
-//     SharedRecords allow-classified passes without a fragment; otherwise
-//     a usable CompanyField passes (the broker ANDs the CompanyDomain
-//     fragment after the caller domain); anything else denies.
+//     SharedRecords allow-classified with no CompanyField passes without
+//     a fragment; an independent model with a CompanyField set denies
+//     (contradictory — already rejected by Validate, failed closed here
+//     too); otherwise a usable CompanyField passes (the broker ANDs the
+//     CompanyDomain fragment after the caller domain); anything else
+//     denies. Scoped models NEVER pass without a fragment.
 //
 // A nil SchemaView only constrains dotted paths: single-segment fields
 // resolve against the rule alone, while any dot-path traversal without a
 // schema to verify it denies.
 func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 	deny := func(reason string) Decision { return Decision{Allow: false, Reason: reason} }
-	if p == nil || p.Version <= 0 || p.Instance == "" || len(p.Operations) == 0 || len(p.Models) == 0 {
+	if p == nil {
 		return deny(ReasonInvalidPolicy)
 	}
-	if p.SharedRecords != SharedDeny && p.SharedRecords != SharedAllowClassified {
+	if err := p.Validate(); err != nil {
+		if serr := ValidateScope(p.Scope); serr != nil {
+			return deny(ReasonInvalidScope)
+		}
 		return deny(ReasonInvalidPolicy)
-	}
-	if p.Budgets.MaxLimit <= 0 {
-		return deny(ReasonInvalidPolicy)
-	}
-	if err := ValidateScope(p.Scope); err != nil {
-		return deny(ReasonInvalidScope)
 	}
 	if r.Operation == OpMeta && strings.TrimSpace(r.Model) == "" {
 		// Policy listing: no model data, only the sealed allowlist shape.
@@ -132,9 +222,29 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 			allowed[nf] = true
 		}
 	}
+	if r.Operation == OpSearch || r.Operation == OpRead {
+		if len(r.Fields) == 0 {
+			return deny(ReasonFieldDenied)
+		}
+	}
 	for _, f := range r.Fields {
+		if strings.Contains(f, "*") {
+			return deny(ReasonFieldDenied)
+		}
 		nf, ok := NormalizeName(f)
-		if !ok || !allowed[nf] {
+		if !ok {
+			return deny(ReasonFieldDenied)
+		}
+		if strings.Contains(nf, ".") {
+			if !checkPath(p, allowed, schema, model, nf) {
+				return deny(ReasonFieldDenied)
+			}
+			continue
+		}
+		if nf == "id" {
+			continue
+		}
+		if !allowed[nf] {
 			return deny(ReasonFieldDenied)
 		}
 	}
@@ -145,14 +255,14 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 		refs[k] = v
 	}
 	refs["id"] = true
-	if !checkDomain(refs, schema, model, r.Domain) {
+	if !checkDomain(p, refs, schema, model, r.Domain) {
 		return deny(ReasonDomainDenied)
 	}
-	if !checkOrder(refs, schema, model, r.Order) {
+	if !checkOrder(p, refs, schema, model, r.Order) {
 		return deny(ReasonOrderDenied)
 	}
 	for _, g := range r.GroupBy {
-		if !checkPath(refs, schema, model, g) {
+		if !checkPath(p, refs, schema, model, g) {
 			return deny(ReasonGroupByDenied)
 		}
 	}
@@ -182,8 +292,11 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 	if len(r.CompanyIDs) != 0 {
 		return deny(ReasonCompanySelectDenied)
 	}
-	if rule.CompanyIndependent && p.SharedRecords == SharedAllowClassified {
-		return Decision{Allow: true, Reason: ReasonAllow}
+	if rule.CompanyIndependent {
+		if p.SharedRecords == SharedAllowClassified && rule.CompanyField == "" {
+			return Decision{Allow: true, Reason: ReasonAllow}
+		}
+		return deny(ReasonCompanyDenied)
 	}
 	if _, ok := NormalizeName(rule.CompanyField); ok {
 		return Decision{Allow: true, Reason: ReasonAllow}
@@ -191,13 +304,13 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 	return deny(ReasonCompanyDenied)
 }
 
-// validDomainOp reports whether op is a known Odoo domain operator.
-// Unknown operators deny rather than pass through to the server, so a
-// mistyped or server-specific operator can never widen a query.
+// validDomainOp reports whether op is a known Odoo domain operator in the
+// strict allowlist. Unknown operators deny rather than pass through to the
+// server, so a mistyped or server-specific operator can never widen a query.
 func validDomainOp(op string) bool {
 	switch op {
-	case "=", "!=", "<>", ">", "<", ">=", "<=",
-		"in", "not in", "like", "not like", "ilike", "not ilike",
+	case "=", "!=", ">", "<", ">=", "<=",
+		"in", "not in", "like", "ilike",
 		"=like", "=ilike", "child_of", "parent_of":
 		return true
 	default:
@@ -205,12 +318,51 @@ func validDomainOp(op string) bool {
 	}
 }
 
-// checkDomain validates a decoded-JSON domain: nil (no filter) or an array
-// whose elements are logical prefix operators ("&", "|", "!") or leaf
-// [field, operator, value] triples. Anything else — wrong top-level shape,
-// wrong leaf arity, non-string field/operator, unknown operator, an
-// unresolvable field path, or an arity-incomplete expression — fails closed.
-// Values (third elements) are never inspected.
+// isDomainScalar reports whether v is a bounded domain operand: a JSON
+// scalar (string, bool, nil, number) with no nesting. Numbers cover every
+// Go numeric kind plus json.Number (decoders using UseNumber); anything
+// else — maps, slices, structs — is not scalar.
+func isDomainScalar(v any) bool {
+	switch v.(type) {
+	case nil, string, bool, json.Number,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64:
+		return true
+	default:
+		return false
+	}
+}
+
+// checkDomainValue bounds a leaf operand: scalars pass, as do flat arrays
+// of scalars; nested arrays or maps as (or inside) the value deny. The
+// `in` operator additionally requires an array value — a scalar `in`
+// operand denies.
+func checkDomainValue(op string, v any) bool {
+	if arr, ok := v.([]any); ok {
+		for _, e := range arr {
+			if !isDomainScalar(e) {
+				return false
+			}
+		}
+		return true
+	}
+	if op == "in" {
+		return false
+	}
+	if _, ok := v.(map[string]any); ok {
+		return false
+	}
+	return isDomainScalar(v)
+}
+
+// checkDomain validates a decoded-JSON domain: nil or an empty array (no
+// filter) or an array whose elements are logical prefix operators ("&",
+// "|", "!") or leaf [field, operator, value] triples. Anything else —
+// wrong top-level shape, wrong leaf arity, non-string field/operator,
+// unknown operator, an unresolvable field path, an unbounded operand, or
+// an arity-incomplete expression — fails closed. Values are bounded by
+// checkDomainValue (never passed through blindly).
 //
 // Arity completeness matters because the broker appends the enforced company
 // fragment AFTER the caller domain: ["|", leaf] alone would combine with the
@@ -218,13 +370,16 @@ func validDomainOp(op string) bool {
 // requires the caller expression to reduce to exactly one complete
 // expression (implicit AND of one or more complete terms), so the appended
 // fragment always further narrows via AND.
-func checkDomain(allowed map[string]bool, schema SchemaView, model string, d any) bool {
+func checkDomain(p *Policy, allowed map[string]bool, schema SchemaView, model string, d any) bool {
 	if d == nil {
 		return true
 	}
 	arr, ok := d.([]any)
 	if !ok {
 		return false
+	}
+	if len(arr) == 0 {
+		return true
 	}
 	// Prefix arity: the domain is an implicit AND of one or more complete
 	// prefix terms. Track open slots in the current term: a binary operator
@@ -258,7 +413,10 @@ func checkDomain(allowed map[string]bool, schema SchemaView, model string, d any
 			if !ok || !validDomainOp(op) {
 				return false
 			}
-			if !checkPath(allowed, schema, model, field) {
+			if !checkPath(p, allowed, schema, model, field) {
+				return false
+			}
+			if !checkDomainValue(op, t[2]) {
 				return false
 			}
 			if need == 0 {
@@ -277,7 +435,7 @@ func checkDomain(allowed map[string]bool, schema SchemaView, model string, d any
 // Each item's head is a field path resolved like any other reference;
 // trailing tokens must each be asc/desc (case-insensitive). Empty clauses
 // pass; empty items or bogus directions deny.
-func checkOrder(allowed map[string]bool, schema SchemaView, model, order string) bool {
+func checkOrder(p *Policy, allowed map[string]bool, schema SchemaView, model, order string) bool {
 	if strings.TrimSpace(order) == "" {
 		return true
 	}
@@ -291,28 +449,51 @@ func checkOrder(allowed map[string]bool, schema SchemaView, model, order string)
 				return false
 			}
 		}
-		if !checkPath(allowed, schema, model, toks[0]) {
+		if !checkPath(p, allowed, schema, model, toks[0]) {
 			return false
 		}
 	}
 	return true
 }
 
+// targetEnforceable reports whether a traversal target model's rule carries
+// its own enforceable company scope: human-reviewed independent under
+// allow-classified with no company field, or a scoped rule with a usable
+// CompanyField. Anything else (contradictory, fieldless scoped) denies the
+// traversal.
+func targetEnforceable(p *Policy, rule ModelRule) bool {
+	if rule.CompanyIndependent {
+		return p.SharedRecords == SharedAllowClassified && rule.CompanyField == ""
+	}
+	_, ok := NormalizeName(rule.CompanyField)
+	return ok
+}
+
 // checkPath resolves one field reference. Single-segment names must
 // normalize and sit in the rule allowlist. Dotted paths (e.g.
-// "partner_id.name") additionally require the root in the allowlist, every
-// intermediate segment to resolve through SchemaView to a relational field
-// (Relation != ""), and the terminal to exist on the final model. The
-// terminal itself needs only to exist: it filters, it is never returned, so
-// the rule allowlist governs returned fields while the schema governs
-// traversal shape. Unknown models, missing fields, non-relational
-// intermediates, and missing schemas all deny.
-func checkPath(allowed map[string]bool, schema SchemaView, model, path string) bool {
-	segs := strings.Split(strings.TrimSpace(path), ".")
-	for _, s := range segs {
-		if _, ok := NormalizeName(s); !ok {
+// "partner_id.name") default DENY and are allowed only when the full path
+// is explicitly approved: the root sits in the requesting model's rule,
+// every intermediate segment resolves through SchemaView to a relational
+// field (Relation != ""), the terminal field exists on the target model AND
+// is explicitly listed in the target model's Policy.Models entry
+// (structural `id` is exempt from both terminal checks), and the target
+// rule is itself enforceable via targetEnforceable. Schema existence alone
+// never approves: a terminal present in the schema but absent from the
+// target rule, or a target model absent from the policy, denies. Unknown
+// models, missing fields, non-relational intermediates, missing schemas,
+// and missing policies all deny.
+func checkPath(p *Policy, allowed map[string]bool, schema SchemaView, model, path string) bool {
+	raw := strings.Split(strings.TrimSpace(path), ".")
+	segs := make([]string, 0, len(raw))
+	for _, s := range raw {
+		n, ok := NormalizeName(s)
+		if !ok {
 			return false
 		}
+		segs = append(segs, n)
+	}
+	if len(segs) == 0 {
+		return false
 	}
 	if !allowed[segs[0]] {
 		return false
@@ -320,23 +501,46 @@ func checkPath(allowed map[string]bool, schema SchemaView, model, path string) b
 	if len(segs) == 1 {
 		return true
 	}
-	if schema == nil {
+	if p == nil || schema == nil {
 		return false
 	}
 	cur, ok := schema.Model(model)
 	if !ok {
 		return false
 	}
+	target := ""
 	for _, s := range segs[:len(segs)-1] {
 		fm, ok := cur.Field(s)
 		if !ok || fm.Relation == "" {
 			return false
 		}
+		target = fm.Relation
 		cur, ok = schema.Model(fm.Relation)
 		if !ok {
 			return false
 		}
 	}
-	_, ok = cur.Field(segs[len(segs)-1])
-	return ok
+	terminal := segs[len(segs)-1]
+	if terminal != "id" {
+		if _, ok := cur.Field(terminal); !ok {
+			return false
+		}
+	}
+	targetRule, ok := p.Models[target]
+	if !ok {
+		return false
+	}
+	if terminal != "id" {
+		found := false
+		for _, f := range targetRule.Fields {
+			if nf, ok := NormalizeName(f); ok && nf == terminal {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return targetEnforceable(p, targetRule)
 }

@@ -26,6 +26,7 @@ func testSchemaView() testSchema {
 	return testSchema{
 		"res.partner": testModel{
 			"name":       {Name: "name", Type: "char"},
+			"secret":     {Name: "secret", Type: "char"},
 			"company_id": {Name: "company_id", Type: "many2one", Relation: "res.company"},
 			"partner_id": {Name: "partner_id", Type: "many2one", Relation: "res.partner"},
 		},
@@ -250,11 +251,10 @@ func TestCompanyRule(t *testing.T) {
 	schema := testSchemaView()
 	// Independent + allow-classified passes without fragment.
 	p := validPolicy()
-	r := Request{Operation: OpSearch, Model: "res.company", Limit: 5}
+	r := Request{Operation: OpSearch, Model: "res.company", Fields: []string{"name"}, Limit: 5}
 	if d := p.Authorize(schema, r); !d.Allow {
 		t.Fatalf("classified independent denied: %+v", d)
 	}
-	// Same model under deny without a company field must deny.
 	p.SharedRecords = SharedDeny
 	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonCompanyDenied {
 		t.Fatalf("independent under deny = %+v, want company-denied", d)
@@ -369,6 +369,7 @@ func TestValidateScopeAndCompanyDomain(t *testing.T) {
 func TestReasonsSecretFree(t *testing.T) {
 	d := validPolicy().Authorize(testSchemaView(), Request{
 		Operation: OpSearch, Model: "res.partner",
+		Fields: []string{"name"},
 		Domain: []any{[]any{"name", "=", "s3cr3t-value"}},
 		Limit:  1,
 	})
@@ -383,5 +384,343 @@ func TestReasonsSecretFree(t *testing.T) {
 	}
 	if strings.Contains(d.Reason, "s3cr3t") {
 		t.Fatalf("reason leaks domain value: %q", d.Reason)
+	}
+}
+
+func TestSearchReadRequireExplicitProjection(t *testing.T) {
+	schema := testSchemaView()
+	p := validPolicy()
+	for _, op := range []Operation{OpSearch, OpRead} {
+		for _, name := range []string{"omitted", "nil", "empty"} {
+			var fields []string
+			switch name {
+			case "nil":
+				fields = nil
+			case "empty":
+				fields = []string{}
+			}
+			r := Request{Operation: op, Model: "res.partner", Fields: fields,
+				Domain: []any{[]any{"name", "=", "x"}}, Limit: 10}
+			if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonFieldDenied {
+				t.Fatalf("%s %s fields = %+v, want deny field-denied", op, name, d)
+			}
+		}
+		// Legitimate exact projection (without `id`) is allowed: the
+		// broker appends `id` because Odoo implicitly returns it.
+		r := Request{Operation: op, Model: "res.partner", Fields: []string{"name"},
+			Domain: []any{[]any{"name", "=", "x"}}, Limit: 10}
+		if d := p.Authorize(schema, r); !d.Allow {
+			t.Fatalf("%s exact projection denied: %+v", op, d)
+		}
+		// Unapproved name denies.
+		r.Fields = []string{"name", "secret_field"}
+		if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonFieldDenied {
+			t.Fatalf("%s unapproved field = %+v", op, d)
+		}
+	}
+	// Count needs no projection.
+	if d := p.Authorize(schema, Request{Operation: OpCount, Model: "res.partner"}); !d.Allow {
+		t.Fatalf("count without fields denied: %+v", d)
+	}
+}
+
+func TestFieldWildcardDenied(t *testing.T) {
+	schema := testSchemaView()
+	p := validPolicy()
+	for _, f := range []string{"*", "na*", "partner_id.*"} {
+		r := validSearch()
+		r.Fields = []string{f}
+		if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonFieldDenied {
+			t.Fatalf("wildcard %q = %+v, want deny field-denied", f, d)
+		}
+	}
+}
+
+func TestDottedFieldProjection(t *testing.T) {
+	schema := testSchemaView()
+	p := validPolicy()
+	r := validSearch()
+	r.Fields = []string{"name", "partner_id.name"}
+	if d := p.Authorize(schema, r); !d.Allow {
+		t.Fatalf("approved dotted projection denied: %+v", d)
+	}
+	r.Fields = []string{"name", "partner_id.secret"}
+	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonFieldDenied {
+		t.Fatalf("unapproved dotted projection = %+v, want deny field-denied", d)
+	}
+}
+
+func TestEnsureID(t *testing.T) {
+	got := EnsureID([]string{"name"})
+	if len(got) != 2 || got[0] != "name" || got[1] != "id" {
+		t.Fatalf("EnsureID appends id: %#v", got)
+	}
+	keep := []string{"name", "id"}
+	if got := EnsureID(keep); len(got) != 2 {
+		t.Fatalf("EnsureID keeps lists with id: %#v", got)
+	}
+}
+
+func traversalSchema() testSchema {
+	return testSchema{
+		"sale.order": testModel{
+			"partner_id": {Name: "partner_id", Type: "many2one", Relation: "res.partner"},
+			"company_id": {Name: "company_id", Type: "many2one", Relation: "res.company"},
+			"name":       {Name: "name", Type: "char"},
+		},
+		"res.partner": testModel{
+			"name":       {Name: "name", Type: "char"},
+			"secret":     {Name: "secret", Type: "char"},
+			"company_id": {Name: "company_id", Type: "many2one", Relation: "res.company"},
+			"partner_id": {Name: "partner_id", Type: "many2one", Relation: "res.partner"},
+		},
+		"res.company": testModel{
+			"name": {Name: "name", Type: "char"},
+		},
+	}
+}
+
+func traversalPolicy() *Policy {
+	p := validPolicy()
+	p.Models["sale.order"] = ModelRule{
+		Fields:       []string{"company_id", "name", "partner_id"},
+		CompanyField: "company_id",
+	}
+	return p
+}
+
+func TestTraversalTargetApproval(t *testing.T) {
+	schema := traversalSchema()
+	// res.partner absent from the policy: schema existence alone must
+	// not approve partner_id.secret.
+	p := validPolicy()
+	delete(p.Models, "res.partner")
+	p.Models["sale.order"] = ModelRule{
+		Fields:       []string{"company_id", "name", "partner_id"},
+		CompanyField: "company_id",
+	}
+	r := Request{Operation: OpSearch, Model: "sale.order", Fields: []string{"name"},
+		Domain: []any{[]any{"partner_id.secret", "=", "x"}}, Limit: 10}
+	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonDomainDenied {
+		t.Fatalf("traversal into absent model = %+v, want deny domain-denied", d)
+	}
+	// Approved full path: terminal `name` explicitly listed in the
+	// res.partner rule (validPolicy lists name) and the target is
+	// scoped-enforceable.
+	p = traversalPolicy()
+	r.Domain = []any{[]any{"partner_id.name", "=", "x"}}
+	if d := p.Authorize(schema, r); !d.Allow {
+		t.Fatalf("approved full path denied: %+v", d)
+	}
+	// Terminal present in schema but absent from the target rule denies.
+	r.Domain = []any{[]any{"partner_id.secret", "=", "x"}}
+	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonDomainDenied {
+		t.Fatalf("unapproved terminal = %+v, want deny domain-denied", d)
+	}
+}
+
+func TestNestedTraversalPaths(t *testing.T) {
+	schema := traversalSchema()
+	p := traversalPolicy()
+	allow := func(path string) Request {
+		return Request{Operation: OpSearch, Model: "sale.order", Fields: []string{"name"},
+			Domain: []any{[]any{path, "=", "x"}}, Limit: 10}
+	}
+	// Fully approved nested path: sale.order -> res.partner ->
+	// res.company(name listed on the independent res.company rule).
+	if d := p.Authorize(schema, allow("partner_id.company_id.name")); !d.Allow {
+		t.Fatalf("approved nested path denied: %+v", d)
+	}
+	// Alternate short path through the local company_id is also allowed
+	// when fully approved.
+	if d := p.Authorize(schema, allow("company_id.name")); !d.Allow {
+		t.Fatalf("approved short path denied: %+v", d)
+	}
+	// Removing the terminal from the target rule denies both paths.
+	p.Models["res.company"] = ModelRule{Fields: []string{"id"}, CompanyIndependent: true}
+	for _, path := range []string{"partner_id.company_id.name", "company_id.name"} {
+		if d := p.Authorize(schema, allow(path)); d.Allow || d.Reason != ReasonDomainDenied {
+			t.Fatalf("path %q without terminal approval = %+v", path, d)
+		}
+	}
+}
+
+func TestEmptyDomainPasses(t *testing.T) {
+	schema := testSchemaView()
+	p := validPolicy()
+	for _, d := range []any{nil, []any{}} {
+		r := validSearch()
+		r.Domain = d
+		if got := p.Authorize(schema, r); !got.Allow {
+			t.Fatalf("empty domain %#v denied: %+v", d, got)
+		}
+	}
+}
+
+func TestDomainOperandBounds(t *testing.T) {
+	schema := testSchemaView()
+	p := validPolicy()
+	bad := []struct {
+		name   string
+		domain any
+	}{
+		{"unknown-op", []any{[]any{"name", "contains", "x"}}},
+		{"not-like-op", []any{[]any{"name", "not like", "x"}}},
+		{"dict-value", []any{[]any{"name", "=", map[string]any{"a": 1}}}},
+		{"nested-array-value", []any{[]any{"name", "=", []any{[]any{1}}}}},
+		{"in-scalar", []any{[]any{"name", "in", "x"}}},
+	}
+	for _, tc := range bad {
+		r := validSearch()
+		r.Domain = tc.domain
+		if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonDomainDenied {
+			t.Fatalf("%s: = %+v, want deny domain-denied", tc.name, d)
+		}
+	}
+	good := []any{
+		[]any{"name", "in", []any{"x", "y"}},
+		[]any{"company_id", "child_of", 1},
+		[]any{"name", "=", nil},
+	}
+	r := validSearch()
+	r.Domain = good
+	if d := p.Authorize(schema, r); !d.Allow {
+		t.Fatalf("bounded operands denied: %+v", d)
+	}
+}
+
+func TestValidateCentral(t *testing.T) {
+	if err := validPolicy().Validate(); err != nil {
+		t.Fatalf("valid policy: %v", err)
+	}
+	cases := []struct {
+		name   string
+		mutate func(p *Policy)
+	}{
+		{"bad-version", func(p *Policy) { p.Version = 0 }},
+		{"bad-instance", func(p *Policy) { p.Instance = "" }},
+		{"empty-ops", func(p *Policy) { p.Operations = nil }},
+		{"empty-models", func(p *Policy) { p.Models = nil }},
+		{"unknown-shared", func(p *Policy) { p.SharedRecords = "sometimes" }},
+		{"bad-scope", func(p *Policy) { p.Scope = CompanyScope{Enabled: []int{1}, Default: 1} }},
+		{"nonpositive-limit", func(p *Policy) { p.Budgets.MaxLimit = 0 }},
+		{"nonpositive-rows", func(p *Policy) { p.Budgets.MaxRowsPerCall = 0 }},
+		{"nonpositive-bytes", func(p *Policy) { p.Budgets.MaxResponseBytes = 0 }},
+		{"negative-offset", func(p *Policy) { p.Budgets.MaxOffset = -1 }},
+		{"contradictory-rule", func(p *Policy) {
+			p.Models["res.partner"] = ModelRule{Fields: []string{"name"}, CompanyField: "company_id", CompanyIndependent: true}
+		}},
+		{"companyless-on-independent", func(p *Policy) {
+			p.Models["res.company"] = ModelRule{Fields: []string{"name"}, CompanyIndependent: true, IncludeCompanyless: true}
+		}},
+		{"empty-rule-fields", func(p *Policy) {
+			p.Models["res.partner"] = ModelRule{Fields: nil, CompanyField: "company_id"}
+		}},
+		{"bad-rule-field", func(p *Policy) {
+			p.Models["res.partner"] = ModelRule{Fields: []string{"na me"}, CompanyField: "company_id"}
+		}},
+		{"bad-company-field", func(p *Policy) {
+			p.Models["res.partner"] = ModelRule{Fields: []string{"name"}, CompanyField: "no good"}
+		}},
+		{"negative-rule-limit", func(p *Policy) {
+			p.Models["res.partner"] = ModelRule{Fields: []string{"name"}, CompanyField: "company_id", MaxLimit: -1}
+		}},
+	}
+	for _, tc := range cases {
+		p := validPolicy()
+		tc.mutate(p)
+		if err := p.Validate(); err == nil {
+			t.Fatalf("%s: Validate passed, want error", tc.name)
+		}
+		if d := p.Authorize(testSchemaView(), validSearch()); d.Allow {
+			t.Fatalf("%s: invalid policy allowed: %+v", tc.name, d)
+		}
+	}
+	// Scoped model without a company field is well-formed (Validate
+	// passes) but every request denies with company-denied.
+	p := validPolicy()
+	p.Models["res.partner"] = ModelRule{Fields: []string{"id", "name"}}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("fieldless-scoped Validate: %v", err)
+	}
+	if d := p.Authorize(testSchemaView(), validSearch()); d.Allow || d.Reason != ReasonCompanyDenied {
+		t.Fatalf("fieldless-scoped = %+v, want company-denied", d)
+	}
+}
+
+func TestContradictoryRuleDenied(t *testing.T) {
+	schema := testSchemaView()
+	p := validPolicy()
+	p.Models["res.partner"] = ModelRule{Fields: []string{"name"}, CompanyField: "company_id", CompanyIndependent: true}
+	if err := p.Validate(); err == nil {
+		t.Fatal("contradictory rule passed Validate")
+	}
+	if d := p.Authorize(schema, validSearch()); d.Allow {
+		t.Fatalf("contradictory rule allowed: %+v", d)
+	}
+}
+
+func TestCompanylessFragment(t *testing.T) {
+	scope := CompanyScope{Enabled: []int{1, 2}, Default: 1}
+	// Without the flag the fragment excludes companyless records.
+	frag, enforce := CompanyDomain(ModelRule{CompanyField: "company_id"}, scope)
+	if !enforce || len(frag) != 1 {
+		t.Fatalf("scoped = (%v,%v)", frag, enforce)
+	}
+	leaf, ok := frag[0].([]any)
+	if !ok || len(leaf) != 3 || leaf[0] != "company_id" || leaf[1] != "in" {
+		t.Fatalf("scoped fragment shape = %#v", frag)
+	}
+	ids, ok := leaf[2].([]any)
+	if !ok || len(ids) != 2 {
+		t.Fatalf("scoped fragment must carry BOTH enabled ids: %#v", frag)
+	}
+	// With the flag the fragment ORs in the companyless shape.
+	frag, enforce = CompanyDomain(ModelRule{CompanyField: "company_id", IncludeCompanyless: true}, scope)
+	if !enforce || len(frag) != 1 {
+		t.Fatalf("companyless = (%v,%v)", frag, enforce)
+	}
+	or, ok := frag[0].([]any)
+	if !ok || len(or) != 3 || or[0] != "|" {
+		t.Fatalf("companyless fragment shape = %#v", frag)
+	}
+	second, ok := or[2].([]any)
+	if !ok || len(second) != 3 || second[2] != false {
+		t.Fatalf("companyless OR-false branch = %#v", frag)
+	}
+	// The companyless flag is admitted by Authorize on scoped models.
+	p := validPolicy()
+	p.Models["res.partner"] = ModelRule{Fields: []string{"company_id", "id", "name"}, CompanyField: "company_id", IncludeCompanyless: true}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("scoped companyless Validate: %v", err)
+	}
+	if d := p.Authorize(testSchemaView(), validSearch()); !d.Allow {
+		t.Fatalf("scoped companyless denied: %+v", d)
+	}
+}
+
+func TestIndependentCompanyFieldContradiction(t *testing.T) {
+	_, enforce := CompanyDomain(
+		ModelRule{CompanyField: "company_id", CompanyIndependent: true},
+		CompanyScope{Enabled: []int{1, 2}, Default: 1})
+	if !enforce {
+		t.Fatal("independent with company field must still enforce (deny)")
+	}
+	p := validPolicy()
+	p.Models["res.company"] = ModelRule{Fields: []string{"name"}, CompanyField: "company_id", CompanyIndependent: true}
+	r := Request{Operation: OpSearch, Model: "res.company", Fields: []string{"name"}, Limit: 5}
+	if d := p.Authorize(testSchemaView(), r); d.Allow {
+		t.Fatalf("independent with company field allowed: %+v", d)
+	}
+}
+
+func TestDisabledCompanyNoBypass(t *testing.T) {
+	schema := testSchemaView()
+	p := validPolicy()
+	// A caller-supplied disabled company is still caller selection: deny.
+	r := validSearch()
+	r.CompanyIDs = []int{3}
+	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonCompanySelectDenied {
+		t.Fatalf("disabled company select = %+v, want deny company-select-denied", d)
 	}
 }

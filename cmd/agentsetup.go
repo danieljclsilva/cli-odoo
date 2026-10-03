@@ -87,39 +87,41 @@ func agentSetupStdinTTY() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
+// agentSetupPrompter threads one bufio.Reader through every prompt so
+// multi-prompt setup never loses buffered input. Each agentSetupPrompt call
+// used to build its own reader; the second reader could consume bytes the
+// first had already buffered and the setup would hang or misread.
+type agentSetupPrompter struct {
+	r *bufio.Reader
+}
+
+// agentSetupNewPrompter binds the shared prompt reader to stdin.
+func agentSetupNewPrompter() *agentSetupPrompter {
+	return &agentSetupPrompter{r: bufio.NewReader(os.Stdin)}
+}
+
 // agentSetupPrompt prints msg on stderr and reads one line from stdin.
 // It refuses when stdin is not a terminal so scripts get an explicit
 // "pass the flag" error instead of a silent hang.
 func agentSetupPrompt(msg string) (string, error) {
-	if !agentSetupStdinTTY() {
-		return "", fmt.Errorf("no value given and stdin is not a terminal (pass the flag explicitly)")
-	}
-	fmt.Fprint(os.Stderr, msg)
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && len(line) == 0 {
-		return "", fmt.Errorf("reading answer: %w", err)
-	}
-	return strings.TrimSpace(line), nil
+	return agentSetupNewPrompter().prompt(msg)
 }
 
-// agentSetupAdminPassword reads the admin password via the lock package:
-// --admin-password-stdin only from stdin, otherwise a no-echo TTY prompt.
-// confirm asks twice on the setup path so a typo cannot lock the human out.
+// agentSetupAdminPassword reads the admin password from stdin (flag) or a
+// TTY prompt. confirm=true (new seal) reads twice and requires a match;
+// with --admin-password-stdin the single piped line is used as-is.
 func agentSetupAdminPassword(adminStdin, confirm bool) (string, error) {
 	if adminStdin {
 		return lock.ReadAdminPasswordStdin()
 	}
-	first, err := lock.PromptAdminPassword("Agent admin password: ")
+	first, err := lock.PromptAdminPassword("Admin password: ")
 	if err != nil {
 		return "", err
-	}
-	if first == "" {
-		return "", fmt.Errorf("empty admin password refused")
 	}
 	if !confirm {
 		return first, nil
 	}
-	second, err := lock.PromptAdminPassword("Confirm agent admin password: ")
+	second, err := lock.PromptAdminPassword("Confirm admin password: ")
 	if err != nil {
 		return "", err
 	}
@@ -127,6 +129,19 @@ func agentSetupAdminPassword(adminStdin, confirm bool) (string, error) {
 		return "", fmt.Errorf("passwords do not match")
 	}
 	return first, nil
+}
+
+// prompt reads one line through the shared reader.
+func (p *agentSetupPrompter) prompt(msg string) (string, error) {
+	if !agentSetupStdinTTY() {
+		return "", fmt.Errorf("no value given and stdin is not a terminal (pass the flag explicitly)")
+	}
+	fmt.Fprint(os.Stderr, msg)
+	line, err := p.r.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return "", fmt.Errorf("reading answer: %w", err)
+	}
+	return strings.TrimSpace(line), nil
 }
 
 // agentSetupLiveClient resolves the active instance with its keychain
@@ -238,10 +253,17 @@ func agentSetupParseModelSpec(spec string) (snapshot.ModelSpec, error) {
 
 // agentSetupPromptModels runs the interactive approval loop: the human names
 // each model and its fields; anything not named here is never described.
+// Setup uses agentSetupPromptModelsWith with the shared reader.
 func agentSetupPromptModels() ([]snapshot.ModelSpec, error) {
+	return agentSetupPromptModelsWith(agentSetupPrompt)
+}
+
+// agentSetupPromptModelsWith is the shared-reader approval loop: ask threads
+// the one bufio.Reader through every prompt.
+func agentSetupPromptModelsWith(ask func(string) (string, error)) ([]snapshot.ModelSpec, error) {
 	var specs []snapshot.ModelSpec
 	for {
-		nameRaw, err := agentSetupPrompt("Approve model (empty to finish): ")
+		nameRaw, err := ask("Approve model (empty to finish): ")
 		if err != nil {
 			return nil, err
 		}
@@ -252,7 +274,7 @@ func agentSetupPromptModels() ([]snapshot.ModelSpec, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid model name %q: must match [A-Za-z0-9._]+", nameRaw)
 		}
-		fieldsRaw, err := agentSetupPrompt("  Fields for " + name + " (comma-separated, at least one): ")
+		fieldsRaw, err := ask("  Fields for " + name + " (comma-separated, at least one): ")
 		if err != nil {
 			return nil, err
 		}
@@ -265,14 +287,14 @@ func agentSetupPromptModels() ([]snapshot.ModelSpec, error) {
 				return nil, fmt.Errorf("invalid field %q for %s", f, name)
 			}
 		}
-		cfRaw, err := agentSetupPrompt("  Company field (company_id|company_ids, empty if none): ")
+		cfRaw, err := ask("  Company field (company_id|company_ids, empty if none): ")
 		if err != nil {
 			return nil, err
 		}
 		sp := snapshot.ModelSpec{Name: name, Label: name, Fields: fields}
 		switch strings.TrimSpace(cfRaw) {
 		case "":
-			indep, err := agentSetupPrompt("  Company-independent shared data you reviewed? (y/N): ")
+			indep, err := ask("  Company-independent shared data you reviewed? (y/N): ")
 			if err != nil {
 				return nil, err
 			}
@@ -282,7 +304,7 @@ func agentSetupPromptModels() ([]snapshot.ModelSpec, error) {
 		default:
 			return nil, fmt.Errorf("invalid company field %q: want company_id|company_ids|empty", cfRaw)
 		}
-		agg, err := agentSetupPrompt("  Allow aggregate on " + name + "? (y/N): ")
+		agg, err := ask("  Allow aggregate on " + name + "? (y/N): ")
 		if err != nil {
 			return nil, err
 		}
@@ -290,6 +312,66 @@ func agentSetupPromptModels() ([]snapshot.ModelSpec, error) {
 		specs = append(specs, sp)
 	}
 	return specs, nil
+}
+
+// agentSetupProtectedPaths resolves the validator's protected set: the
+// profile path, the snapshot path, the config dir holding them, and the
+// admin socket dir plus the derived socket path (broker admin socket).
+func agentSetupProtectedPaths(profilePath, snapshotPath string) []string {
+	out := []string{profilePath, snapshotPath}
+	seen := map[string]bool{}
+	for _, p := range []string{profilePath, snapshotPath} {
+		if abs, err := filepath.Abs(p); err == nil {
+			d := filepath.Dir(abs)
+			if !seen[d] {
+				seen[d] = true
+				out = append(out, d)
+			}
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		cfg := filepath.Join(home, ".config", "odoo-cli")
+		if !seen[cfg] {
+			out = append(out, cfg)
+		}
+	}
+	tmp := strings.TrimSpace(os.TempDir())
+	if tmp != "" {
+		out = append(out, tmp)
+	}
+	return out
+}
+
+// agentSetupPrintSummary prints the effective setup on stderr before commit:
+// companies enabled/default, shared policy, models/fields/ops, budgets, and
+// workspace. Guided setup requires explicit confirmation of exactly this.
+func agentSetupPrintSummary(instance string, scope policy.CompanyScope, specs []snapshot.ModelSpec, ops map[policy.Operation]bool, shared string, b policy.Budgets, workspaceDir string, allowWorkspace bool) {
+	opNames := make([]string, 0, len(ops))
+	for op := range ops {
+		opNames = append(opNames, string(op))
+	}
+	sort.Strings(opNames)
+	fmt.Fprintf(os.Stderr, "Setup summary for %q:\n", instance)
+	fmt.Fprintf(os.Stderr, "  companies: enabled=%v default=%d\n", scope.Enabled, scope.Default)
+	fmt.Fprintf(os.Stderr, "  shared_records: %s\n", shared)
+	fmt.Fprintf(os.Stderr, "  operations: %s\n", strings.Join(opNames, ","))
+	for _, sp := range specs {
+		fmt.Fprintf(os.Stderr, "  model %s: fields=%s company_field=%q independent=%v aggregate=%v\n",
+			sp.Name, strings.Join(sp.Fields, ","), sp.CompanyField, sp.CompanyIndependent, sp.AllowAggregate)
+	}
+	fmt.Fprintf(os.Stderr, "  budgets: limit=%d offset=%d rows/call=%d response=%d calls/session=%d rows/session=%d\n",
+		b.MaxLimit, b.MaxOffset, b.MaxRowsPerCall, b.MaxResponseBytes, b.MaxCallsPerSession, b.MaxRowsPerSession)
+	fmt.Fprintf(os.Stderr, "  workspace: %s (model tools=%v)\n", workspaceDir, allowWorkspace)
+}
+
+// mustJSONSetup marshals v for size-cap checks; encoding never fails for
+// the in-memory setup structs.
+func mustJSONSetup(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // agentSetupOps parses the --ops CSV into the Operations allowlist.
@@ -351,9 +433,167 @@ func agentSetupEnsureParent(path string) error {
 	return nil
 }
 
+// agentSetup input bounds. Profile/snapshot inputs are human-handled files:
+// anything over cap fails closed before decode or crypto runs.
+const (
+	// agentSetupMaxProfileBytes bounds a sealed profile read: 4 MiB, the
+	// same cap the lock package enforces on payloads and ciphertext.
+	agentSetupMaxProfileBytes = 4 << 20
+	// agentSetupMaxSnapshotBytes bounds a snapshot read on setup paths
+	// that do not go through snapshot.Load (profile-embedded copies).
+	agentSetupMaxSnapshotBytes = 4 << 20
+)
+
+// agentSetupSecureReplace atomically replaces path with data (0600): the
+// parent must already exist, the temp is created with O_CREATE|O_EXCL in
+// that same directory (no WriteFile symlink sink), set 0600, fsynced, and
+// renamed over the target. An existing 0644 is never preserved: the new
+// file is always 0600.
+func agentSetupSecureReplace(path string, data []byte) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("empty path")
+	}
+	dir := filepath.Dir(path)
+	st, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("parent %q: %w (create it first; secure replace creates no directories)", dir, err)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("parent %q is not a directory", dir)
+	}
+	tmp, err := os.CreateTemp(dir, ".setup-*.tmp")
+	if err != nil {
+		return fmt.Errorf("staging temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("staging temp: %w", err)
+	}
+	// Chmod the open handle, not the path: no symlink-swap race.
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("staging temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("staging temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("staging temp: %w", err)
+	}
+	// Rename replaces a final-component symlink itself rather than
+	// following it; preexisting hardlinks keep the old content.
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("committing: %w", err)
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		return fmt.Errorf("chmod: %w", err)
+	}
+	return nil
+}
+
+// agentSetupProfileLocked reports whether path holds a parseable locked
+// (sealed) profile envelope. Unparseable or missing files report false so
+// the first-setup path stays open; a parseable envelope triggers the
+// overwrite guard.
+func agentSetupProfileLocked(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil || !st.Mode().IsRegular() || st.Size() == 0 {
+		return false
+	}
+	if st.Size() > agentSetupMaxProfileBytes {
+		return true // over-cap input is still "existing": force the guard path
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || int64(len(b)) > agentSetupMaxProfileBytes {
+		return true
+	}
+	var prof lock.Profile
+	if err := json.Unmarshal(b, &prof); err != nil {
+		return false
+	}
+	return prof.FormatVersion == lock.FormatVersion && len(prof.Ciphertext) > 0
+}
+
+// agentSetupRequireCurrentPassword enforces the setup overwrite guard: when
+// profilePath already holds a locked profile, the human must supply the
+// current admin password (opened successfully) before it may be replaced.
+// With reset=true the human instead performs an explicit secure recovery:
+// typing RESET plus a new password, with no old password required.
+// readPassword supplies the password source (TTY prompt or stdin flag).
+func agentSetupRequireCurrentPassword(profilePath string, reset bool, readPassword func(confirm bool) (string, error), prompter *agentSetupPrompter) (current string, _ bool, err error) {
+	if !agentSetupProfileLocked(profilePath) {
+		return "", false, nil
+	}
+	if reset {
+		typed, err := prompter.prompt("Type RESET to erase the existing sealed profile: ")
+		if err != nil {
+			return "", false, err
+		}
+		if typed != "RESET" {
+			return "", false, fmt.Errorf("reset aborted: typed %q, want RESET", typed)
+		}
+		return "", true, nil
+	}
+	pw, err := readPassword(false)
+	if err != nil {
+		return "", false, fmt.Errorf("existing sealed profile at %q: enter the CURRENT admin password (--admin-password-stdin) or re-run with --reset: %w", profilePath, err)
+	}
+	if err := agentSetupCheckPassword(profilePath, pw); err != nil {
+		return "", false, fmt.Errorf("existing sealed profile at %q: current password rejected (or re-run with --reset): %w", profilePath, err)
+	}
+	return pw, false, nil
+}
+
+// agentSetupCheckPassword opens the existing profile once: success proves
+// the human holds the current password. The plaintext is discarded; only
+// the open verdict matters.
+func agentSetupCheckPassword(profilePath, adminPassword string) error {
+	st, err := os.Stat(profilePath)
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file")
+	}
+	if st.Size() > agentSetupMaxProfileBytes {
+		return fmt.Errorf("profile %d bytes exceeds cap %d", st.Size(), agentSetupMaxProfileBytes)
+	}
+	b, err := os.ReadFile(profilePath)
+	if err != nil {
+		return err
+	}
+	var prof lock.Profile
+	if err := json.Unmarshal(b, &prof); err != nil {
+		return err
+	}
+	if _, err := prof.Open(adminPassword); err != nil {
+		return err
+	}
+	return nil
+}
+
 // agentSetupOpenPolicy reads a sealed profile and unseals its policy JSON.
+// The profile file is size-capped (agentSetupMaxProfileBytes) and must be
+// a regular file; anything over cap fails closed before decode or crypto.
 func agentSetupOpenPolicy(profilePath, adminPassword string) (policy.Policy, error) {
 	var pol policy.Policy
+	st, err := os.Stat(profilePath)
+	if err != nil {
+		return pol, fmt.Errorf("reading profile %q: %w (run: odoo agent setup)", profilePath, err)
+	}
+	if !st.Mode().IsRegular() {
+		return pol, fmt.Errorf("reading profile %q: not a regular file", profilePath)
+	}
+	if st.Size() > agentSetupMaxProfileBytes {
+		return pol, fmt.Errorf("reading profile %q: %d bytes exceeds cap %d", profilePath, st.Size(), agentSetupMaxProfileBytes)
+	}
 	b, err := os.ReadFile(profilePath)
 	if err != nil {
 		return pol, fmt.Errorf("reading profile %q: %w (run: odoo agent setup)", profilePath, err)
@@ -393,7 +633,7 @@ func newAgentSetupCmd() *cobra.Command {
 	var profilePath, snapshotPath, workspaceDir, companiesStr, opsStr, sharedRecords string
 	var defaultCompany int
 	var modelFlags []string
-	var adminStdin bool
+	var adminStdin, resetFlag, nonInteractive bool
 	var maxLimit, maxOffset, maxRowsPerCall, maxResponseBytes int
 	var maxCallsPerSession, maxRowsPerSession int64
 	var allowWorkspace bool
@@ -413,10 +653,15 @@ instance (--instance flag or ODOO_INSTANCE) with its keychain secret
   3. approves operations (--ops), budgets, and shared-record handling
      (--shared-records deny|allow-classified);
   4. takes a workspace directory (--workspace), created 0700 when missing;
-  5. builds the snapshot from the live server, writes it 0600;
-  6. seals the policy with an admin password (TTY no-echo prompt, or
+  5. prints the effective summary and requires explicit confirmation
+     (or --non-interactive with all choices explicit);
+  6. builds the snapshot from the live server, writes it 0600;
+  7. seals the policy with an admin password (TTY no-echo prompt, or
      --admin-password-stdin only) and writes the profile 0600.
 
+Overwriting an existing sealed profile requires the CURRENT admin password
+first (it is opened successfully before replacement), or --reset for
+explicit secure recovery (type RESET plus a new password, no old password).
 The admin password never appears in output, envelopes, or errors.
 MethodManifest in the snapshot is informational only, never executable.`,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -429,6 +674,26 @@ MethodManifest in the snapshot is informational only, never executable.`,
 			}
 			if profilePath == "" || snapshotPath == "" {
 				output.Fail(tool, fmt.Errorf("cannot determine home directory (set --profile and --snapshot-path explicitly)"))
+				return
+			}
+			// One shared reader for every prompt below: multi-prompt
+			// stdin must not be split across readers.
+			prompter := agentSetupNewPrompter()
+			ask := func(msg string) (string, error) { return prompter.prompt(msg) }
+			// Overwrite guard BEFORE any live RPC: an existing locked
+			// profile requires the current password (opened
+			// successfully) before replacement, or an explicit --reset
+			// recovery (typing RESET + a new password, no old password).
+			_, resetRecovery, err := agentSetupRequireCurrentPassword(profilePath, resetFlag, func(confirm bool) (string, error) {
+				return agentSetupAdminPassword(adminStdin, confirm)
+			}, prompter)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			interactive := strings.TrimSpace(companiesStr) == "" || defaultCompany == 0 || len(modelFlags) == 0 || strings.TrimSpace(workspaceDir) == ""
+			if nonInteractive && interactive {
+				output.Fail(tool, fmt.Errorf("--non-interactive requires --companies, --default-company, --model, and --workspace (no prompts allowed)"))
 				return
 			}
 			cli, inst, err := agentSetupLiveClient(InstanceName())
@@ -472,7 +737,7 @@ MethodManifest in the snapshot is informational only, never executable.`,
 					return
 				}
 			} else {
-				raw, err := agentSetupPrompt("Enable companies (comma-separated ids, at least two): ")
+				raw, err := ask("Enable companies (comma-separated ids, at least two): ")
 				if err != nil {
 					output.Fail(tool, err)
 					return
@@ -484,7 +749,7 @@ MethodManifest in the snapshot is informational only, never executable.`,
 				}
 			}
 			if defaultCompany == 0 {
-				raw, err := agentSetupPrompt("Default company (must be one of the enabled): ")
+				raw, err := ask("Default company (must be one of the enabled): ")
 				if err != nil {
 					output.Fail(tool, err)
 					return
@@ -509,7 +774,7 @@ MethodManifest in the snapshot is informational only, never executable.`,
 					specs = append(specs, sp)
 				}
 			} else {
-				specs, err = agentSetupPromptModels()
+				specs, err = agentSetupPromptModelsWith(ask)
 				if err != nil {
 					output.Fail(tool, err)
 					return
@@ -538,7 +803,7 @@ MethodManifest in the snapshot is informational only, never executable.`,
 
 			if strings.TrimSpace(workspaceDir) == "" {
 				suggest := filepath.Join(filepath.Dir(snapshotPath), "agent-workspace")
-				raw, err := agentSetupPrompt("Workspace directory [" + suggest + "]: ")
+				raw, err := ask("Workspace directory [" + suggest + "]: ")
 				if err != nil {
 					output.Fail(tool, err)
 					return
@@ -553,26 +818,20 @@ MethodManifest in the snapshot is informational only, never executable.`,
 				output.Fail(tool, err)
 				return
 			}
+			// Dedicated-dir validation against protected paths
+			// (profile, snapshot, config dir, admin socket dir+path):
+			// rejects broad roots, group-writable dirs, and overlap.
+			protected := agentSetupProtectedPaths(profilePath, snapshotPath)
+			if wsAbs, err = workspace.ValidateDedicatedDir(wsAbs, protected); err != nil {
+				output.Fail(tool, err)
+				return
+			}
 			ws, err := workspace.Open(wsAbs)
 			if err != nil {
 				output.Fail(tool, err)
 				return
 			}
 			_ = ws.Close()
-
-			snap, err := snapshot.BuildFromServer(cli, instanceName, scope, specs)
-			if err != nil {
-				output.Fail(tool, err)
-				return
-			}
-			if err := agentSetupEnsureParent(snapshotPath); err != nil {
-				output.Fail(tool, err)
-				return
-			}
-			if err := snapshot.Write(snapshotPath, snap); err != nil {
-				output.Fail(tool, err)
-				return
-			}
 
 			models := make(map[string]policy.ModelRule, len(specs))
 			for _, sp := range specs {
@@ -598,11 +857,51 @@ MethodManifest in the snapshot is informational only, never executable.`,
 				WorkspaceDir:   wsAbs,
 				SnapshotPath:   snapshotPath,
 			}
+			// Guided setup: print the effective summary and require
+			// explicit confirmation before committing anything.
+			agentSetupPrintSummary(instanceName, scope, specs, ops, shared, pol.Budgets, wsAbs, allowWorkspace)
+			if !nonInteractive {
+				confirm, err := ask("Commit this setup (seal policy + write snapshot)? (yes/N): ")
+				if err != nil {
+					output.Fail(tool, err)
+					return
+				}
+				if !strings.EqualFold(strings.TrimSpace(confirm), "yes") && !strings.EqualFold(strings.TrimSpace(confirm), "y") {
+					output.Fail(tool, fmt.Errorf("setup aborted: confirmation required before commit"))
+					return
+				}
+			}
+			snap, err := snapshot.BuildFromServer(cli, instanceName, scope, specs)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			if err := agentSetupEnsureParent(snapshotPath); err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			if int64(len(mustJSONSetup(snap))) > agentSetupMaxSnapshotBytes {
+				output.Fail(tool, fmt.Errorf("built snapshot exceeds cap %d", agentSetupMaxSnapshotBytes))
+				return
+			}
+			if err := snapshot.Write(snapshotPath, snap); err != nil {
+				output.Fail(tool, err)
+				return
+			}
+
 			policyJSON, err := json.Marshal(pol)
 			if err != nil {
 				output.Fail(tool, fmt.Errorf("encoding policy: %w", err))
 				return
 			}
+			if int64(len(policyJSON)) > agentSetupMaxProfileBytes {
+				output.Fail(tool, fmt.Errorf("sealed policy %d bytes exceeds cap %d", len(policyJSON), agentSetupMaxProfileBytes))
+				return
+			}
+			// New password seals the replacement (the overwrite guard
+			// above already verified the current one, unless --reset
+			// recovery applied).
+			_ = resetRecovery
 			adminPassword, err := agentSetupAdminPassword(adminStdin, true)
 			if err != nil {
 				output.Fail(tool, err)
@@ -622,7 +921,7 @@ MethodManifest in the snapshot is informational only, never executable.`,
 				output.Fail(tool, err)
 				return
 			}
-			if err := os.WriteFile(profilePath, append(profJSON, '\n'), 0600); err != nil {
+			if err := agentSetupSecureReplace(profilePath, append(profJSON, '\n')); err != nil {
 				output.Fail(tool, fmt.Errorf("writing profile: %w", err))
 				return
 			}
@@ -655,6 +954,8 @@ MethodManifest in the snapshot is informational only, never executable.`,
 	c.Flags().Int64Var(&maxCallsPerSession, "max-calls-per-session", 1000, "session call budget")
 	c.Flags().Int64Var(&maxRowsPerSession, "max-rows-per-session", 100000, "session row budget")
 	c.Flags().BoolVar(&allowWorkspace, "allow-workspace", true, "grant the model broker-level workspace file tools")
+	c.Flags().BoolVar(&resetFlag, "reset", false, "explicit secure recovery: type RESET plus a new password to replace an existing sealed profile (no old password)")
+	c.Flags().BoolVar(&nonInteractive, "non-interactive", false, "fail instead of prompting; requires --companies, --default-company, --model, and --workspace")
 	return c
 }
 

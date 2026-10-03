@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -182,6 +183,7 @@ func writeRawSnapshot(t *testing.T, s Snapshot) string {
 	f := snapshotFile{
 		Version: FormatVersion, Instance: s.Instance,
 		ServerVersion: s.ServerVersion, CapturedAt: s.CapturedAt,
+		CapturedBy:         s.CapturedBy,
 		AvailableCompanies: s.AvailableCompanies, EnabledCompanies: s.EnabledCompanies,
 		DefaultCompany: s.DefaultCompany, Models: s.Models, MethodManifest: s.MethodManifest,
 	}
@@ -244,5 +246,196 @@ func TestLoadTrailingDataDenies(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("trailing data: expected deny, got allow")
+	}
+}
+
+func writeCatalogFile(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestImportBoundedCatalogMixedProvenance(t *testing.T) {
+	// A human-transcribed catalog with mixed provenance imports bounded:
+	// unstated provenance defaults explicitly to unknown, labels are
+	// preserved, and the display-only Executable flag does not authorize.
+	body := `{"instance":"test","server_version":"17.0",` +
+		`"available_companies":[{"id":1,"name":"A"},{"id":2,"name":"B"}],` +
+		`"enabled_companies":[1,2],"default_company":1,` +
+		`"models":{` +
+		`"res.partner":{"label":"Contact","provenance":"manifest","executable":false,` +
+		`"company_field":"company_id","fields":{` +
+		`"name":{"type":"char","label":"Name","provenance":"manifest"},` +
+		`"email":{"type":"char","label":"Email"}}},` +
+		`"x.custom":{"label":"Custom","executable":false,"fields":{` +
+		`"x_note":{"type":"text","label":"Note"}}}}` +
+		`,"method_manifest":["search_read"]}`
+	s, err := ImportCatalog(writeCatalogFile(t, body))
+	if err != nil {
+		t.Fatalf("ImportCatalog: %v", err)
+	}
+	pm, ok := s.Models["res.partner"]
+	if !ok || pm.Provenance != ProvManifest {
+		t.Fatalf("res.partner provenance = %q, want manifest", pm.Provenance)
+	}
+	if prov, ok := s.FieldProvenanceOf("res.partner", "name"); !ok || prov != ProvManifest {
+		t.Fatalf("name provenance = %q,%v, want manifest,true", prov, ok)
+	}
+	// Unstated email + custom provenance default explicitly to unknown.
+	if prov, ok := s.FieldProvenanceOf("res.partner", "email"); !ok || prov != ProvUnknown {
+		t.Fatalf("email provenance = %q,%v, want unknown,true", prov, ok)
+	}
+	if prov, ok := s.ProvenanceOf("x.custom"); !ok || prov != ProvUnknown {
+		t.Fatalf("x.custom provenance = %q,%v, want unknown,true", prov, ok)
+	}
+	// An unapproved custom model is describable here but never executable
+	// by this flag: IsExecutable is display-only (false), and the broker
+	// (not this package) denies read/call via Policy.Models.
+	if s.IsExecutable("x.custom") {
+		t.Fatal("IsExecutable(x.custom): got true, want false (display-only)")
+	}
+	if s.IsExecutable("res.partner") {
+		t.Fatal("IsExecutable(res.partner): got true, want false")
+	}
+	if _, ok := s.Model("search_read"); ok {
+		t.Fatal("manifest method resolved as a model")
+	}
+	if mprov, ok := s.ProvenanceOf("res.partner"); !ok || mprov != ProvManifest {
+		t.Fatalf("ProvenanceOf(res.partner) = %q,%v", mprov, ok)
+	}
+	// The imported snapshot round-trips through Write/Load unchanged.
+	path := filepath.Join(t.TempDir(), "imported.json")
+	if err := Write(path, s); err != nil {
+		t.Fatalf("Write(imported): %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(imported): %v", err)
+	}
+	if prov, _ := got.ProvenanceOf("x.custom"); prov != ProvUnknown {
+		t.Fatalf("round trip x.custom provenance = %q", prov)
+	}
+}
+
+func TestImportCatalogBounds(t *testing.T) {
+	// Unknown fields in the catalog reject.
+	if _, err := ImportCatalog(writeCatalogFile(t, `{"instance":"x","bogus":1}`)); err == nil {
+		t.Fatal("unknown catalog field: expected deny, got allow")
+	}
+	// Trailing data rejects.
+	p := writeCatalogFile(t, `{"instance":"x"}garbage`)
+	if _, err := ImportCatalog(p); err == nil {
+		t.Fatal("trailing catalog data: expected deny, got allow")
+	}
+	// Bad provenance rejects.
+	bad := `{"instance":"test","available_companies":[{"id":1,"name":"A"},{"id":2,"name":"B"}],` +
+		`"enabled_companies":[1,2],"default_company":1,` +
+		`"models":{"res.partner":{"provenance":"auto","fields":{"name":{"type":"char"}}}}}`
+	if _, err := ImportCatalog(writeCatalogFile(t, bad)); err == nil {
+		t.Fatal("bad provenance: expected deny, got allow")
+	}
+	// Over-cap model count rejects (build the body programmatically).
+	var sb strings.Builder
+	sb.WriteString(`{"instance":"test","available_companies":[{"id":1,"name":"A"},{"id":2,"name":"B"}],` +
+		`"enabled_companies":[1,2],"default_company":1,"models":{`)
+	for i := range MaxCatalogModels + 1 {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(`"overcap.model.` + strconv.Itoa(i) + `":{"fields":{"f":{"type":"char"}}}`)
+	}
+	sb.WriteString(`}}`)
+	if _, err := ImportCatalog(writeCatalogFile(t, sb.String())); err == nil {
+		t.Fatal("over-cap models: expected deny, got allow")
+	}
+}
+
+func TestImportManifestInformationalOnly(t *testing.T) {
+	// A bounded method list imports for inspection; entries never resolve
+	// as models and no Execute path takes names from this list.
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(path, []byte(`{"methods":["search_read","read"]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	methods, err := ImportManifest(path)
+	if err != nil {
+		t.Fatalf("ImportManifest: %v", err)
+	}
+	if len(methods) != 2 || methods[0] != "search_read" {
+		t.Fatalf("methods = %v", methods)
+	}
+	s := validTestSnapshot()
+	for _, m := range methods {
+		if _, ok := s.Model(m); ok {
+			t.Fatalf("manifest entry %q resolved as a model", m)
+		}
+		if s.IsExecutable(m) {
+			t.Fatalf("manifest entry %q executable", m)
+		}
+	}
+	// Unknown fields reject; trailing data rejects.
+	bad := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(bad, []byte(`{"methods":[],"bogus":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ImportManifest(bad); err == nil {
+		t.Fatal("unknown manifest field: expected deny, got allow")
+	}
+}
+
+func TestLoadRejectsEmptyProvenance(t *testing.T) {
+	// An empty model provenance always denies on Load (explicit unknown
+	// required), including through the raw-envelope path.
+	s := validTestSnapshot()
+	m := s.Models["res.partner"]
+	m.Provenance = ""
+	s.Models["res.partner"] = m
+	if _, err := Load(writeRawSnapshot(t, s)); err == nil {
+		t.Fatal("empty provenance: expected deny, got allow")
+	}
+	// A snapshot missing CapturedBy still loads (back-compat: Build always
+	// sets it, Load does not require it), while Executable defaults false.
+	path := writeTestSnapshot(t, validTestSnapshot())
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.IsExecutable("res.partner") {
+		t.Fatal("IsExecutable default: got true, want false")
+	}
+}
+
+func TestWriteIsAtomicSecure0600(t *testing.T) {
+	// Write replaces atomically at 0600 and never preserves a looser mode.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.json")
+	if err := os.WriteFile(path, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(path, validTestSnapshot()); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0600 {
+		t.Fatalf("mode = %04o, want 0600", st.Mode().Perm())
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load(written): %v", err)
+	}
+	// No staging files leak.
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), ".tmp-") {
+			t.Fatalf("staging file leaked: %s", f.Name())
+		}
 	}
 }

@@ -100,3 +100,82 @@ func TestReadPasswordLineTrims(t *testing.T) {
 		t.Fatal("blank password accepted")
 	}
 }
+
+func TestOpenRejectsBadSizesWithoutPanic(t *testing.T) {
+	p, err := Seal([]byte(`{"v":1}`), "pw")
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	cases := map[string]func() Profile{
+		"1-byte nonce": func() Profile {
+			bad := p
+			bad.Nonce = []byte{0x01}
+			return bad
+		},
+		"truncated salt": func() Profile {
+			bad := p
+			bad.Salt = p.Salt[:7]
+			return bad
+		},
+		"truncated verifier": func() Profile {
+			bad := p
+			bad.Verifier = p.Verifier[:16]
+			return bad
+		},
+		"empty ciphertext": func() Profile {
+			bad := p
+			bad.Ciphertext = nil
+			return bad
+		},
+		"oversize ciphertext": func() Profile {
+			bad := p
+			bad.Ciphertext = make([]byte, 4<<20)
+			return bad
+		},
+	}
+	for name, mk := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("%s panicked: %v", name, r)
+				}
+			}()
+			if _, err := mk().Open("pw"); err == nil {
+				t.Fatalf("%s accepted", name)
+			}
+		}()
+	}
+}
+
+func TestSealBoundsInputs(t *testing.T) {
+	if _, err := Seal([]byte(`{"v":1}`), ""); err == nil {
+		t.Fatal("empty password sealed")
+	}
+	if _, err := Seal(make([]byte, 4<<20), "pw"); err == nil {
+		t.Fatal("oversize payload sealed")
+	}
+	bad, err := Seal([]byte(`{"v":1}`), "pw")
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if _, err := bad.Open("nope"); err == nil {
+		t.Fatal("wrong password opened")
+	}
+}
+
+func TestReadPasswordLineKeepsSecondLine(t *testing.T) {
+	// One shared reader, two sequential line reads: the first read must
+	// not swallow the second line (the old per-call bufio.Reader did).
+	r := strings.NewReader("first-pw\nsecond-pw\n")
+	first, err := readPasswordLine(r)
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	second, err := readPasswordLine(r)
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if first != "first-pw" || second != "second-pw" {
+		t.Fatalf("got %q, %q", first, second)
+	}
+}

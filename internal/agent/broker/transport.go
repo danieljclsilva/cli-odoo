@@ -118,8 +118,22 @@ func (b *Broker) effectiveAdminSocket(addr string) string {
 // mux on a 0600 unix socket, and blocks. It resolves the keychain secret
 // and dials Odoo once here — never in New. No admin endpoints exist on the
 // TCP listener (typed tools + /healthz only).
+//
+// Serve re-validates the sealed policy and refuses to serve when the
+// snapshot disagrees with it (instance identity, exact enabled-company set
+// and default): a swapped or mismatched snapshot never reaches credential
+// resolution.
 func (b *Broker) Serve(addr string) error {
 	if err := checkLoopbackAddr(addr); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	pol := b.pol
+	b.mu.Unlock()
+	if err := pol.Validate(); err != nil {
+		return fmt.Errorf("broker: invalid policy: %w", err)
+	}
+	if err := b.checkScopeMatch(); err != nil {
 		return err
 	}
 	b.mu.Lock()
@@ -159,17 +173,34 @@ func (b *Broker) Serve(addr string) error {
 	if err != nil {
 		return fmt.Errorf("broker: admin socket: %w", err)
 	}
-	_ = os.Chmod(sockPath, 0600)
 	defer func() {
 		_ = adminLn.Close()
 		_ = os.Remove(sockPath)
 	}()
 	adminErr := make(chan error, 1)
 	go func() {
-		adminErr <- http.Serve(adminLn, b.adminMux())
+		srv := &http.Server{
+			Handler:      b.adminMux(),
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 60 * time.Second,
+			IdleTimeout:  120 * time.Second,
+		}
+		adminErr <- srv.Serve(adminLn)
 	}()
 
-	modelErr := http.ListenAndServe(addr, b.modelMux())
+	// Bounds: every model response (search/read/count/aggregate/meta/
+	// companies/catalog/workspace) is capped by the sealed
+	// Budgets.MaxResponseBytes envelope check at write time, and the
+	// listeners carry read/write/idle timeouts so a stalled model peer
+	// cannot hold a session handler forever.
+	modelSrv := &http.Server{
+		Addr:         addr,
+		Handler:      b.modelMux(),
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+	modelErr := modelSrv.ListenAndServe()
 	select {
 	case err := <-adminErr:
 		return fmt.Errorf("broker: admin socket: %w", err)
@@ -190,6 +221,8 @@ func (b *Broker) modelMux() *http.ServeMux {
 	m.HandleFunc("/rpc/count", b.requirePost(b.handleCount))
 	m.HandleFunc("/rpc/aggregate", b.requirePost(b.handleAggregate))
 	m.HandleFunc("/rpc/meta", b.requireGet(b.handleMeta))
+	m.HandleFunc("/rpc/companies", b.requireGet(b.handleCompanies))
+	m.HandleFunc("/rpc/catalog", b.requireGet(b.handleCatalog))
 	m.HandleFunc("/rpc/workspace/list", b.requirePost(b.handleWorkspaceList))
 	m.HandleFunc("/rpc/workspace/read", b.requirePost(b.handleWorkspaceRead))
 	m.HandleFunc("/rpc/workspace/write", b.requirePost(b.handleWorkspaceWrite))
@@ -264,8 +297,11 @@ func checkError(w http.ResponseWriter, err error) bool {
 	return true
 }
 
-// decodeBody parses one JSON object with unknown fields rejected (so a
-// caller-supplied context/CompanyIDs block fails closed) and a 1 MiB cap.
+// decodeBody parses exactly one JSON object with unknown fields rejected (so
+// a caller-supplied context/CompanyIDs block fails closed) and a 1 MiB cap.
+// Trailing bytes beyond one complete object deny (trailing whitespace is
+// allowed; a second value, `null`, or garbage is not). A null body into a
+// struct denies: the target must stay a JSON object.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
@@ -276,10 +312,25 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		writeRPCError(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return false
 	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		writeRPCError(w, http.StatusBadRequest, "invalid request: empty body")
+		return false
+	}
+	if string(bytes.TrimSpace(body)) == "null" {
+		writeRPCError(w, http.StatusBadRequest, "invalid request: null body")
+		return false
+	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		writeRPCError(w, http.StatusBadRequest, fmt.Sprintf("invalid request: %v", sanitizeBrokerErr(err)))
+		return false
+	}
+	// Exactly one JSON value: a second decode must hit EOF (trailing
+	// whitespace is consumed by Decode, so only real trailing data denies).
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		writeRPCError(w, http.StatusBadRequest, "invalid request: trailing data after JSON object")
 		return false
 	}
 	return true
@@ -365,6 +416,22 @@ func (b *Broker) authorize(w http.ResponseWriter, r *http.Request) (string, bool
 	return tok, true
 }
 
+// gateMeta authorizes the unscoped discovery surface (meta listing,
+// companies, catalog): no model membership, zero paging, no caller company
+// selection. It mirrors the Authorize policy-listing branch without
+// depending on the injected test gate (fakes are allow-all stubs for the
+// data path, not the discovery authz).
+func (b *Broker) gateMeta(w http.ResponseWriter) bool {
+	b.mu.Lock()
+	pol := b.pol
+	b.mu.Unlock()
+	if !pol.Operations[policy.OpMeta] {
+		writeRPCError(w, http.StatusForbidden, "denied: "+policy.ReasonOperationDenied)
+		return false
+	}
+	return true
+}
+
 // gate checks the deny-by-default policy for one request. The rule lookup
 // uses the normalized model name so padded/case-variant input that the gate
 // allowed (NormalizeName trims) resolves to the same sealed rule.
@@ -421,6 +488,10 @@ func (b *Broker) handleSearch(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
+	if !b.enforceable(w, rule) {
+		b.release(tok)
+		return
+	}
 	domain, kwargs, err := b.scopedArgs(rule, in.Domain)
 	if err != nil {
 		writeRPCError(w, http.StatusBadRequest, err.Error())
@@ -430,29 +501,41 @@ func (b *Broker) handleSearch(w http.ResponseWriter, r *http.Request) {
 	kwargs["domain"] = domain
 	kwargs["limit"] = limit
 	kwargs["offset"] = in.Offset
-	if len(in.Fields) > 0 {
-		fs := make([]any, 0, len(in.Fields))
-		for _, f := range in.Fields {
-			fs = append(fs, f)
-		}
-		kwargs["fields"] = fs
+	// Exact authorized projection: the gate already approved in.Fields, and
+	// Odoo implicitly returns `id` on search_read, so send exactly the
+	// approved list with `id` appended when absent (see policy.EnsureID).
+	fs := make([]any, 0, len(in.Fields)+1)
+	for _, f := range policy.EnsureID(in.Fields) {
+		fs = append(fs, f)
 	}
+	kwargs["fields"] = fs
 	if in.Order != "" {
 		kwargs["order"] = in.Order
+	}
+	// Atomic row reservation BEFORE the RPC: reserve the whole admitted
+	// limit; on success settleRows refunds the unused headroom, on RPC or
+	// output failure the attempt keeps its reservation (still billed).
+	reserved, err := b.reserveForLimit(tok, limit)
+	if checkError(w, err) {
+		b.release(tok)
+		return
 	}
 	exec := b.execOf()
 	if exec == nil {
 		writeRPCError(w, http.StatusServiceUnavailable, "broker not serving")
-		b.release(tok)
+		b.releaseReserve(tok, reserved)
 		return
 	}
 	res, err := exec.Execute(in.Model, "search_read", nil, kwargs)
 	if err != nil {
 		writeRPCError(w, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
-		b.release(tok)
 		return
 	}
-	b.writeRows(w, r, tok, res)
+	if err := b.live(tok); err != nil {
+		checkError(w, err)
+		return
+	}
+	b.writeRows(w, r, tok, res, reserved)
 }
 
 func (b *Broker) handleRead(w http.ResponseWriter, r *http.Request) {
@@ -484,6 +567,10 @@ func (b *Broker) handleRead(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
+	if !b.enforceable(w, rule) {
+		b.release(tok)
+		return
+	}
 	domain, kwargs, err := b.scopedArgs(rule, []any{[]any{"id", "in", ids}})
 	if err != nil {
 		writeRPCError(w, http.StatusBadRequest, err.Error())
@@ -493,26 +580,33 @@ func (b *Broker) handleRead(w http.ResponseWriter, r *http.Request) {
 	kwargs["domain"] = domain
 	kwargs["limit"] = len(ids)
 	kwargs["offset"] = 0
-	if len(in.Fields) > 0 {
-		fs := make([]any, 0, len(in.Fields))
-		for _, f := range in.Fields {
-			fs = append(fs, f)
-		}
-		kwargs["fields"] = fs
+	// Same exact-projection rule as search: approved fields plus `id`.
+	rfs := make([]any, 0, len(in.Fields)+1)
+	for _, f := range policy.EnsureID(in.Fields) {
+		rfs = append(rfs, f)
+	}
+	kwargs["fields"] = rfs
+	reserved, err := b.reserveForLimit(tok, len(ids))
+	if checkError(w, err) {
+		b.release(tok)
+		return
 	}
 	exec := b.execOf()
 	if exec == nil {
 		writeRPCError(w, http.StatusServiceUnavailable, "broker not serving")
-		b.release(tok)
+		b.releaseReserve(tok, reserved)
 		return
 	}
 	res, err := exec.Execute(in.Model, "search_read", nil, kwargs)
 	if err != nil {
 		writeRPCError(w, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
-		b.release(tok)
 		return
 	}
-	b.writeRows(w, r, tok, res)
+	if err := b.live(tok); err != nil {
+		checkError(w, err)
+		return
+	}
+	b.writeRows(w, r, tok, res, reserved)
 }
 
 func (b *Broker) handleCount(w http.ResponseWriter, r *http.Request) {
@@ -539,6 +633,10 @@ func (b *Broker) handleCount(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
+	if !b.enforceable(w, rule) {
+		b.release(tok)
+		return
+	}
 	exec := b.execOf()
 	if exec == nil {
 		writeRPCError(w, http.StatusServiceUnavailable, "broker not serving")
@@ -548,11 +646,14 @@ func (b *Broker) handleCount(w http.ResponseWriter, r *http.Request) {
 	res, err := exec.Execute(in.Model, "search_count", []any{domain}, kwargs)
 	if err != nil {
 		writeRPCError(w, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
-		b.release(tok)
+		return
+	}
+	if err := b.live(tok); err != nil {
+		checkError(w, err)
 		return
 	}
 	b.record(tok, 1)
-	writeRPCOK(w, res, 1)
+	b.writeEnvelope(w, r, tok, res, 1)
 }
 
 func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
@@ -617,6 +718,10 @@ func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
+	if !b.enforceable(w, rule) {
+		b.release(tok)
+		return
+	}
 	var fields, gb []any
 	for _, g := range in.GroupBy {
 		fields = append(fields, g)
@@ -630,19 +735,56 @@ func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
 	}
 	kwargs["lazy"] = false
 	kwargs["limit"] = limit
+	reserved, err := b.reserveForLimit(tok, limit)
+	if checkError(w, err) {
+		b.release(tok)
+		return
+	}
 	exec := b.execOf()
 	if exec == nil {
 		writeRPCError(w, http.StatusServiceUnavailable, "broker not serving")
-		b.release(tok)
+		b.releaseReserve(tok, reserved)
 		return
 	}
 	res, err := exec.Execute(in.Model, "read_group", []any{domain, fields, gb}, kwargs)
 	if err != nil {
 		writeRPCError(w, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
-		b.release(tok)
 		return
 	}
-	b.writeRows(w, r, tok, res)
+	if err := b.live(tok); err != nil {
+		checkError(w, err)
+		return
+	}
+	b.writeRows(w, r, tok, res, reserved)
+}
+
+// enforceable is defense in depth behind the policy gate: a scoped model
+// (neither company-independent nor companyless-opted) must carry an
+// enforceable company fragment, or the request denies even if Authorize
+// passed. Never serve no-fragment scoped models.
+func (b *Broker) enforceable(w http.ResponseWriter, rule policy.ModelRule) bool {
+	if rule.CompanyIndependent {
+		if rule.CompanyField != "" {
+			// Contradictory (rejected by Validate, denied by Authorize):
+			// fail closed here too.
+			writeRPCError(w, http.StatusForbidden, "denied: company scope unenforceable for this model")
+			return false
+		}
+		return true
+	}
+	b.mu.Lock()
+	scope := b.pol.Scope
+	b.mu.Unlock()
+	frag, enforce := b.frag(rule, scope)
+	if enforce && len(frag) == 0 {
+		writeRPCError(w, http.StatusForbidden, "denied: company scope unenforceable for this model")
+		return false
+	}
+	if !enforce {
+		writeRPCError(w, http.StatusForbidden, "denied: company scope unenforceable for this model")
+		return false
+	}
+	return true
 }
 
 // handleMeta is discoverable-not-executable: it serves the sealed
@@ -661,15 +803,23 @@ func (b *Broker) handleMeta(w http.ResponseWriter, r *http.Request) {
 			b.release(tok)
 			return
 		}
+		if err := b.live(tok); err != nil {
+			checkError(w, err)
+			return
+		}
 		b.record(tok, 0)
-		writeRPCOK(w, map[string]any{
+		b.writeEnvelope(w, r, tok, map[string]any{
 			"model": model, "fields": rule.Fields,
 			"max_limit": rule.MaxLimit, "allow_aggregate": rule.AllowAggregate,
 		}, len(rule.Fields))
 		return
 	}
-	if _, ok := b.gate(w, policy.Request{Operation: policy.OpMeta}); !ok {
+	if !b.gateMeta(w) {
 		b.release(tok)
+		return
+	}
+	if err := b.live(tok); err != nil {
+		checkError(w, err)
 		return
 	}
 	ops := make([]string, 0, len(b.pol.Operations))
@@ -686,10 +836,104 @@ func (b *Broker) handleMeta(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	b.record(tok, 0)
-	writeRPCOK(w, map[string]any{
+	b.writeEnvelope(w, r, tok, map[string]any{
 		"instance": b.pol.Instance, "operations": ops, "models": models,
 		"default_company": b.pol.Scope.Default, "workspace": b.pol.AllowWorkspace,
 	}, len(models))
+}
+
+// handleCompanies serves company discovery from the sealed policy plus the
+// human-built snapshot (no Execute): available companies come from the
+// snapshot's discovered res.company rows, while enabled/default come from
+// the sealed scope. The model cannot select companies from this listing;
+// the broker injects the enforced scope on every RPC regardless.
+func (b *Broker) handleCompanies(w http.ResponseWriter, r *http.Request) {
+	tok, ok := b.authorize(w, r)
+	if !ok {
+		return
+	}
+	if !b.gateMeta(w) {
+		b.release(tok)
+		return
+	}
+	if err := b.live(tok); err != nil {
+		checkError(w, err)
+		return
+	}
+	b.mu.Lock()
+	avail := make([]any, 0, len(b.snap.AvailableCompanies))
+	availByID := make(map[int]string, len(b.snap.AvailableCompanies))
+	for _, c := range b.snap.AvailableCompanies {
+		avail = append(avail, map[string]any{"id": c.ID, "name": c.Name})
+		availByID[c.ID] = c.Name
+	}
+	enabled := append([]int(nil), b.pol.Scope.Enabled...)
+	def := b.pol.Scope.Default
+	b.mu.Unlock()
+	enabledOut := make([]any, 0, len(enabled))
+	for _, id := range enabled {
+		name := availByID[id]
+		enabledOut = append(enabledOut, map[string]any{"id": id, "name": name})
+	}
+	b.record(tok, 0)
+	b.writeEnvelope(w, r, tok, map[string]any{
+		"available": avail, "enabled": enabledOut, "default": def,
+	}, len(avail))
+}
+
+// handleCatalog serves the per-model catalog from the sealed policy plus
+// the snapshot (no Execute). executable is true only for models in
+// Policy.Models; discoverable-only snapshot models list with
+// executable:false and are denied to read/call by the gate (unknown-model
+// deny), never auto-enabled.
+func (b *Broker) handleCatalog(w http.ResponseWriter, r *http.Request) {
+	tok, ok := b.authorize(w, r)
+	if !ok {
+		return
+	}
+	if !b.gateMeta(w) {
+		b.release(tok)
+		return
+	}
+	if err := b.live(tok); err != nil {
+		checkError(w, err)
+		return
+	}
+	b.mu.Lock()
+	models := make(map[string]any, len(b.snap.Models)+len(b.pol.Models))
+	for name, meta := range b.snap.Models {
+		_, exec := b.pol.Models[name]
+		fields := make(map[string]any, len(meta.Fields))
+		for fname, f := range meta.Fields {
+			fields[fname] = map[string]any{
+				"type": f.Type, "relation": f.Relation,
+				"label": f.Label, "provenance": meta.Provenance,
+			}
+		}
+		models[name] = map[string]any{
+			"label": meta.Label, "provenance": meta.Provenance,
+			"executable": exec, "fields": fields,
+		}
+	}
+	for name, rule := range b.pol.Models {
+		if _, seen := models[name]; seen {
+			continue
+		}
+		fields := make(map[string]any, len(rule.Fields))
+		for _, fname := range rule.Fields {
+			fields[fname] = map[string]any{
+				"type": "", "relation": "", "label": fname,
+				"provenance": "unknown",
+			}
+		}
+		models[name] = map[string]any{
+			"label": name, "provenance": "unknown",
+			"executable": true, "fields": fields,
+		}
+	}
+	b.mu.Unlock()
+	b.record(tok, 0)
+	b.writeEnvelope(w, r, tok, map[string]any{"models": models}, len(models))
 }
 
 // ---------------------------------------------------------------------------
@@ -707,39 +951,68 @@ func toSlice(v any) ([]any, bool) {
 	return nil, false
 }
 
-// writeRows caps rows (MaxRowsPerCall) and bytes (MaxResponseBytes, by
-// trimming trailing rows until the payload fits), bills the session, and
-// writes the success envelope.
-func (b *Broker) writeRows(w http.ResponseWriter, r *http.Request, tok string, res any) {
+// writeRows caps rows (MaxRowsPerCall), settles the pre-RPC row reservation
+// (refunding unused headroom), and writes the success envelope through the
+// single MaxResponseBytes envelope cap. Row-trimming for the byte cap
+// happens BEFORE settle so the session keeps only delivered rows; an RPC
+// success that yields zero deliverable rows still bills the admitted call
+// (Check reservation stands, no release). Any output that cannot fit the
+// envelope denies instead of sending a partial payload.
+func (b *Broker) writeRows(w http.ResponseWriter, r *http.Request, tok string, res any, reserved int) {
 	rows, ok := toSlice(res)
 	if !ok {
 		writeRPCError(w, http.StatusBadGateway, "unexpected result shape")
-		b.release(tok)
 		return
 	}
 	b.mu.Lock()
 	maxRows := b.pol.Budgets.MaxRowsPerCall
-	maxBytes := b.pol.Budgets.MaxResponseBytes
 	b.mu.Unlock()
 	if maxRows > 0 && len(rows) > maxRows {
 		rows = rows[:maxRows]
 	}
-	if maxBytes > 0 {
-		for len(rows) > 0 {
-			n, err := json.Marshal(map[string]any{"success": true, "result": rows, "count": len(rows)})
-			if err != nil {
-				writeRPCError(w, http.StatusInternalServerError, "encode response")
-				b.release(tok)
-				return
-			}
-			if len(n) <= maxBytes {
-				break
-			}
-			rows = rows[:len(rows)-1]
-		}
+	if len(rows) > reserved {
+		rows = rows[:reserved]
 	}
-	b.record(tok, len(rows))
-	writeRPCOK(w, rows, len(rows))
+	for len(rows) > 0 {
+		n, err := json.Marshal(map[string]any{"success": true, "result": rows, "count": len(rows)})
+		if err != nil {
+			writeRPCError(w, http.StatusInternalServerError, "encode response")
+			return
+		}
+		b.mu.Lock()
+		maxBytes := b.pol.Budgets.MaxResponseBytes
+		b.mu.Unlock()
+		if maxBytes <= 0 || len(n) <= maxBytes {
+			break
+		}
+		rows = rows[:len(rows)-1]
+	}
+	b.settleRows(tok, reserved, len(rows))
+	b.writeEnvelope(w, r, tok, rows, len(rows))
+}
+
+// writeEnvelope marshals ANY model response and enforces the single total
+// serialized envelope cap (Budgets.MaxResponseBytes) for every endpoint,
+// including meta/companies/catalog/workspace/count. Over-cap output denies
+// with an error instead of sending; the admitted call stays billed (no
+// release-on-failure). w and r are unused except for the response path;
+// r is kept for redaction context parity with the RPC handlers.
+func (b *Broker) writeEnvelope(w http.ResponseWriter, r *http.Request, tok string, result any, count int) {
+	_ = r
+	_ = tok
+	n, err := json.Marshal(map[string]any{"success": true, "result": result, "count": count})
+	if err != nil {
+		writeRPCError(w, http.StatusInternalServerError, "encode response")
+		return
+	}
+	b.mu.Lock()
+	maxBytes := b.pol.Budgets.MaxResponseBytes
+	b.mu.Unlock()
+	if maxBytes > 0 && len(n) > maxBytes {
+		writeRPCError(w, http.StatusBadGateway, fmt.Sprintf("response %d bytes exceeds cap %d", len(n), maxBytes))
+		return
+	}
+	writeRPCOK(w, result, count)
 }
 
 func maxLimitOr(v, d int) int {
@@ -910,6 +1183,8 @@ func (b *Broker) handleAdminStatus(w http.ResponseWriter, _ *http.Request) {
 // ---------------------------------------------------------------------------
 
 // handleWorkspaceList lists workspace entries (broker-confined reads).
+// Caller max_entries can only narrow the policy row cap, never widen it:
+// effective = min(caller-or-default, MaxRowsPerCall).
 func (b *Broker) handleWorkspaceList(w http.ResponseWriter, r *http.Request) {
 	tok, ok := b.authorize(w, r)
 	if !ok {
@@ -933,9 +1208,16 @@ func (b *Broker) handleWorkspaceList(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
-	maxEntries := in.MaxEntries
-	if maxEntries <= 0 {
-		maxEntries = 100
+	b.mu.Lock()
+	capRows := b.pol.Budgets.MaxRowsPerCall
+	b.mu.Unlock()
+	want := in.MaxEntries
+	if want <= 0 {
+		want = 100
+	}
+	maxEntries := want
+	if capRows > 0 && maxEntries > capRows {
+		maxEntries = capRows
 	}
 	entries, err := ws.List(in.Path, maxEntries)
 	if err != nil {
@@ -943,8 +1225,12 @@ func (b *Broker) handleWorkspaceList(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
+	if err := b.live(tok); err != nil {
+		checkError(w, err)
+		return
+	}
 	b.record(tok, len(entries))
-	writeRPCOK(w, entries, len(entries))
+	b.writeEnvelope(w, r, tok, entries, len(entries))
 }
 
 // handleWorkspaceRead reads one workspace file, capped by policy budgets.
@@ -982,8 +1268,12 @@ func (b *Broker) handleWorkspaceRead(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
+	if err := b.live(tok); err != nil {
+		checkError(w, err)
+		return
+	}
 	b.record(tok, 1)
-	writeRPCOK(w, map[string]any{"path": in.Path, "content": string(data)}, 1)
+	b.writeEnvelope(w, r, tok, map[string]any{"path": in.Path, "content": string(data)}, 1)
 }
 
 // handleWorkspaceWrite writes one workspace file (0600, atomic rename).
@@ -1015,8 +1305,12 @@ func (b *Broker) handleWorkspaceWrite(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
+	if err := b.live(tok); err != nil {
+		checkError(w, err)
+		return
+	}
 	b.record(tok, 0)
-	writeRPCOK(w, map[string]any{"path": in.Path, "written": true}, 1)
+	b.writeEnvelope(w, r, tok, map[string]any{"path": in.Path, "written": true}, 1)
 }
 
 // workspaceAllowed denies when the sealed policy disables the workspace.

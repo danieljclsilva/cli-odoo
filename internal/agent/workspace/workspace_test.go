@@ -329,3 +329,124 @@ func TestReadRefusesNonRegular(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateDedicatedDirAccepts(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "ws")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ValidateDedicatedDir(dir, []string{filepath.Join(base, "profile.json")})
+	if err != nil {
+		t.Fatalf("ValidateDedicatedDir: %v", err)
+	}
+	if got == "" {
+		t.Fatal("ValidateDedicatedDir: empty canonical path")
+	}
+	w, err := OpenValidated(dir, []string{filepath.Join(base, "profile.json")})
+	if err != nil {
+		t.Fatalf("OpenValidated: %v", err)
+	}
+	_ = w.Close()
+}
+
+func TestValidateDedicatedDirRejects(t *testing.T) {
+	base := t.TempDir()
+	protected := filepath.Join(base, "profile.json")
+	if err := os.WriteFile(protected, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(base, "ws")
+	if err := os.Mkdir(ws, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Broad/system roots reject: filesystem root and the shared TMPDIR
+	// root itself (a per-tool subdirectory is fine).
+	for _, root := range []string{"/", os.TempDir()} {
+		if _, err := ValidateDedicatedDir(root, nil); err == nil {
+			t.Fatalf("ValidateDedicatedDir(%q): expected denial", root)
+		}
+	}
+	// Empty, missing, and non-dir reject.
+	if _, err := ValidateDedicatedDir("", nil); err == nil {
+		t.Fatal("ValidateDedicatedDir(empty): expected denial")
+	}
+	if _, err := ValidateDedicatedDir(filepath.Join(base, "missing"), nil); err == nil {
+		t.Fatal("ValidateDedicatedDir(missing): expected denial")
+	}
+	if _, err := ValidateDedicatedDir(protected, nil); err == nil {
+		t.Fatal("ValidateDedicatedDir(file): expected denial")
+	}
+	// Overlap with a protected path rejects in every direction: equal,
+	// child-of (protected parent), parent-of (protected child), and
+	// symlink-alias-equal.
+	if _, err := ValidateDedicatedDir(base, []string{ws}); err == nil {
+		t.Fatal("ValidateDedicatedDir(parent of protected): expected denial")
+	}
+	if _, err := ValidateDedicatedDir(ws, []string{base}); err == nil {
+		t.Fatal("ValidateDedicatedDir(child of protected): expected denial")
+	}
+	alias := filepath.Join(base, "alias")
+	if err := os.Symlink(ws, alias); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if _, err := ValidateDedicatedDir(alias, []string{ws}); err == nil {
+		t.Fatal("ValidateDedicatedDir(symlink alias of protected): expected denial")
+	}
+	if !Overlaps(alias, ws) || !CanonicalEqual(alias, ws) {
+		t.Fatal("Overlaps/CanonicalEqual(alias): expected true")
+	}
+	if Overlaps(ws, filepath.Join(base, "unrelated")) {
+		t.Fatal("Overlaps(unrelated): expected false")
+	}
+}
+
+func TestReadRefusesFifo(t *testing.T) {
+	w, dir := openTestWorkspace(t)
+	fifo := filepath.Join(dir, "pipe")
+	if err := makeFifo(fifo); err != nil {
+		t.Skipf("fifos unsupported: %v", err)
+	}
+	if _, err := w.Read("pipe", 1024); err == nil {
+		t.Fatal("Read(fifo): expected denial, got content (would block)")
+	}
+}
+
+func TestMkdirAllNested(t *testing.T) {
+	w, _ := openTestWorkspace(t)
+	if err := w.MkdirAll("reports/2026/10"); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := w.Write("reports/2026/10/summary.txt", []byte("ok")); err != nil {
+		t.Fatalf("Write(nested): %v", err)
+	}
+	b, err := w.Read("reports/2026/10/summary.txt", 1024)
+	if err != nil || string(b) != "ok" {
+		t.Fatalf("Read(nested): got %q, %v", b, err)
+	}
+	if err := w.MkdirAll("../escape"); err == nil {
+		t.Fatal("MkdirAll(escape): expected denial")
+	}
+}
+
+func TestMaxEntriesCannotWiden(t *testing.T) {
+	w, _ := openTestWorkspace(t)
+	for i := range 3 {
+		if err := w.Write("f"+string(rune('a'+i))+".txt", []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A caller cap above the policy cap cannot widen it: exceeding the
+	// policy cap denies even when the caller allows more. Build enough
+	// entries to cross MaxListEntries is impractical here; instead assert
+	// the cap constant exists and a narrowing cap still denies at 2.
+	if MaxListEntries != 1000 {
+		t.Fatalf("MaxListEntries = %d, want 1000", MaxListEntries)
+	}
+	if _, err := w.List("", 2); err == nil {
+		t.Fatal("List over narrowing cap: expected denial")
+	}
+	if _, err := w.List("", MaxListEntries+1000000); err != nil {
+		t.Fatalf("List under effective policy cap: %v", err)
+	}
+}

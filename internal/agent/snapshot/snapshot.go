@@ -26,11 +26,14 @@ package snapshot
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -39,9 +42,41 @@ import (
 	"github.com/danieljclsilva/cli-odoo/internal/odoo"
 )
 
+// parentDir returns the parent directory of a file path.
+func parentDir(path string) string {
+	return filepath.Dir(path)
+}
+
+// tempPath mints a fresh staging name inside dir for O_EXCL creation.
+func tempPath(dir string) string {
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		// Uniqueness still holds via nanotime; randomness failure must
+		// not block the write.
+		return filepath.Join(dir, fmt.Sprintf(".tmp-%d.tmp", time.Now().UTC().UnixNano()))
+	}
+	return filepath.Join(dir, ".tmp-"+hex.EncodeToString(nonce[:])+".tmp")
+}
+
 // FormatVersion is the only snapshot file version Load accepts. There is no
 // legacy fallback: a version skew denies.
 const FormatVersion = 1
+
+// Size and count caps. Snapshot and catalog files are human-handled inputs:
+// anything over cap fails closed before decode completes.
+const (
+	// MaxFileBytes bounds any snapshot or catalog file read (Load,
+	// ImportCatalog, ImportManifest).
+	MaxFileBytes = 4 << 20 // 4 MiB
+	// MaxCatalogModels bounds the models in one imported catalog.
+	MaxCatalogModels = 512
+	// MaxCatalogFieldsPerModel bounds the fields of one imported model.
+	MaxCatalogFieldsPerModel = 2048
+	// MaxCatalogMethods bounds one imported method manifest.
+	MaxCatalogMethods = 1024
+	// MaxCatalogCompanies bounds the companies in one imported catalog.
+	MaxCatalogCompanies = 10000
+)
 
 // Field provenances recorded on ModelMeta.
 const (
@@ -64,15 +99,24 @@ type Company struct {
 }
 
 // SFieldMeta is approved metadata for one field: exact technical name plus
-// display hints. It carries no values and no access rights.
+// display hints. It carries no values and no access rights. Provenance
+// records the metadata origin (server|manifest|unknown); entries written
+// before per-field provenance existed carry an empty provenance, which
+// FieldProvenanceOf reports as unattested.
 type SFieldMeta struct {
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	Relation string `json:"relation"`
-	Label    string `json:"label"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Relation   string `json:"relation"`
+	Label      string `json:"label"`
+	Provenance string `json:"provenance,omitempty"`
 }
 
 // ModelMeta is approved metadata for one human-allowlisted model.
+// Executable is display-only: it records whether a human marked this model
+// executable in the catalog view. It authorizes nothing. The broker's
+// executable set (membership in Policy.Models) stays authoritative; a model
+// described here with Executable=false (the default for files written
+// before this flag existed) is denied to read/call by the broker.
 type ModelMeta struct {
 	Name               string                `json:"name"`
 	Label              string                `json:"label"`
@@ -80,14 +124,19 @@ type ModelMeta struct {
 	CompanyField       string                `json:"company_field"`
 	CompanyIndependent bool                  `json:"company_independent"`
 	Provenance         string                `json:"provenance"`
+	Executable         bool                  `json:"executable"`
 }
 
 // Snapshot is the human-built metadata file: discovery kept distinct from
 // authorization. MethodManifest is informational ONLY and never executable.
+// CapturedBy names the human operator (or import run) that built the file.
+// It is optional on Load so files written before it existed still load;
+// BuildFromServer and ImportCatalog always set it.
 type Snapshot struct {
 	Instance           string               `json:"instance"`
 	ServerVersion      string               `json:"server_version"`
 	CapturedAt         time.Time            `json:"captured_at"`
+	CapturedBy         string               `json:"captured_by"`
 	AvailableCompanies []Company            `json:"available_companies"`
 	EnabledCompanies   []int                `json:"enabled_companies"`
 	DefaultCompany     int                  `json:"default_company"`
@@ -103,6 +152,7 @@ type snapshotFile struct {
 	Instance           string               `json:"instance"`
 	ServerVersion      string               `json:"server_version"`
 	CapturedAt         time.Time            `json:"captured_at"`
+	CapturedBy         string               `json:"captured_by"`
 	AvailableCompanies []Company            `json:"available_companies"`
 	EnabledCompanies   []int                `json:"enabled_companies"`
 	DefaultCompany     int                  `json:"default_company"`
@@ -146,14 +196,31 @@ func (s Snapshot) Model(name string) (policy.ModelView, bool) {
 	return modelView{fields: m.Fields}, true
 }
 
-// Load reads, strictly decodes, and validates a snapshot file. Unknown JSON
-// fields are rejected and any version other than FormatVersion denies with
-// no legacy fallback. A malformed file fails closed before any policy
-// decision can consult it.
+// Load reads, strictly decodes, and validates a snapshot file: the file is
+// size-capped (MaxFileBytes) and must be a regular file; unknown JSON fields
+// are rejected and any version other than FormatVersion denies with no legacy
+// fallback. A malformed file fails closed before any policy decision can
+// consult it. A missing Executable defaults to false (display-only; the
+// broker's executable set stays authoritative) and a missing CapturedBy is
+// accepted for files written before it existed; an empty model provenance is
+// always rejected.
 func Load(path string) (Snapshot, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot: reading %q: %w", path, err)
+	}
+	if !st.Mode().IsRegular() {
+		return Snapshot{}, fmt.Errorf("snapshot: %q is not a regular file", path)
+	}
+	if st.Size() > MaxFileBytes {
+		return Snapshot{}, fmt.Errorf("snapshot: %q is %d bytes, over cap %d", path, st.Size(), MaxFileBytes)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("snapshot: reading %q: %w", path, err)
+	}
+	if int64(len(b)) > MaxFileBytes {
+		return Snapshot{}, fmt.Errorf("snapshot: %q is %d bytes, over cap %d", path, len(b), MaxFileBytes)
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
@@ -172,6 +239,7 @@ func Load(path string) (Snapshot, error) {
 		Instance:           f.Instance,
 		ServerVersion:      f.ServerVersion,
 		CapturedAt:         f.CapturedAt,
+		CapturedBy:         f.CapturedBy,
 		AvailableCompanies: f.AvailableCompanies,
 		EnabledCompanies:   f.EnabledCompanies,
 		DefaultCompany:     f.DefaultCompany,
@@ -184,8 +252,10 @@ func Load(path string) (Snapshot, error) {
 	return s, nil
 }
 
-// Write validates s and persists it as versioned JSON with mode 0600. The
-// parent directory must already exist: Write creates no directories.
+// Write validates s and persists it as versioned JSON with mode 0600 via
+// the same atomic secure-replace as setup profiles (O_EXCL temp + fsync +
+// rename, no symlink sink). The parent directory must already exist: Write
+// creates no directories.
 func Write(path string, s Snapshot) error {
 	if err := s.validate(); err != nil {
 		return fmt.Errorf("snapshot: refusing to write invalid snapshot: %w", err)
@@ -195,6 +265,7 @@ func Write(path string, s Snapshot) error {
 		Instance:           s.Instance,
 		ServerVersion:      s.ServerVersion,
 		CapturedAt:         s.CapturedAt,
+		CapturedBy:         s.CapturedBy,
 		AvailableCompanies: s.AvailableCompanies,
 		EnabledCompanies:   s.EnabledCompanies,
 		DefaultCompany:     s.DefaultCompany,
@@ -205,7 +276,11 @@ func Write(path string, s Snapshot) error {
 	if err != nil {
 		return fmt.Errorf("snapshot: encoding: %w", err)
 	}
-	if err := os.WriteFile(path, append(b, '\n'), 0600); err != nil {
+	b = append(b, '\n')
+	if int64(len(b)) > MaxFileBytes {
+		return fmt.Errorf("snapshot: encoded snapshot %d bytes exceeds cap %d", len(b), MaxFileBytes)
+	}
+	if err := secureReplaceFile(path, b); err != nil {
 		return fmt.Errorf("snapshot: writing %q: %w", path, err)
 	}
 	return nil
@@ -269,14 +344,25 @@ func (s *Snapshot) validate() error {
 		switch m.Provenance {
 		case ProvServer, ProvManifest, ProvUnknown:
 		default:
-			return fmt.Errorf("models %q: provenance %q must be server|manifest|unknown", key, m.Provenance)
+			return fmt.Errorf("models %q: provenance %q must be server|manifest|unknown (empty rejected)", key, m.Provenance)
 		}
 		if len(m.Fields) == 0 {
 			return fmt.Errorf("models %q: at least one approved field is required", key)
 		}
-		for fname := range m.Fields {
+		for fname, fm := range m.Fields {
 			if _, ok := policy.NormalizeName(fname); !ok {
 				return fmt.Errorf("models %q: invalid field name %q", key, fname)
+			}
+			if fm.Name != "" && fm.Name != fname {
+				return fmt.Errorf("models %q: field key %q mismatches entry name %q", key, fname, fm.Name)
+			}
+			// Per-field provenance is optional for back-compat (entries
+			// written before it existed carry empty = unattested). When
+			// present it must be a known label.
+			switch fm.Provenance {
+			case "", ProvServer, ProvManifest, ProvUnknown:
+			default:
+				return fmt.Errorf("models %q field %q: provenance %q must be server|manifest|unknown", key, fname, fm.Provenance)
 			}
 		}
 		if m.CompanyField != "" {
@@ -440,7 +526,9 @@ func BuildFromServer(client *odoo.Client, instance string, scope policy.CompanyS
 	models := make(map[string]ModelMeta, len(clean))
 	for _, sp := range clean {
 		// fields_get runs ONLY for this human-approved model, requesting
-		// ONLY the human-approved fields.
+		// ONLY the human-approved fields. A missing field is an error
+		// naming the field: BuildFromServer never synthesizes metadata for
+		// absent fields (no silent approve).
 		fieldArgs := make([]any, 0, len(sp.Fields))
 		for _, f := range sp.Fields {
 			fieldArgs = append(fieldArgs, f)
@@ -453,17 +541,20 @@ func BuildFromServer(client *odoo.Client, instance string, scope policy.CompanyS
 		attrs, _ := got.(map[string]any)
 		fields := make(map[string]SFieldMeta, len(sp.Fields))
 		for _, f := range sp.Fields {
-			meta := SFieldMeta{Name: f, Type: "unknown", Label: f}
-			if am, ok := attrs[f].(map[string]any); ok {
-				if t, _ := am["type"].(string); t != "" {
-					meta.Type = t
-				}
-				if r, _ := am["relation"].(string); r != "" {
-					meta.Relation = r
-				}
-				if l, _ := am["string"].(string); strings.TrimSpace(l) != "" {
-					meta.Label = l
-				}
+			am, ok := attrs[f].(map[string]any)
+			if !ok {
+				return Snapshot{}, fmt.Errorf("snapshot: fields_get %s: missing metadata for approved field %q", sp.Name, f)
+			}
+			typ, _ := am["type"].(string)
+			if strings.TrimSpace(typ) == "" {
+				return Snapshot{}, fmt.Errorf("snapshot: fields_get %s: missing type for approved field %q", sp.Name, f)
+			}
+			meta := SFieldMeta{Name: f, Type: typ, Provenance: ProvServer, Label: f}
+			if r, _ := am["relation"].(string); r != "" {
+				meta.Relation = r
+			}
+			if l, _ := am["string"].(string); strings.TrimSpace(l) != "" {
+				meta.Label = l
 			}
 			fields[f] = meta
 		}
@@ -485,6 +576,7 @@ func BuildFromServer(client *odoo.Client, instance string, scope policy.CompanyS
 		Instance:           strings.TrimSpace(instance),
 		ServerVersion:      serverVersionString(ver),
 		CapturedAt:         time.Now().UTC(),
+		CapturedBy:         "server",
 		AvailableCompanies: available,
 		EnabledCompanies:   enabled,
 		DefaultCompany:     scope.Default,
@@ -557,4 +649,61 @@ func serverVersionString(v any) string {
 		}
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+// secureReplaceFile atomically replaces path with data (0600): the parent
+// must already exist, the temp is created with O_CREATE|O_EXCL inside that
+// same directory (never following a planted symlink at the temp name), set
+// 0600, fsynced, and renamed over the target. Rename replaces a
+// final-component symlink itself rather than following it, and breaks (not
+// follows) preexisting hardlinks to the target. It never preserves an
+// existing looser mode: the new file is always 0600.
+func secureReplaceFile(path string, data []byte) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("empty path")
+	}
+	dir := parentDir(path)
+	st, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("parent %q: %w (create it first; secure replace creates no directories)", dir, err)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("parent %q is not a directory", dir)
+	}
+	tmp, err := os.OpenFile(tempPath(dir), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("staging temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	// The temp path is freshly created O_EXCL and held open; close/remove
+	// on every failure path leaves no staging file behind.
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("staging temp: %w", err)
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("staging temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("staging temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("staging temp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("committing: %w", err)
+	}
+	// The new file is always 0600 regardless of any preexisting mode or
+	// umask: rename carries the temp's mode through.
+	if err := os.Chmod(path, 0600); err != nil {
+		return fmt.Errorf("chmod: %w", err)
+	}
+	return nil
 }

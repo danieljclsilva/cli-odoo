@@ -12,6 +12,7 @@ import (
 
 	"github.com/danieljclsilva/cli-odoo/internal/agent/policy"
 	"github.com/danieljclsilva/cli-odoo/internal/agent/snapshot"
+	"github.com/danieljclsilva/cli-odoo/internal/agent/workspace"
 	"github.com/danieljclsilva/cli-odoo/internal/config"
 )
 
@@ -125,13 +126,15 @@ func TestGrantCheckExpiryRevocation(t *testing.T) {
 	if err := b.Check("nope"); !errors.Is(err, ErrSessionUnknown) {
 		t.Fatalf("Check unknown = %v, want ErrSessionUnknown", err)
 	}
+	// Sub-minute TTLs clamp to 1 minute (no sub-second sessions): a 1ms
+	// grant stays live past 5ms.
 	short, err := b.Grant(time.Millisecond)
 	if err != nil {
 		t.Fatalf("Grant short: %v", err)
 	}
 	time.Sleep(5 * time.Millisecond)
-	if err := b.Check(short); !errors.Is(err, ErrSessionExpired) {
-		t.Fatalf("Check expired = %v, want ErrSessionExpired", err)
+	if err := b.Check(short); err != nil {
+		t.Fatalf("clamped short TTL expired early: %v", err)
 	}
 	b.Revoke(tok)
 	if err := b.Check(tok); !errors.Is(err, ErrSessionUnknown) {
@@ -472,5 +475,257 @@ func TestMethodGuards(t *testing.T) {
 	b.modelMux().ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET on POST endpoint = %d", rec.Code)
+	}
+}
+
+func TestNewRejectsInvalidPolicy(t *testing.T) {
+	bad := testPolicy()
+	bad.Budgets.MaxResponseBytes = 0
+	if _, err := New(bad, &config.Instance{Name: "test"}, snapshot.Snapshot{}); err == nil {
+		t.Fatal("New accepted zero MaxResponseBytes")
+	}
+	contra := testPolicy()
+	contra.Models["res.partner"] = policy.ModelRule{Fields: []string{"name"}, CompanyIndependent: true, CompanyField: "company_id"}
+	if _, err := New(contra, &config.Instance{Name: "test"}, snapshot.Snapshot{}); err == nil {
+		t.Fatal("New accepted contradictory rule")
+	}
+}
+
+func TestSessionTTLClampedAndCapped(t *testing.T) {
+	b, err := New(testPolicy(), &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for i := 0; i < 70; i++ {
+		if _, err := b.Grant(time.Hour); err != nil {
+			t.Fatalf("Grant %d: %v", i, err)
+		}
+	}
+	if n, _, _, _ := b.sessionStats(); n > 64 {
+		t.Fatalf("sessions = %d, want cap 64", n)
+	}
+}
+
+func TestReserveRowsDeniedWhenExhausted(t *testing.T) {
+	p := testPolicy()
+	p.Budgets.MaxRowsPerSession = 2
+	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	tok, _ := b.Grant(time.Hour)
+	if err := b.Check(tok); err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if err := b.ReserveRows(tok, 3); !errors.Is(err, ErrSessionBudget) {
+		t.Fatalf("ReserveRows over-remaining = %v, want budget", err)
+	}
+	if err := b.ReserveRows(tok, 0); !errors.Is(err, ErrSessionBudget) {
+		t.Fatalf("ReserveRows zero = %v, want budget", err)
+	}
+}
+
+func TestRowReservationBilledOnRPCFailure(t *testing.T) {
+	gate := &fakeGate{allow: true}
+	exec := &fakeExec{err: errors.New("boom")}
+	b := testBroker(t, gate, exec)
+	tok := grantToken(t, b)
+	rec := post(t, b, "/rpc/search", tok, `{"model":"res.partner","fields":["name"]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code = %d, want 502", rec.Code)
+	}
+	b.mu.Lock()
+	calls, rows := b.sessions[tok].calls, b.sessions[tok].rows
+	b.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 (attempt billed)", calls)
+	}
+	if rows <= 0 {
+		t.Fatalf("rows = %d, want reserved rows kept on failure", rows)
+	}
+}
+
+func TestRevokedBeforeWriteDeniedButBilled(t *testing.T) {
+	gate := &fakeGate{allow: true}
+	exec := &fakeExec{rows: []any{map[string]any{"id": 1}}}
+	b := testBroker(t, gate, exec)
+	tok := grantToken(t, b)
+	revoking := &revokeAfterRPC{inner: exec, b: b, tok: tok}
+	b.exec = revoking
+	rec := post(t, b, "/rpc/search", tok, `{"model":"res.partner","fields":["name"]}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401 revoked-before-write", rec.Code)
+	}
+	b.mu.Lock()
+	_, live := b.sessions[tok]
+	b.mu.Unlock()
+	if live {
+		t.Fatal("revoked session still live")
+	}
+}
+
+// revokeAfterRPC revokes the token inside Execute: the RPC ran, so the
+// admitted call stays billed while the response denies.
+type revokeAfterRPC struct {
+	inner *fakeExec
+	b     *Broker
+	tok   string
+}
+
+func (r *revokeAfterRPC) Execute(model, method string, args []any, kwargs map[string]any) (any, error) {
+	out, err := r.inner.Execute(model, method, args, kwargs)
+	r.b.Revoke(r.tok)
+	return out, err
+}
+
+func TestStrictDecodeRejectsTrailingData(t *testing.T) {
+	b := testBroker(t, &fakeGate{allow: true}, &fakeExec{})
+	tok := grantToken(t, b)
+	for _, body := range []string{
+		`{"model":"res.partner"}{}`,
+		`{"model":"res.partner"} null`,
+		`{"model":"res.partner"} garbage`,
+		`null`,
+		``,
+	} {
+		rec := post(t, b, "/rpc/search", tok, body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body %q code = %d, want 400", body, rec.Code)
+		}
+	}
+	rec := post(t, b, "/rpc/search", tok, "{\"model\":\"res.partner\"} \n\t ")
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("trailing whitespace denied: %d", rec.Code)
+	}
+}
+
+func TestCheckScopeMatchRefusesMismatch(t *testing.T) {
+	p := testPolicy()
+	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{Instance: "other"})
+	if err := b.checkScopeMatch(); err == nil {
+		t.Fatal("instance mismatch accepted")
+	}
+	b2, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{
+		Instance: "test", EnabledCompanies: []int{1, 2}, DefaultCompany: 9,
+		AvailableCompanies: []snapshot.Company{{ID: 1, Name: "a"}, {ID: 2, Name: "b"}},
+	})
+	if err := b2.checkScopeMatch(); err == nil {
+		t.Fatal("default mismatch accepted")
+	}
+}
+
+func TestDiscoveryCatalogMarksExecutable(t *testing.T) {
+	p := testPolicy()
+	snap := snapshot.Snapshot{
+		Instance:           "test",
+		AvailableCompanies: []snapshot.Company{{ID: 1, Name: "A"}, {ID: 2, Name: "B"}},
+		EnabledCompanies:   []int{1, 2}, DefaultCompany: 1,
+		Models: map[string]snapshot.ModelMeta{
+			"res.partner": {Name: "res.partner", Label: "Partner", Provenance: snapshot.ProvServer,
+				Fields: map[string]snapshot.SFieldMeta{"name": {Name: "name", Type: "char", Label: "Name"}}},
+			"discover.only": {Name: "discover.only", Label: "Only", Provenance: snapshot.ProvServer,
+				Fields: map[string]snapshot.SFieldMeta{"name": {Name: "name", Type: "char", Label: "Name"}}},
+		},
+	}
+	gate := &fakeGate{allow: true}
+	b, _ := New(p, &config.Instance{Name: "test"}, snap)
+	b.authz = gate
+	b.exec = &fakeExec{rows: []any{map[string]any{"id": 1}}}
+	tok := grantToken(t, b)
+	get := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rec := httptest.NewRecorder()
+		b.modelMux().ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := get("/rpc/companies"); rec.Code != http.StatusOK {
+		t.Fatalf("companies = %d: %s", rec.Code, rec.Body.String())
+	} else {
+		var env struct {
+			Success bool `json:"success"`
+			Result  struct {
+				Available []map[string]any `json:"available"`
+				Enabled   []map[string]any `json:"enabled"`
+				Default   int              `json:"default"`
+			} `json:"result"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&env); err != nil {
+			t.Fatalf("decode companies: %v", err)
+		}
+		if len(env.Result.Available) != 2 || len(env.Result.Enabled) != 2 || env.Result.Default != 1 {
+			t.Fatalf("companies shape: %+v", env.Result)
+		}
+	}
+	rec := get("/rpc/catalog")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog = %d: %s", rec.Code, rec.Body.String())
+	}
+	var env struct {
+		Success bool `json:"success"`
+		Result  struct {
+			Models map[string]struct {
+				Executable bool `json:"executable"`
+			} `json:"models"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&env); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	if !env.Result.Models["res.partner"].Executable {
+		t.Fatal("res.partner should be executable")
+	}
+	if env.Result.Models["discover.only"].Executable {
+		t.Fatal("discover.only must list executable:false")
+	}
+	// Discoverable-only model read denies (unknown-model at the gate).
+	b.authz = &fakeGate{allow: false, reason: "unknown-model"}
+	denied := post(t, b, "/rpc/read", tok, `{"model":"discover.only","ids":[1]}`)
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("discover-only read = %d, want 403", denied.Code)
+	}
+	if len(b.exec.(*fakeExec).calls) != 0 {
+		t.Fatal("Execute ran for discoverable-only model")
+	}
+}
+
+func TestEnvelopeCapDeniesInsteadOfSending(t *testing.T) {
+	p := testPolicy()
+	p.Budgets.MaxRowsPerCall = 100
+	p.Budgets.MaxResponseBytes = 40 // smaller than any success envelope
+	gate := &fakeGate{allow: true}
+	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b.authz = gate
+	b.exec = &fakeExec{rows: []any{map[string]any{"id": 1}}}
+	tok := grantToken(t, b)
+	req := httptest.NewRequest(http.MethodGet, "/rpc/meta", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	b.modelMux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("over-cap meta = %d, want 502 deny", rec.Code)
+	}
+}
+
+func TestWorkspaceCallerCannotWidenCap(t *testing.T) {
+	p := testPolicy()
+	p.AllowWorkspace = true
+	p.Budgets.MaxRowsPerCall = 2
+	b, _ := New(p, &config.Instance{Name: "test"}, snapshot.Snapshot{})
+	b.authz = &fakeGate{allow: true}
+	ws, err := workspace.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("workspace.Open: %v", err)
+	}
+	for i := range 5 {
+		if err := ws.Write(fmt.Sprintf("f%d.txt", i), []byte("x")); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+	}
+	b.ws = ws
+	tok := grantToken(t, b)
+	rec := post(t, b, "/rpc/workspace/list", tok, `{"path":".","max_entries":100}`)
+	// Five entries with a policy cap of 2: the caller asks for 100, but
+	// effective = min(100, 2) = 2, so the listing denies (5 > 2). Without
+	// the clamp the caller would have widened to 100 and succeeded.
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("widened list = %d, want 400 deny", rec.Code)
 	}
 }
