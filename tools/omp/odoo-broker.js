@@ -14,6 +14,13 @@
 //       Promise<AgentToolResult>;       // { content: [{type:"text",text}], isError? }
 //   }
 //
+// Loader evidence (proven 2026-10-04 with a disposable harness: temp cwd +
+// .omp/tools copy, real installed loader via bun, temp HOME, no user config,
+// no model/backend/Odoo credentials): the installed
+// discoverCustomToolPaths([], tmpCwd) discovers
+// <tmpCwd>/.omp/tools/odoo-broker.js with source
+// {provider:"native",providerName:"OMP",level:"project"}, and loadCustomTools
+// binds this factory to 11 tools (see tools/omp/odoo-broker.loader.test.js).
 // This module exports the FACTORY directly (module.exports = factory), for
 // tools the loader discovers at `.omp/tools/` (+ plugin/configured paths;
 // see discoverCustomToolPaths in loader.d.ts). Copy this file to
@@ -35,7 +42,10 @@
 // from ODOO_BROKER_TOKEN as an Authorization: Bearer header. The token is
 // read at EXECUTE time, never at load time; it is never logged and never
 // written to disk. No child_process, no shell fallback, no secrets in
-// output.
+// output. Redirects are never followed (redirect:'error'): a 3xx from the
+// broker surfaces a tool error instead of moving the Bearer token.
+// Broker URLs are loopback-only (127.0.0.0/8, ::1, localhost, exact match).
+// Error text is token-redacted before it reaches the model.
 //
 // Typed broker ops only: odoo.search/read/count/aggregate/meta/companies/
 // catalog/workspace.list/read/write/mkdir. No grant/revoke/admin/raw tools.
@@ -45,9 +55,35 @@
 'use strict';
 
 const { URL } = require('url');
+const net = require('net');
 
 function brokerURL() {
-  return (process.env.ODOO_BROKER_URL || 'http://127.0.0.1:8471').replace(/\/+$/, '');
+  const raw = (process.env.ODOO_BROKER_URL || 'http://127.0.0.1:8471').trim().replace(/\/+$/, '');
+  if (!isLoopbackURL(raw)) throw new Error('ODOO_BROKER_URL must be a loopback http(s) URL');
+  return raw;
+}
+
+// isLoopbackURL: loopback-only gate for the bearer-token endpoint.
+// http(s) only, loopback literal (127/8 incl. IPv4-in-IPv6, ::1) or exact
+// "localhost" (127.evil.com is NOT loopback). Anything else fails closed.
+function isLoopbackURL(raw) {
+  let u;
+  try {
+    u = new URL(String(raw));
+  } catch {
+    return false;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  const host = (u.hostname || '').replace(/^\[|\]$/g, '');
+  if (!host) return false;
+  if (host.toLowerCase() === 'localhost') return true;
+  if (net.isIP(host)) {
+    if (net.isIPv4(host)) return host.split('.')[0] === '127';
+    const norm = host.toLowerCase().replace(/^0(:0){0,6}:ffff:/, '');
+    if (norm.split('.')[0] === '127') return true;
+    return norm === '::1' || norm === '0:0:0:0:0:0:0:1';
+  }
+  return false;
 }
 
 function token() {
@@ -56,47 +92,123 @@ function token() {
   return t;
 }
 
+// redactToken scrubs the session token (raw + encodeURIComponent forms)
+// from any text before it reaches the model.
+function redactToken(text) {
+  const t = (process.env.ODOO_BROKER_TOKEN || '').trim();
+  let out = String(text);
+  if (!t) return out;
+  out = out.split(t).join('***');
+  const enc = encodeURIComponent(t);
+  if (enc && enc !== t) out = out.split(enc).join('***');
+  return out;
+}
+
 function ok(text) {
   return { content: [{ type: 'text', text: String(text) }] };
 }
 
 function err(text) {
-  return { content: [{ type: 'text', text: String(text) }], isError: true };
+  return { content: [{ type: 'text', text: redactToken(text) }], isError: true };
+}
+
+// strictParams rejects unknown or wrong-typed arguments before dispatch.
+// Kinds: string | strings | int | ints | bool | any.
+function strictParams(tool, spec, params) {
+  const p = params == null ? {} : params;
+  if (typeof p !== 'object' || Array.isArray(p)) return `${tool}: params must be an object`;
+  for (const key of Object.keys(p)) {
+    if (!(key in spec)) return `${tool}: unknown argument ${JSON.stringify(key)}`;
+    if (!checkKind(spec[key], p[key])) return `${tool}: argument ${JSON.stringify(key)} must be ${spec[key]}`;
+  }
+  return null;
+}
+
+function checkKind(kind, v) {
+  switch (kind) {
+    case 'any': return true;
+    case 'string': return typeof v === 'string';
+    case 'bool': return typeof v === 'boolean';
+    case 'int': return Number.isInteger(v);
+    case 'strings': return Array.isArray(v) && v.every((e) => typeof e === 'string');
+    case 'ints': return Array.isArray(v) && v.every((e) => Number.isInteger(e));
+    default: return false;
+  }
+}
+
+async function fetchNoRedirect(url, opts) {
+  let res;
+  try {
+    res = await fetch(url, { ...opts, redirect: 'error' });
+  } catch (e) {
+    if (e && e.name === 'AbortError') return { aborted: true };
+    throw e;
+  }
+  return { res };
 }
 
 async function postJSON(path, body, signal) {
-  let res;
+  let base;
   try {
-    res = await fetch(brokerURL() + path, {
+    base = brokerURL();
+  } catch (e) {
+    return err(e.message);
+  }
+  let t;
+  try {
+    t = token();
+  } catch (e) {
+    return err(e.message);
+  }
+  let out;
+  try {
+    out = await fetchNoRedirect(base + path, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token() },
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + t },
       body: JSON.stringify(body || {}),
       signal,
     });
-  } catch (e) {
-    if (e && e.name === 'AbortError') return err('broker request aborted at ' + path);
+  } catch {
     return err('broker unreachable at ' + path);
   }
-  const env = await res.json().catch(() => null);
+  if (out.aborted) return err('broker request aborted at ' + path);
+  const env = await out.res.json().catch(() => null);
   if (!env) return err('broker returned non-JSON at ' + path);
   if (!env.success) return err(env.error || ('broker denied ' + path));
   return ok(JSON.stringify(env.result));
 }
 
 async function getJSON(path, signal) {
-  const url = new URL(brokerURL() + path);
-  let res;
+  let base;
   try {
-    res = await fetch(url, {
+    base = brokerURL();
+  } catch (e) {
+    return err(e.message);
+  }
+  let t;
+  try {
+    t = token();
+  } catch (e) {
+    return err(e.message);
+  }
+  let url;
+  try {
+    url = new URL(base + path);
+  } catch {
+    return err('broker request failed at ' + path);
+  }
+  let out;
+  try {
+    out = await fetchNoRedirect(url, {
       method: 'GET',
-      headers: { Authorization: 'Bearer ' + token() },
+      headers: { Authorization: 'Bearer ' + t },
       signal,
     });
-  } catch (e) {
-    if (e && e.name === 'AbortError') return err('broker request aborted at ' + path);
+  } catch {
     return err('broker unreachable at ' + path);
   }
-  const env = await res.json().catch(() => null);
+  if (out.aborted) return err('broker request aborted at ' + path);
+  const env = await out.res.json().catch(() => null);
   if (!env) return err('broker returned non-JSON at ' + path);
   if (!env.success) return err(env.error || ('broker denied ' + path));
   return ok(JSON.stringify(env.result));
@@ -108,9 +220,24 @@ function str(desc) { return { type: 'string', description: desc }; }
 // CustomTool.execute signature. Broker denials already arrive as isError
 // results from postJSON/getJSON, so execute returns them directly; only a
 // missing token throws (operator misconfiguration, not a broker denial).
-function exec(path, getArgs) {
-  return async (_toolCallId, params, _onUpdate, _ctx, signal) => postJSON(path, getArgs(params), signal);
+// getArgs extracts exactly the declared arguments (no pass-through of
+// unknown params); strictParams rejects unknown/wrong-typed args first.
+function exec(tool, path, spec, getArgs) {
+  return async (_toolCallId, params, _onUpdate, _ctx, signal) => {
+    const bad = strictParams(tool, spec, params);
+    if (bad) return err(bad);
+    return postJSON(path, getArgs(params || {}), signal);
+  };
 }
+
+const SEARCH_ARGS = { model: 'string', domain: 'any', fields: 'strings', order: 'string', limit: 'int', offset: 'int' };
+const READ_ARGS = { model: 'string', ids: 'ints', fields: 'strings' };
+const COUNT_ARGS = { model: 'string', domain: 'any' };
+const AGG_ARGS = { model: 'string', domain: 'any', groupby: 'strings', sum: 'strings', avg: 'strings', count: 'bool', limit: 'int' };
+const META_ARGS = { model: 'string' };
+const WS_LIST_ARGS = { path: 'string', max_entries: 'int' };
+const WS_PATH_ARGS = { path: 'string' };
+const WS_WRITE_ARGS = { path: 'string', content: 'string' };
 
 function buildTools() {
   return [
@@ -130,7 +257,10 @@ function buildTools() {
         },
         required: ['model', 'fields'],
       },
-      execute: exec('/rpc/search', (p) => p),
+      execute: exec('odoo.search', '/rpc/search', SEARCH_ARGS, (p) => ({
+        model: p.model, domain: p.domain, fields: p.fields,
+        order: p.order, limit: p.limit, offset: p.offset,
+      })),
     },
     {
       name: 'odoo.read',
@@ -145,7 +275,9 @@ function buildTools() {
         },
         required: ['model', 'ids', 'fields'],
       },
-      execute: exec('/rpc/read', (p) => p),
+      execute: exec('odoo.read', '/rpc/read', READ_ARGS, (p) => ({
+        model: p.model, ids: p.ids, fields: p.fields,
+      })),
     },
     {
       name: 'odoo.count',
@@ -159,7 +291,9 @@ function buildTools() {
         },
         required: ['model'],
       },
-      execute: exec('/rpc/count', (p) => p),
+      execute: exec('odoo.count', '/rpc/count', COUNT_ARGS, (p) => ({
+        model: p.model, domain: p.domain,
+      })),
     },
     {
       name: 'odoo.aggregate',
@@ -178,7 +312,10 @@ function buildTools() {
         },
         required: ['model', 'groupby'],
       },
-      execute: exec('/rpc/aggregate', (p) => p),
+      execute: exec('odoo.aggregate', '/rpc/aggregate', AGG_ARGS, (p) => ({
+        model: p.model, domain: p.domain, groupby: p.groupby,
+        sum: p.sum, avg: p.avg, count: p.count, limit: p.limit,
+      })),
     },
     {
       name: 'odoo.meta',
@@ -189,6 +326,8 @@ function buildTools() {
         properties: { model: str('Optional exact model name.') },
       },
       execute: async (_id, params, _u, _c, signal) => {
+        const bad = strictParams('odoo.meta', META_ARGS, params);
+        if (bad) return err(bad);
         const q = params && params.model ? '?model=' + encodeURIComponent(params.model) : '';
         return getJSON('/rpc/meta' + q, signal);
       },
@@ -198,14 +337,22 @@ function buildTools() {
       label: 'Odoo companies',
       description: 'Company discovery: available/enabled/default (no record data).',
       parameters: { type: 'object', properties: {} },
-      execute: async (_id, _p, _u, _c, signal) => getJSON('/rpc/companies', signal),
+      execute: async (_id, p, _u, _c, signal) => {
+        const bad = strictParams('odoo.companies', {}, p);
+        if (bad) return err(bad);
+        return getJSON('/rpc/companies', signal);
+      },
     },
     {
       name: 'odoo.catalog',
       label: 'Odoo catalog',
       description: 'Per-model catalog with MethodManifest and provenance (read-only pass-through, no record data).',
       parameters: { type: 'object', properties: {} },
-      execute: async (_id, _p, _u, _c, signal) => getJSON('/rpc/catalog', signal),
+      execute: async (_id, p, _u, _c, signal) => {
+        const bad = strictParams('odoo.catalog', {}, p);
+        if (bad) return err(bad);
+        return getJSON('/rpc/catalog', signal);
+      },
     },
     {
       name: 'odoo.workspace.list',
@@ -219,7 +366,9 @@ function buildTools() {
         },
         required: ['path'],
       },
-      execute: exec('/rpc/workspace/list', (p) => p),
+      execute: exec('odoo.workspace.list', '/rpc/workspace/list', WS_LIST_ARGS, (p) => ({
+        path: p.path, max_entries: p.max_entries,
+      })),
     },
     {
       name: 'odoo.workspace.read',
@@ -230,7 +379,9 @@ function buildTools() {
         properties: { path: str('Workspace-relative file.') },
         required: ['path'],
       },
-      execute: exec('/rpc/workspace/read', (p) => p),
+      execute: exec('odoo.workspace.read', '/rpc/workspace/read', WS_PATH_ARGS, (p) => ({
+        path: p.path,
+      })),
     },
     {
       name: 'odoo.workspace.write',
@@ -244,7 +395,9 @@ function buildTools() {
         },
         required: ['path', 'content'],
       },
-      execute: exec('/rpc/workspace/write', (p) => p),
+      execute: exec('odoo.workspace.write', '/rpc/workspace/write', WS_WRITE_ARGS, (p) => ({
+        path: p.path, content: p.content,
+      })),
     },
     {
       name: 'odoo.workspace.mkdir',
@@ -255,7 +408,9 @@ function buildTools() {
         properties: { path: str('Workspace-relative directory.') },
         required: ['path'],
       },
-      execute: exec('/rpc/workspace/mkdir', (p) => p),
+      execute: exec('odoo.workspace.mkdir', '/rpc/workspace/mkdir', WS_PATH_ARGS, (p) => ({
+        path: p.path,
+      })),
     },
   ];
 }

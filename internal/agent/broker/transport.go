@@ -368,10 +368,17 @@ func (b *Broker) Serve(addr string) error {
 		return err
 	}
 	adminDir := filepath.Dir(sockPath)
-	// (6) Workspace opens validated against the real protected set.
+	// (6) Workspace opens validated against the real protected set. The
+	// helper already compares the held root against the validated path
+	// (rename/substitution between validate and open denies) and checks
+	// protected separation; Serve revalidates the held root immediately
+	// before credential use below (after the scope match), so protected
+	// state that moved in between still denies before secrets resolve.
+	var wsProtected []string
 	if allowWS {
 		protected := servingProtected(paths, pol)
 		protected = append(protected, sockPath, adminDir)
+		wsProtected = append([]string(nil), protected...)
 		ws, err := workspace.OpenValidated(wsDir, protected)
 		if err != nil {
 			return fmt.Errorf("broker: open workspace: %w", err)
@@ -380,7 +387,23 @@ func (b *Broker) Serve(addr string) error {
 		b.ws = ws
 		b.mu.Unlock()
 	}
-
+	// Revalidate the held workspace root against the protected set
+	// immediately before credential use: OpenValidated's checks were exact
+	// at open time, but a rename/substitution or protected-path move since
+	// then must still deny before secrets resolve. This is the
+	// workspace-side helper; Serve owns the ordering (after scope match,
+	// before resolve/dial).
+	if allowWS {
+		b.mu.Lock()
+		ws := b.ws
+		b.mu.Unlock()
+		if ws == nil {
+			return fmt.Errorf("broker: open workspace: workspace unavailable")
+		}
+		if err := ws.RevalidateProtectedSeparation(wsProtected); err != nil {
+			return fmt.Errorf("broker: open workspace: %w", err)
+		}
+	}
 	// Only now: resolve credentials and build exec.
 	resolved, err := resolve(instName)
 	if err != nil {
@@ -769,19 +792,28 @@ func (b *Broker) handleSearch(w http.ResponseWriter, r *http.Request) {
 	// limit (deny when want exceeds remaining — never silently reserve a
 	// smaller min); on success settleRows refunds the unused headroom, on
 	// RPC or output failure the attempt keeps its reservation (billed).
+	// dispatchExec takes one in-flight slot (429 when saturated, rolled
+	// back via releaseReserve since no RPC ran) and runs the RPC under the
+	// timeout/abandonment wrapper (HTTP WriteTimeout alone cannot bound the
+	// upstream call; the running Execute is abandoned, not cancelled);
+	// dispatched failures keep the reservation.
 	reserved, err := b.reserveForLimit(tok, limit)
 	if b.checkError(w, r, err) {
 		b.release(tok)
 		return
 	}
-	exec := b.execOf()
-	if exec == nil {
-		b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
-		b.releaseReserve(tok, reserved)
-		return
-	}
-	res, err := exec.Execute(in.Model, "search_read", nil, kwargs)
+	res, err := b.dispatchExec(r, in.Model, "search_read", nil, kwargs)
 	if err != nil {
+		if errors.Is(err, ErrSessionBudget) {
+			b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+			b.releaseReserve(tok, reserved)
+			return
+		}
+		if errors.Is(err, errBrokerNotServing) {
+			b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
+			b.releaseReserve(tok, reserved)
+			return
+		}
 		b.writeError(w, r, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
 		return
 	}
@@ -845,14 +877,18 @@ func (b *Broker) handleRead(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
-	exec := b.execOf()
-	if exec == nil {
-		b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
-		b.releaseReserve(tok, reserved)
-		return
-	}
-	res, err := exec.Execute(in.Model, "search_read", nil, kwargs)
+	res, err := b.dispatchExec(r, in.Model, "search_read", nil, kwargs)
 	if err != nil {
+		if errors.Is(err, ErrSessionBudget) {
+			b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+			b.releaseReserve(tok, reserved)
+			return
+		}
+		if errors.Is(err, errBrokerNotServing) {
+			b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
+			b.releaseReserve(tok, reserved)
+			return
+		}
 		b.writeError(w, r, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
 		return
 	}
@@ -891,22 +927,27 @@ func (b *Broker) handleCount(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
-	exec := b.execOf()
-	if exec == nil {
-		b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
-		b.release(tok)
-		return
-	}
 	// A count result is one scalar row surface: reserve exactly 1 before
 	// dispatch so exhausted row budgets deny rather than serve unbilled.
-	// The attempt stays billed on RPC/output failure (no release).
+	// The attempt stays billed on RPC/output failure (no release). The
+	// semaphore denial below rolls back via releaseReserve (no RPC ran).
 	reserved, err := b.reserveForLimit(tok, 1)
 	if b.checkError(w, r, err) {
 		b.release(tok)
 		return
 	}
-	res, err := exec.Execute(in.Model, "search_count", []any{domain}, kwargs)
+	res, err := b.dispatchExec(r, in.Model, "search_count", []any{domain}, kwargs)
 	if err != nil {
+		if errors.Is(err, ErrSessionBudget) {
+			b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+			b.releaseReserve(tok, reserved)
+			return
+		}
+		if errors.Is(err, errBrokerNotServing) {
+			b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
+			b.releaseReserve(tok, reserved)
+			return
+		}
 		b.writeError(w, r, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
 		return
 	}
@@ -1002,14 +1043,18 @@ func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
-	exec := b.execOf()
-	if exec == nil {
-		b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
-		b.releaseReserve(tok, reserved)
-		return
-	}
-	res, err := exec.Execute(in.Model, "read_group", []any{domain, fields, gb}, kwargs)
+	res, err := b.dispatchExec(r, in.Model, "read_group", []any{domain, fields, gb}, kwargs)
 	if err != nil {
+		if errors.Is(err, ErrSessionBudget) {
+			b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+			b.releaseReserve(tok, reserved)
+			return
+		}
+		if errors.Is(err, errBrokerNotServing) {
+			b.writeError(w, r, http.StatusServiceUnavailable, "broker not serving")
+			b.releaseReserve(tok, reserved)
+			return
+		}
 		b.writeError(w, r, http.StatusBadGateway, b.redactErr(r.Context(), err).Error())
 		return
 	}
@@ -1323,12 +1368,15 @@ func toSlice(v any) ([]any, bool) {
 // the atomic reservation (or more than the MaxRowsPerCall cap), writeRows
 // DENIES with a budget error instead of false-completing a narrowed slice
 // (fail closed: a "success" envelope must never claim count=N for fewer
-// than N admitted rows). Row-trimming applies ONLY to the byte cap: while
-// the serialized envelope exceeds MaxResponseBytes the last row drops, and
-// settle bills only delivered rows; an RPC success that yields zero
-// deliverable rows still bills the admitted call (Check reservation stands,
-// no release). Any output that cannot fit the envelope denies instead of
-// sending a partial payload.
+// than N admitted rows). There is no reviewed pagination contract anywhere
+// in this codebase (searched: no paginate/cursor/continuation envelope
+// exists on the typed RPC surface), so the only honest over-cap behavior is
+// denial. Likewise, a serialized envelope that exceeds MaxResponseBytes
+// denies: shedding trailing rows to fit the byte cap would present a partial
+// payload as a complete one. An RPC success that yields zero deliverable
+// rows still bills the admitted call (Check reservation stands, no release).
+// Any output that cannot fit the envelope denies instead of sending partial
+// data; the admitted reservation stays billed on every post-RPC denial.
 func (b *Broker) writeRows(w http.ResponseWriter, r *http.Request, tok string, res any, reserved int) {
 	rows, ok := toSlice(res)
 	if !ok {
@@ -1337,6 +1385,7 @@ func (b *Broker) writeRows(w http.ResponseWriter, r *http.Request, tok string, r
 	}
 	b.mu.Lock()
 	maxRows := b.pol.Budgets.MaxRowsPerCall
+	maxBytes := b.pol.Budgets.MaxResponseBytes
 	b.mu.Unlock()
 	if maxRows > 0 && len(rows) > maxRows {
 		b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
@@ -1346,19 +1395,14 @@ func (b *Broker) writeRows(w http.ResponseWriter, r *http.Request, tok string, r
 		b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
 		return
 	}
-	for len(rows) > 0 {
-		n, err := json.Marshal(map[string]any{"success": true, "result": rows, "count": len(rows)})
-		if err != nil {
-			b.writeError(w, r, http.StatusInternalServerError, "encode response")
-			return
-		}
-		b.mu.Lock()
-		maxBytes := b.pol.Budgets.MaxResponseBytes
-		b.mu.Unlock()
-		if maxBytes <= 0 || len(n) <= maxBytes {
-			break
-		}
-		rows = rows[:len(rows)-1]
+	n, err := json.Marshal(map[string]any{"success": true, "result": rows, "count": len(rows)})
+	if err != nil {
+		b.writeError(w, r, http.StatusInternalServerError, "encode response")
+		return
+	}
+	if maxBytes > 0 && len(n) > maxBytes {
+		b.writeError(w, r, http.StatusBadGateway, fmt.Sprintf("response %d bytes exceeds cap %d", len(n), maxBytes))
+		return
 	}
 	b.settleRows(tok, reserved, len(rows))
 	b.writeEnvelope(w, r, tok, rows, len(rows))
@@ -1392,10 +1436,17 @@ func (b *Broker) writeError(w http.ResponseWriter, r *http.Request, code int, ms
 // output denies with an error instead of sending; the admitted call stays
 // billed (no release-on-failure). It is the shared tail of writeEnvelope
 // (session-billed model responses) and writeError's fallback shape.
+//
+// Oversize-error honesty: the fallback denial itself is capped (see
+// writeCappedError/writeRawDenied). When the cap cannot carry even the
+// minimum JSON denial, a bounded empty-body transport denial preserves the
+// status code with no JSON claim — never an uncapped write or truncated
+// JSON. Success and error outputs therefore share one actual serialized
+// cap on every path.
 func (b *Broker) writeEnvelopeRaw(w http.ResponseWriter, code int, body map[string]any) {
 	n, err := json.Marshal(body)
 	if err != nil {
-		writeRPCError(w, http.StatusInternalServerError, "encode response")
+		b.writeRawDenied(w, code)
 		return
 	}
 	b.mu.Lock()
@@ -1403,10 +1454,10 @@ func (b *Broker) writeEnvelopeRaw(w http.ResponseWriter, code int, body map[stri
 	b.mu.Unlock()
 	if maxBytes > 0 && len(n) > maxBytes {
 		if _, isErr := body["error"]; isErr {
-			writeRPCError(w, code, "request denied")
+			b.writeCappedError(w, code, "request denied", maxBytes)
 			return
 		}
-		writeRPCError(w, http.StatusBadGateway, fmt.Sprintf("response %d bytes exceeds cap %d", len(n), maxBytes))
+		b.writeCappedError(w, http.StatusBadGateway, fmt.Sprintf("response %d bytes exceeds cap %d", len(n), maxBytes), maxBytes)
 		return
 	}
 	if v, isErr := body["error"]; isErr {
@@ -1414,7 +1465,7 @@ func (b *Broker) writeEnvelopeRaw(w http.ResponseWriter, code int, body map[stri
 		if errMsg == "" {
 			errMsg = "request denied"
 		}
-		writeRPCError(w, code, errMsg)
+		b.writeCappedError(w, code, errMsg, maxBytes)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1422,6 +1473,39 @@ func (b *Broker) writeEnvelopeRaw(w http.ResponseWriter, code int, body map[stri
 		w.WriteHeader(code)
 	}
 	_, _ = w.Write(n)
+}
+
+// writeCappedError writes one error envelope known to fit maxBytes, or a
+// bounded empty-body denial when no JSON denial can fit. It never calls
+// the uncapped writeRPCError on oversize paths: every byte the model sees
+// passed the cap check.
+func (b *Broker) writeCappedError(w http.ResponseWriter, code int, msg string, maxBytes int) {
+	n, err := json.Marshal(map[string]any{"success": false, "error": msg})
+	if err != nil || (maxBytes > 0 && len(n) > maxBytes) {
+		short, serr := json.Marshal(map[string]any{"success": false, "error": "request denied"})
+		if serr != nil || (maxBytes > 0 && len(short) > maxBytes) {
+			b.writeRawDenied(w, code)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_, _ = w.Write(short)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_, _ = w.Write(n)
+}
+
+// writeRawDenied is the last resort: an empty-body transport denial with
+// the status code preserved. Used only when the configured cap cannot carry
+// even the minimum JSON denial — no JSON is emitted, so nothing exceeds
+// the cap by construction.
+func (b *Broker) writeRawDenied(w http.ResponseWriter, code int) {
+	if code == 0 {
+		code = http.StatusBadGateway
+	}
+	w.WriteHeader(code)
 }
 
 func maxLimitOr(v, d int) int {
@@ -1806,23 +1890,4 @@ func (b *Broker) workspace() *workspace.Workspace {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.ws
-}
-
-// ---------------------------------------------------------------------------
-// JSON envelopes (mirror output.Envelope shape for agent consumers).
-// ---------------------------------------------------------------------------
-
-func writeRPCOK(w http.ResponseWriter, result any, count int) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"success": true, "result": result, "count": count,
-	})
-}
-
-func writeRPCError(w http.ResponseWriter, code int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"success": false, "error": msg,
-	})
 }

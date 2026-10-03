@@ -167,7 +167,7 @@ func TestDomainFieldExtraction(t *testing.T) {
 	good := []any{
 		"|",
 		[]any{"name", "=", "x"},
-		[]any{"partner_id.name", "ilike", "y"},
+		[]any{"partner_id", "ilike", "y"},
 		"!",
 		[]any{"company_id", "in", []any{1, 2}},
 	}
@@ -190,11 +190,10 @@ func TestDomainFieldExtraction(t *testing.T) {
 		{"leaf-nonstring-op", []any{[]any{"name", 1, "x"}}, schema},
 		{"leaf-unknown-op", []any{[]any{"name", "contains", "x"}}, schema},
 		{"bad-prefix", []any{"AND", []any{"name", "=", "x"}}, schema},
-		{"nonrel-intermediate", []any{[]any{"name.first", "=", "x"}}, schema},
-		{"missing-terminal", []any{[]any{"partner_id.nope", "=", "x"}}, schema},
-		{"root-unlisted", []any{[]any{"secret.name", "=", "x"}}, schema},
-		{"dot-no-schema", []any{[]any{"partner_id.name", "=", "x"}}, nil},
-		{"unknown-model-schema", []any{[]any{"partner_id.name", "=", "x"}}, testSchema{}},
+		{"dotted-domain", []any{[]any{"partner_id.name", "=", "x"}}, schema},
+		{"dotted-domain-nested", []any{[]any{"partner_id.company_id.name", "=", "x"}}, schema},
+		{"child-of", []any{[]any{"company_id", "child_of", 1}}, schema},
+		{"parent-of", []any{[]any{"company_id", "parent_of", 1}}, schema},
 		{"element-int", []any{42}, schema},
 		{"lone-or", []any{"|", []any{"name", "=", "x"}}, schema},
 		{"trailing-op", []any{[]any{"name", "=", "x"}, "|"}, schema},
@@ -218,14 +217,14 @@ func TestDomainFieldExtraction(t *testing.T) {
 func TestOrderAndGroupBy(t *testing.T) {
 	schema := testSchemaView()
 	p := validPolicy()
-	for _, order := range []string{"", "name", "name asc, id desc", "partner_id.name DESC"} {
+	for _, order := range []string{"", "name", "name asc, id desc", "partner_id asc"} {
 		r := validSearch()
 		r.Order = order
 		if d := p.Authorize(schema, r); !d.Allow {
 			t.Fatalf("order %q denied: %+v", order, d)
 		}
 	}
-	for _, order := range []string{"secret asc", "name sideways", "name asc,", " , ", "partner_id.secret asc"} {
+	for _, order := range []string{"secret asc", "name sideways", "name asc,", " , ", "partner_id.secret asc", "partner_id.name DESC", "company_id.name asc"} {
 		r := validSearch()
 		r.Order = order
 		if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonOrderDenied {
@@ -233,7 +232,7 @@ func TestOrderAndGroupBy(t *testing.T) {
 		}
 	}
 	r := validSearch()
-	r.GroupBy = []string{"company_id", "partner_id.name"}
+	r.GroupBy = []string{"company_id", "partner_id"}
 	if d := p.Authorize(schema, r); !d.Allow {
 		t.Fatalf("good groupby denied: %+v", d)
 	}
@@ -460,14 +459,21 @@ func TestFieldWildcardDenied(t *testing.T) {
 func TestDottedFieldProjection(t *testing.T) {
 	schema := testSchemaView()
 	p := validPolicy()
-	r := validSearch()
-	r.Fields = []string{"name", "partner_id.name"}
-	if d := p.Authorize(schema, r); !d.Allow {
-		t.Fatalf("approved dotted projection denied: %+v", d)
+	// Minimum safe choice: every dotted projection denies, even a fully
+	// approved traversal (root allowlisted, relational intermediates,
+	// terminal listed on an enforceable target).
+	for _, f := range []string{"partner_id.name", "partner_id.secret", "partner_id.company_id.name"} {
+		r := validSearch()
+		r.Fields = []string{"name", f}
+		if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonFieldDenied {
+			t.Fatalf("dotted projection %q = %+v, want deny field-denied", f, d)
+		}
 	}
-	r.Fields = []string{"name", "partner_id.secret"}
-	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonFieldDenied {
-		t.Fatalf("unapproved dotted projection = %+v, want deny field-denied", d)
+	// Legitimate same-model exact projection still passes.
+	r := validSearch()
+	r.Fields = []string{"name"}
+	if d := p.Authorize(schema, r); !d.Allow {
+		t.Fatalf("same-model projection denied: %+v", d)
 	}
 }
 
@@ -512,56 +518,42 @@ func traversalPolicy() *Policy {
 
 func TestTraversalTargetApproval(t *testing.T) {
 	schema := traversalSchema()
-	// res.partner absent from the policy: schema existence alone must
-	// not approve partner_id.secret.
-	p := validPolicy()
-	delete(p.Models, "res.partner")
-	p.Models["sale.order"] = ModelRule{
-		Fields:       []string{"company_id", "name", "partner_id"},
-		CompanyField: "company_id",
+	// Minimum safe choice: every dotted domain denies, even the fully
+	// approved full path (root allowlisted, terminal listed on an
+	// enforceable target). Schema existence alone never approves.
+	p := traversalPolicy()
+	for _, path := range []string{"partner_id.name", "partner_id.secret", "partner_id.company_id.name"} {
+		r := Request{Operation: OpSearch, Model: "sale.order", Fields: []string{"name"},
+			Domain: []any{[]any{path, "=", "x"}}, Limit: 10}
+		if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonDomainDenied {
+			t.Fatalf("dotted domain %q = %+v, want deny domain-denied", path, d)
+		}
 	}
+	// Same-model domain on the allowlisted field still passes.
 	r := Request{Operation: OpSearch, Model: "sale.order", Fields: []string{"name"},
-		Domain: []any{[]any{"partner_id.secret", "=", "x"}}, Limit: 10}
-	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonDomainDenied {
-		t.Fatalf("traversal into absent model = %+v, want deny domain-denied", d)
-	}
-	// Approved full path: terminal `name` explicitly listed in the
-	// res.partner rule (validPolicy lists name) and the target is
-	// scoped-enforceable.
-	p = traversalPolicy()
-	r.Domain = []any{[]any{"partner_id.name", "=", "x"}}
+		Domain: []any{[]any{"name", "=", "x"}}, Limit: 10}
 	if d := p.Authorize(schema, r); !d.Allow {
-		t.Fatalf("approved full path denied: %+v", d)
-	}
-	// Terminal present in schema but absent from the target rule denies.
-	r.Domain = []any{[]any{"partner_id.secret", "=", "x"}}
-	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonDomainDenied {
-		t.Fatalf("unapproved terminal = %+v, want deny domain-denied", d)
+		t.Fatalf("same-model domain denied: %+v", d)
 	}
 }
 
 func TestNestedTraversalPaths(t *testing.T) {
 	schema := traversalSchema()
 	p := traversalPolicy()
-	allow := func(path string) Request {
-		return Request{Operation: OpSearch, Model: "sale.order", Fields: []string{"name"},
+	// Minimum safe choice: every nested dotted path denies, even fully
+	// approved ones. Same-model references on either path's root pass.
+	for _, path := range []string{"partner_id.company_id.name", "company_id.name", "partner_id.name"} {
+		r := Request{Operation: OpSearch, Model: "sale.order", Fields: []string{"name"},
 			Domain: []any{[]any{path, "=", "x"}}, Limit: 10}
+		if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonDomainDenied {
+			t.Fatalf("dotted domain %q = %+v, want deny domain-denied", path, d)
+		}
 	}
-	// Fully approved nested path: sale.order -> res.partner ->
-	// res.company(name listed on the independent res.company rule).
-	if d := p.Authorize(schema, allow("partner_id.company_id.name")); !d.Allow {
-		t.Fatalf("approved nested path denied: %+v", d)
-	}
-	// Alternate short path through the local company_id is also allowed
-	// when fully approved.
-	if d := p.Authorize(schema, allow("company_id.name")); !d.Allow {
-		t.Fatalf("approved short path denied: %+v", d)
-	}
-	// Removing the terminal from the target rule denies both paths.
-	p.Models["res.company"] = ModelRule{Fields: []string{"id"}, CompanyIndependent: true}
-	for _, path := range []string{"partner_id.company_id.name", "company_id.name"} {
-		if d := p.Authorize(schema, allow(path)); d.Allow || d.Reason != ReasonDomainDenied {
-			t.Fatalf("path %q without terminal approval = %+v", path, d)
+	for _, field := range []string{"name", "company_id", "partner_id"} {
+		r := Request{Operation: OpSearch, Model: "sale.order", Fields: []string{"name"},
+			Domain: []any{[]any{field, "=", "x"}}, Limit: 10}
+		if d := p.Authorize(schema, r); !d.Allow {
+			t.Fatalf("same-model domain %q denied: %+v", field, d)
 		}
 	}
 }
@@ -587,6 +579,8 @@ func TestDomainOperandBounds(t *testing.T) {
 	}{
 		{"unknown-op", []any{[]any{"name", "contains", "x"}}},
 		{"not-like-op", []any{[]any{"name", "not like", "x"}}},
+		{"child-of", []any{[]any{"company_id", "child_of", 1}}},
+		{"parent-of", []any{[]any{"company_id", "parent_of", 1}}},
 		{"dict-value", []any{[]any{"name", "=", map[string]any{"a": 1}}}},
 		{"nested-array-value", []any{[]any{"name", "=", []any{[]any{1}}}}},
 		{"in-scalar", []any{[]any{"name", "in", "x"}}},
@@ -600,13 +594,84 @@ func TestDomainOperandBounds(t *testing.T) {
 	}
 	good := []any{
 		[]any{"name", "in", []any{"x", "y"}},
-		[]any{"company_id", "child_of", 1},
+		[]any{"company_id", "=", 1},
 		[]any{"name", "=", nil},
 	}
 	r := validSearch()
 	r.Domain = good
 	if d := p.Authorize(schema, r); !d.Allow {
 		t.Fatalf("bounded operands denied: %+v", d)
+	}
+}
+
+func TestSequence8DenyAllDottedAndHierarchy(t *testing.T) {
+	schema := traversalSchema()
+	p := traversalPolicy()
+	base := func() Request {
+		return Request{Operation: OpSearch, Model: "sale.order", Fields: []string{"name"},
+			Domain: []any{[]any{"name", "=", "x"}}, Order: "name asc", Limit: 10}
+	}
+	// Malicious dotted count: sale.order partner_id.name in the domain.
+	r := base()
+	r.Domain = []any{[]any{"partner_id.name", "=", "x"}}
+	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonDomainDenied {
+		t.Fatalf("dotted count domain = %+v, want deny domain-denied", d)
+	}
+	// Malicious dotted order/group-by/aggregate inputs.
+	r = base()
+	r.Order = "partner_id.name asc"
+	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonOrderDenied {
+		t.Fatalf("dotted order = %+v, want deny order-denied", d)
+	}
+	r = base()
+	r.GroupBy = []string{"partner_id.name"}
+	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonGroupByDenied {
+		t.Fatalf("dotted groupby = %+v, want deny groupby-denied", d)
+	}
+	agg := base()
+	agg.Operation = OpAggregate
+	agg.Model = "res.partner"
+	agg.GroupBy = []string{"partner_id.name"}
+	ap := validPolicy()
+	if d := ap.Authorize(schema, agg); d.Allow || d.Reason != ReasonGroupByDenied {
+		t.Fatalf("dotted aggregate groupby = %+v, want deny groupby-denied", d)
+	}
+	// Hierarchy operators deny on the structural id and on scoped fields,
+	// even nested under NOT/OR.
+	for _, op := range []string{"child_of", "parent_of"} {
+		for _, field := range []string{"id", "company_id"} {
+			leaf := []any{[]any{field, op, 1}}
+			for name, domain := range map[string]any{
+				"leaf":     leaf,
+				"not-leaf": []any{"!", leaf[0]},
+				"or-leaf":  []any{"|", []any{"name", "=", "x"}, leaf[0]},
+			} {
+				r = base()
+				r.Model = "res.partner"
+				r.Domain = domain
+				if d := validPolicy().Authorize(testSchemaView(), r); d.Allow || d.Reason != ReasonDomainDenied {
+					t.Fatalf("%s %s %s = %+v, want deny domain-denied", op, field, name, d)
+				}
+			}
+		}
+	}
+	// NOT/OR nesting of legitimate same-model leaves still passes, and the
+	// empty domain stays allowed.
+	r = base()
+	r.Model = "res.partner"
+	r.Domain = []any{"|", []any{"name", "=", "x"}, "!", []any{"company_id", "=", 1}}
+	if d := validPolicy().Authorize(testSchemaView(), r); !d.Allow {
+		t.Fatalf("legitimate NOT/OR domain denied: %+v", d)
+	}
+	for _, verb := range []Operation{OpSearch, OpRead, OpCount} {
+		r := Request{Operation: verb, Model: "res.partner", Fields: []string{"name"}, Limit: 10}
+		if verb == OpCount {
+			r.Fields = nil
+			r.Limit = 0
+		}
+		if d := validPolicy().Authorize(testSchemaView(), r); !d.Allow {
+			t.Fatalf("legitimate %s denied: %+v", verb, d)
+		}
 	}
 }
 

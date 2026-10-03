@@ -19,15 +19,28 @@
 //
 // Protocol errors use JSON-RPC error objects. Broker denials surface as
 // tool errors (IsError content), not protocol errors.
+//
+// Transport bounds: one newline-terminated stdio frame per request capped
+// at 1 MiB (oversized input gets one ParseError and resynchronizes on the
+// next frame, never a repeat-decode loop); an encoder failure aborts Serve
+// with an error so the host exits non-zero; cancellation flows from Serve
+// into every broker request; the broker client never follows redirects and
+// only dials loopback http(s); tool arguments are strictly typed
+// (unknown/wrong-typed arguments are rejected before dispatch); the session
+// token is redacted from every error surface.
 package mcpadapter
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -36,6 +49,24 @@ import (
 // Version is the adapter protocol surface version (not an OMP version).
 const Version = "1.0.0"
 
+// maxFrameBytes bounds one stdio JSON-RPC frame (one newline-terminated
+// value). Oversized input is rejected with a single ParseError without
+// entering a repeat-decode loop.
+const maxFrameBytes = 1 << 20 // 1 MiB
+
+// maxDiscardBytes bounds recovery after an over-cap frame: at most this
+// many bytes are dropped looking for the next newline before reporting.
+const maxDiscardBytes = 8 << 20 // 8 MiB
+
+// defaultProtocolVersion is negotiated when the client offers nothing the
+// adapter supports.
+const defaultProtocolVersion = "2024-11-05"
+
+// supportedVersions lists the MCP protocol versions the adapter negotiates
+// on initialize, oldest first. A client offering one of these gets it
+// echoed back; anything else (or nothing) gets the default.
+var supportedVersions = []string{"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
+
 // Config carries the broker endpoint and credential. Token is never logged.
 type Config struct {
 	// BaseURL is the broker model listener, e.g. http://127.0.0.1:8471.
@@ -43,9 +74,30 @@ type Config struct {
 	// Token is the broker session token. Prefer env ODOO_BROKER_TOKEN;
 	// Config.Token is the explicit override (host-read, e.g. stdin).
 	Token string
-	// HTTPClient, if nil, defaults to a 30s-timeout client.
+	// HTTPClient, if nil, defaults to a loopback-only no-redirect client.
 	HTTPClient *http.Client
 }
+
+// loopbackClient is the default credential-bearing client: 30s timeout and
+// no redirect following. Redirects (even loopback-to-loopback) are refused
+// before the Authorization header can move: callTool surfaces a tool error
+// instead of following, so a compromised or misconfigured broker cannot
+// bounce the session token to an attacker-chosen target.
+func loopbackClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return errRedirectRefused
+		},
+	}
+}
+
+// errRedirectRefused marks a refused redirect: the adapter never follows
+// redirects with the session token attached.
+var errRedirectRefused = errors.New("mcpadapter: refusing redirect (redirects are not followed)")
+
+// errFrameTooLarge marks an over-cap stdio frame.
+var errFrameTooLarge = errors.New("mcpadapter: frame exceeds 1 MiB")
 
 // Resolve fills BaseURL/Token from the environment when unset:
 // ODOO_BROKER_URL (default http://127.0.0.1:8471) and ODOO_BROKER_TOKEN.
@@ -61,9 +113,43 @@ func (c Config) Resolve() Config {
 		out.Token = strings.TrimSpace(os.Getenv("ODOO_BROKER_TOKEN"))
 	}
 	if out.HTTPClient == nil {
-		out.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+		out.HTTPClient = loopbackClient()
 	}
 	return out
+}
+
+// isLoopbackURL reports whether raw is an http(s) URL whose host is a
+// loopback literal (127.0.0.0/8, ::1 incl. IPv4-in-IPv6) or localhost
+// (exact match only: 127.evil.com is NOT loopback). Anything else —
+// unparsable, wrong scheme, missing host, non-loopback — fails closed.
+func isLoopbackURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u == nil {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if addr, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		return addr.WithZone("").Unmap().IsLoopback()
+	}
+	return false
+}
+
+// validateBaseURL rejects non-loopback broker endpoints before any request
+// is built: the session token must never travel beyond the local broker.
+func validateBaseURL(raw string) error {
+	if !isLoopbackURL(raw) {
+		return errors.New("broker URL must be a loopback http(s) URL")
+	}
+	return nil
 }
 
 // Tool describes one typed broker tool on tools/list.
@@ -79,7 +165,11 @@ type Tool struct {
 // per-field/per-model provenance as read-only pass-through.
 func Tools() []Tool {
 	obj := func(props map[string]any, required ...string) map[string]any {
-		return map[string]any{"type": "object", "properties": props, "required": required}
+		m := map[string]any{"type": "object", "properties": props}
+		if len(required) > 0 {
+			m["required"] = required
+		}
+		return m
 	}
 	str := map[string]any{"type": "string"}
 	strs := map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
@@ -146,24 +236,90 @@ func New(cfg Config) *Server {
 	return &Server{cfg: cfg.Resolve(), In: os.Stdin, Out: os.Stdout}
 }
 
-// Serve reads JSON-RPC 2.0 values from In and writes responses to Out until
-// EOF. Each line (or stream value) is one request; notifications get no
-// reply. Unknown methods return MethodNotFound; bad JSON returns ParseError.
-func (s *Server) Serve(ctx context.Context) error {
-	dec := json.NewDecoder(s.In)
-	enc := json.NewEncoder(s.Out)
+// readFrame reads one newline-terminated frame, bounded by maxFrameBytes.
+// It returns io.EOF only when no bytes remain. An over-cap frame is fully
+// consumed (remainder discarded, bounded by maxDiscardBytes) and reported
+// once as errFrameTooLarge, so the caller emits one ParseError and
+// resynchronizes on the next frame instead of looping on a stuck decoder.
+func readFrame(r *bufio.Reader) ([]byte, error) {
+	var buf []byte
 	for {
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
+		chunk, err := r.ReadBytes('\n')
+		buf = append(buf, chunk...)
+		if len(buf) > maxFrameBytes+1 {
+			if err == nil || err == io.EOF {
+				// Line already ended (or stream ended): the whole
+				// over-cap frame is consumed; report once.
+				return nil, errFrameTooLarge
+			}
+			// Mid-line and over cap: drop the rest of the line so the
+			// next frame starts clean, then report once.
+			discardRestOfLine(r)
+			return nil, errFrameTooLarge
+		}
+		if err == nil {
+			return buf, nil
+		}
+		if err == io.EOF {
+			if len(buf) == 0 {
+				return nil, io.EOF
+			}
+			return buf, nil
+		}
+		return nil, err
+	}
+}
+
+// discardRestOfLine drops bytes until the next newline, EOF, a read error,
+// or maxDiscardBytes — bounding recovery from an over-cap frame.
+func discardRestOfLine(r *bufio.Reader) {
+	scratch := make([]byte, 4096)
+	for dropped := 0; dropped < maxDiscardBytes; {
+		n, err := r.Read(scratch)
+		dropped += n
+		if err != nil {
+			return
+		}
+		for _, b := range scratch[:n] {
+			if b == '\n' {
+				return
+			}
+		}
+	}
+}
+
+// Serve reads newline-framed JSON-RPC 2.0 requests from In and writes
+// responses to Out until EOF or cancellation. Each frame is decoded
+// independently, so malformed input costs exactly one ParseError and the
+// loop continues on the next frame. Notifications get no reply. An output
+// (encoder) failure aborts Serve with an error so the host process exits
+// non-zero instead of silently dropping responses.
+func (s *Server) Serve(ctx context.Context) error {
+	r := bufio.NewReader(s.In)
+	enc := json.NewEncoder(s.Out)
+	respond := func(v rpcResponse) error { return enc.Encode(v) }
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		frame, err := readFrame(r)
+		if err != nil {
 			if err == io.EOF {
 				return nil
 			}
-			_ = enc.Encode(rpcResponse{JSONRPC: "2.0", Error: &rpcErr{Code: -32700, Message: "parse error"}})
+			if werr := respond(rpcResponse{JSONRPC: "2.0", Error: &rpcErr{Code: -32700, Message: "parse error"}}); werr != nil {
+				return werr
+			}
+			continue
+		}
+		if len(bytes.TrimSpace(frame)) == 0 {
 			continue
 		}
 		var req rpcRequest
-		if err := json.Unmarshal(raw, &req); err != nil || req.JSONRPC != "2.0" || req.Method == "" {
-			_ = enc.Encode(rpcResponse{JSONRPC: "2.0", Error: &rpcErr{Code: -32600, Message: "invalid request"}})
+		if err := json.Unmarshal(frame, &req); err != nil || req.JSONRPC != "2.0" || req.Method == "" {
+			if werr := respond(rpcResponse{JSONRPC: "2.0", Error: &rpcErr{Code: -32700, Message: "parse error"}}); werr != nil {
+				return werr
+			}
 			continue
 		}
 		if req.ID == nil {
@@ -174,35 +330,64 @@ func (s *Server) Serve(ctx context.Context) error {
 		_ = json.Unmarshal(*req.ID, &id)
 		res, rerr := s.handle(ctx, req.Method, req.Params)
 		if rerr != nil {
-			_ = enc.Encode(rpcResponse{JSONRPC: "2.0", ID: id, Error: rerr})
+			if werr := respond(rpcResponse{JSONRPC: "2.0", ID: id, Error: rerr}); werr != nil {
+				return werr
+			}
 			continue
 		}
-		_ = enc.Encode(rpcResponse{JSONRPC: "2.0", ID: id, Result: res})
+		if werr := respond(rpcResponse{JSONRPC: "2.0", ID: id, Result: res}); werr != nil {
+			return werr
+		}
 	}
 }
 
 func (s *Server) handleNotification(method string, _ json.RawMessage) {
-	// notifications/initialized is a no-op (handshake completion).
+	// Handshake/shutdown notifications (notifications/initialized and any
+	// other notification) carry no ID and get no reply by JSON-RPC rule.
 	_ = method
+}
+
+// negotiateVersion echoes the client's protocolVersion when the adapter
+// supports it, and the default otherwise. The adapter keeps no session
+// state: every initialize gets a deterministic answer.
+func negotiateVersion(params json.RawMessage) string {
+	var in struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if len(params) > 0 {
+		if err := json.Unmarshal(params, &in); err == nil {
+			for _, v := range supportedVersions {
+				if in.ProtocolVersion == v {
+					return v
+				}
+			}
+		}
+	}
+	return defaultProtocolVersion
 }
 
 func (s *Server) handle(ctx context.Context, method string, params json.RawMessage) (any, *rpcErr) {
 	switch method {
 	case "initialize":
 		return map[string]any{
-			"protocolVersion": "2024-11-05",
+			"protocolVersion": negotiateVersion(params),
 			"serverInfo":      map[string]any{"name": "odoo-broker", "version": Version},
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 		}, nil
+	case "ping":
+		return map[string]any{}, nil
 	case "tools/list":
 		return map[string]any{"tools": Tools()}, nil
 	case "tools/call":
 		var in struct {
-			Name      string         `json:"name"`
-			Arguments map[string]any `json:"arguments"`
+			Name      string          `json:"name"`
+			Arguments map[string]any  `json:"arguments"`
+			Meta      json.RawMessage `json:"_meta"`
 		}
 		if len(params) > 0 {
-			if err := json.Unmarshal(params, &in); err != nil {
+			dec := json.NewDecoder(bytes.NewReader(params))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&in); err != nil {
 				return nil, &rpcErr{Code: -32602, Message: "invalid params"}
 			}
 		}
@@ -211,6 +396,9 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 		}
 		if in.Arguments == nil {
 			in.Arguments = map[string]any{}
+		}
+		if verr := validateArgs(in.Name, in.Arguments); verr != nil {
+			return nil, verr
 		}
 		out, toolErr, perr := s.callTool(ctx, in.Name, in.Arguments)
 		if perr != nil {
@@ -257,6 +445,128 @@ func endpoint(name string) (method, path string, ok bool) {
 	return "", "", false
 }
 
+// toolArgTypes is the strict per-tool argument contract: allowed names and
+// value kinds. Unknown or wrong-typed arguments are rejected with
+// InvalidParams before any broker dispatch. Kinds: "string", "strings"
+// (array of string), "int" (integral number), "ints" (array of integral
+// numbers), "bool", "any" (the broker policy validates the shape, e.g.
+// domain). GET tools take no body, so companies/catalog accept no arguments
+// at all and meta accepts only its model query.
+var toolArgTypes = map[string]map[string]string{
+	"search":          {"model": "string", "domain": "any", "fields": "strings", "order": "string", "limit": "int", "offset": "int"},
+	"read":            {"model": "string", "ids": "ints", "fields": "strings"},
+	"count":           {"model": "string", "domain": "any"},
+	"aggregate":       {"model": "string", "domain": "any", "groupby": "strings", "sum": "strings", "avg": "strings", "count": "bool", "limit": "int"},
+	"meta":            {"model": "string"},
+	"companies":       {},
+	"catalog":         {},
+	"workspace.list":  {"path": "string", "max_entries": "int"},
+	"workspace.read":  {"path": "string"},
+	"workspace.write": {"path": "string", "content": "string"},
+	"workspace.mkdir": {"path": "string"},
+}
+
+// validateArgs rejects unknown or wrong-typed arguments before dispatch.
+// Unknown tools report unknown-tool (matching endpoint); argument violations
+// report invalid params.
+func validateArgs(name string, args map[string]any) *rpcErr {
+	spec, ok := toolArgTypes[name]
+	if !ok {
+		return &rpcErr{Code: -32601, Message: fmt.Sprintf("unknown tool %q", name)}
+	}
+	for key, val := range args {
+		kind, ok := spec[key]
+		if !ok {
+			return &rpcErr{Code: -32602, Message: fmt.Sprintf("invalid params: unknown argument %q for tool %q", key, name)}
+		}
+		if !checkArgKind(kind, val) {
+			return &rpcErr{Code: -32602, Message: fmt.Sprintf("invalid params: argument %q for tool %q must be %s", key, name, kind)}
+		}
+	}
+	return nil
+}
+
+func checkArgKind(kind string, v any) bool {
+	switch kind {
+	case "any":
+		return true
+	case "string":
+		_, ok := v.(string)
+		return ok
+	case "bool":
+		_, ok := v.(bool)
+		return ok
+	case "int":
+		return isIntegralNumber(v)
+	case "strings":
+		arr, ok := v.([]any)
+		if !ok {
+			return false
+		}
+		for _, e := range arr {
+			if _, ok := e.(string); !ok {
+				return false
+			}
+		}
+		return true
+	case "ints":
+		arr, ok := v.([]any)
+		if !ok {
+			return false
+		}
+		for _, e := range arr {
+			if !isIntegralNumber(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// isIntegralNumber reports whether v is an integral JSON number. MCP
+// arguments arrive as float64; integral values pass while fractions,
+// NaN/Inf, and non-numbers fail.
+func isIntegralNumber(v any) bool {
+	var f float64
+	switch n := v.(type) {
+	case float64:
+		f = n
+	case float32:
+		f = float64(n)
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return true
+	case json.Number:
+		if _, err := n.Int64(); err == nil {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+	if f != f || f > 9e15 || f < -9e15 {
+		return false
+	}
+	return f == float64(int64(f))
+}
+
+// redactToken replaces the session token (raw and QueryEscape forms) with
+// "***" so credential material can never echo in tool errors. The token
+// travels in the Authorization header only; broker or transport text that
+// repeats it is scrubbed before it reaches the model.
+func (s *Server) redactToken(text string) string {
+	tok := s.cfg.Token
+	if tok == "" || text == "" {
+		return text
+	}
+	out := strings.ReplaceAll(text, tok, "***")
+	if enc := url.QueryEscape(tok); enc != tok {
+		out = strings.ReplaceAll(out, enc, "***")
+	}
+	return out
+}
+
+// callTool forwards one typed tool call to the broker model listener
 // with the bearer token, and maps the broker envelope to MCP content.
 // Returns (text, isToolError, protocolError). Admin/raw names are unknown
 // methods, never forwarded.
@@ -268,14 +578,25 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 	if strings.TrimSpace(s.cfg.Token) == "" {
 		return "broker token is not configured", true, nil
 	}
+	if err := validateBaseURL(s.cfg.BaseURL); err != nil {
+		return "broker URL must be a loopback http(s) URL", true, nil
+	}
 	var body io.Reader
-	url := strings.TrimRight(s.cfg.BaseURL, "/") + path
+	requestURL := strings.TrimRight(s.cfg.BaseURL, "/") + path
 	if method == http.MethodGet {
-		// GET tools take no body; meta's optional model query rides the
-		// query string so no body shape can smuggle filter state.
+		// GET tools take no body; meta's optional model query is set
+		// through url.Values (QueryEscape) so no raw concatenation can
+		// smuggle filter state.
 		if name == "meta" {
 			if m, _ := args["model"].(string); strings.TrimSpace(m) != "" {
-				url += "?model=" + strings.TrimSpace(m)
+				u, err := url.Parse(requestURL)
+				if err != nil {
+					return "building broker request failed", true, nil
+				}
+				q := u.Query()
+				q.Set("model", strings.TrimSpace(m))
+				u.RawQuery = q.Encode()
+				requestURL = u.String()
 			}
 		}
 	} else {
@@ -288,7 +609,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		}
 		body = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, body)
 	if err != nil {
 		return "building broker request failed", true, nil
 	}
@@ -298,8 +619,15 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 	// Token travels only in the Authorization header; it is never logged,
 	// never echoed in errors, and never placed in tool output.
 	req.Header.Set("Authorization", "Bearer "+s.cfg.Token)
-	res, err := s.cfg.HTTPClient.Do(req)
+	client := s.cfg.HTTPClient
+	if client == nil {
+		client = loopbackClient()
+	}
+	res, err := client.Do(req)
 	if err != nil {
+		if errors.Is(err, errRedirectRefused) {
+			return "broker refused redirect (redirects are not followed)", true, nil
+		}
 		return "broker unreachable", true, nil
 	}
 	defer res.Body.Close()
@@ -321,7 +649,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		if msg == "" {
 			msg = "broker denied the request"
 		}
-		return msg, true, nil
+		return s.redactToken(msg), true, nil
 	}
 	out := strings.TrimSpace(string(env.Result))
 	if out == "" || out == "null" {

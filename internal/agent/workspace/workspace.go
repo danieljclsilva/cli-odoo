@@ -34,10 +34,11 @@
 //     such a link — never claimed as confinement. Writes are safe
 //     everywhere regardless: rename-write breaks (not follows) links.
 //   - FIFO blocking: opening a FIFO for reading blocks until a writer
-//     arrives, so a planted FIFO is a hang, not just a read. Read never
-//     lets that happen: it opens with O_NONBLOCK where the platform offers
-//     it (unix), so the open returns immediately, and the held-handle
-//     f.Stat then refuses the FIFO before any Read runs. There is no
+//     arrives, so a planted FIFO is a hang, not just a read. Read and
+//     List never let that happen: both open with O_NONBLOCK where the
+//     platform offers it (unix), so the open returns immediately, and the
+//     held-handle f.Stat then refuses the FIFO (Read: non-regular file;
+//     List: not a directory) before any Read or readdir runs. There is no
 //     pre-open Stat: the name can be swapped between Stat and Open, so
 //     only the HELD handle is judged. On Windows O_NONBLOCK does not exist
 //     and a plain open is used; FIFO nodes cannot be planted in a Windows
@@ -65,6 +66,14 @@
 //     GOOS=js a Root tracks a directory name, not a handle, so renames of
 //     the root itself are not tracked; WASI preview 1 lacks Chmod.
 //
+// Concurrency: a Workspace is safe for concurrent use. Mutating operations
+// (Write, MkdirAll) serialize on an internal mutex so concurrent model
+// dispatches cannot interleave renames/staging; List and Read take no
+// exclusive lock because os.Root methods are documented safe for concurrent
+// use and neither mutates workspace state. Callers needing a multi-step
+// read-modify-write sequence must serialize it themselves: List+Read+Write
+// are individually atomic, not jointly.
+//
 // Caps (maxEntries, maxBytes) are enforced by denial: over-cap reads fail
 // instead of truncating, so a caller can never mistake a partial listing
 // for a complete one. List reads at most cap+1 entries through the held
@@ -76,6 +85,7 @@ package workspace
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -84,6 +94,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // MaxListEntries is the fixed policy-side listing cap. A caller max_entries
@@ -310,16 +321,127 @@ func broadRoots() []string {
 // OpenValidated validates dir against protected paths and then Opens it.
 // The serve-time check lives in the broker; this helper is the shared
 // validator both setup and the broker use.
+//
+// Rename/symlink-substitution window: validation attests the name, but Open
+// must serve the directory the name resolves to at open time. OpenValidated
+// therefore compares the held root handle ("." through os.Root.Stat) with
+// the validated path via os.SameFile and denies on mismatch: a root swapped
+// between ValidateDedicatedDir and os.OpenRoot (rename, symlink
+// substitution, mount swap) fails closed. The protected-set separation check
+// is exact at validation time; callers that hold protected state across a
+// longer session must revalidate before credential use (the broker performs
+// its workspace validation inside Serve, immediately before credentials
+// resolve — see RevalidateProtectedSeparation).
+//
+// Platform posture (honest, not proof): where os.SameFile, link counts, or
+// ownership are unattestable, OpenValidated degrades rather than claims
+// confinement. On Windows, mode/ownership checks are skipped (ACLs are not
+// attested through os.Stat) and link counts are unknown, so posture is
+// trusted-private-contents for the same user only — never claimed as
+// confinement against a hostile same-user planter. On js/plan9-class ports
+// ownership is unattestable and validation fails closed (denies).
 func OpenValidated(dir string, protected []string) (*Workspace, error) {
 	canon, err := ValidateDedicatedDir(dir, protected)
 	if err != nil {
 		return nil, err
 	}
-	return Open(canon)
+	ws, err := Open(canon)
+	if err != nil {
+		return nil, err
+	}
+	same, serr := ws.heldSameDir(canon)
+	if serr != nil {
+		_ = ws.Close()
+		return nil, fmt.Errorf("workspace: identity of opened root %q: %w", canon, serr)
+	}
+	if !same {
+		_ = ws.Close()
+		return nil, fmt.Errorf("workspace: %q changed between validation and open (rename/symlink substitution): refusing", dir)
+	}
+	if err := ws.RevalidateProtectedSeparation(protected); err != nil {
+		_ = ws.Close()
+		return nil, err
+	}
+	return ws, nil
+}
+
+// heldSameDir reports whether the held root handle confines the same
+// directory the validated host path names now: it stats the live path and
+// "." through the held handle and compares with os.SameFile. A rename or
+// symlink substitution between validation and open (or since open) fails
+// closed. Where the platform cannot attest sameness (SameFile false on
+// distinct-but-equal paths, or unattestable file identity), the caller gets
+// (false, nil) on Windows — a documented degrade to trusted-private
+// posture, never claimed as confinement — and OpenValidated still requires
+// the dedicated-dir shape (ValidateDedicatedDir) to pass; other unattestable
+// ports fail closed via ValidateDedicatedDir's ownership denial.
+func (w *Workspace) heldSameDir(livePath string) (bool, error) {
+	want, err := os.Stat(livePath)
+	if err != nil {
+		return false, err
+	}
+	got, err := w.root.Stat(".")
+	if err != nil {
+		return false, err
+	}
+	if os.SameFile(want, got) {
+		return true, nil
+	}
+	// SameFile is unattestable-or-different here. On Windows the identity
+	// comparison is not reliable through os.Stat, so degrade honestly:
+	// fall back to comparing the canonicalized live path against the
+	// open-time dir (EvalSymlinks-resolved on both sides). Equal canonical
+	// paths are accepted under the documented trusted-private posture;
+	// genuinely different locations still deny.
+	if runtime.GOOS == "windows" {
+		canonLive, lerr := canonicalPath(livePath)
+		if lerr != nil {
+			return false, lerr
+		}
+		canonHeld, herr := canonicalPath(strings.TrimSpace(w.dir))
+		if herr != nil {
+			return false, herr
+		}
+		return canonLive == canonHeld, nil
+	}
+	return false, nil
+}
+
+// RevalidateProtectedSeparation re-checks the already-open workspace's held
+// root against a protected set: it denies when the held root no longer
+// names the same directory as the open-time path (rename/substitution
+// since open) or when the live path fails the dedicated-dir shape
+// (mode/ownership/broad-root/protected-overlap). Serve calls OpenValidated
+// (which performs this check before returning) and must call this again
+// immediately before credential use when protected state may have moved
+// since open; until this returns nil the caller must not use credentials
+// against this workspace.
+func (w *Workspace) RevalidateProtectedSeparation(protected []string) error {
+	if w == nil || w.root == nil {
+		return fmt.Errorf("workspace: closed")
+	}
+	canon := strings.TrimSpace(w.dir)
+	if canon == "" {
+		return fmt.Errorf("workspace: empty directory")
+	}
+	same, err := w.heldSameDir(canon)
+	if err != nil {
+		return fmt.Errorf("workspace: live root %q: %w", canon, err)
+	}
+	if !same {
+		return fmt.Errorf("workspace: %q moved since open: refusing", canon)
+	}
+	if _, err := ValidateDedicatedDir(canon, protected); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Workspace is an os.Root-confined handle on a human-chosen directory.
+// Mutating operations (Write, MkdirAll) serialize on mu; concurrent reads
+// need no exclusive lock (os.Root is safe for concurrent use).
 type Workspace struct {
+	mu   sync.Mutex
 	root *os.Root
 	dir  string
 }
@@ -413,8 +535,15 @@ func (w *Workspace) List(rel string, maxEntries int) ([]Entry, error) {
 	// Open the held handle first, then judge the handle: no pre-open
 	// Stat, so a swap between check and use cannot attest a name Open
 	// no longer resolves to. A dir/file swap still resolves to the
-	// replacement through the same held handle and denies below.
-	f, err := w.root.Open(clean)
+	// replacement through the same held handle and denies below. The open
+	// uses O_NONBLOCK where the platform offers it (unix), exactly like
+	// Read: opening a planted FIFO returns immediately instead of hanging
+	// for a writer, and the held-handle Stat below refuses the FIFO before
+	// any readdir runs. On Windows O_NONBLOCK does not exist and a plain
+	// open is used — FIFO nodes cannot be planted in a Windows directory
+	// (named pipes live outside the filesystem namespace), so that block
+	// class does not apply there, and the held-handle refusal still runs.
+	f, err := w.root.OpenFile(clean, openReadNoBlock, 0)
 	if err != nil {
 		return nil, fmt.Errorf("workspace: opening %q: %w", rel, err)
 	}
@@ -426,10 +555,13 @@ func (w *Workspace) List(rel string, maxEntries int) ([]Entry, error) {
 	}
 	// Bounded enumeration: read at most cap+1 names through the held
 	// handle. effectiveMax+1 always fits an int on every platform Go
-	// supports (effectiveMax <= MaxListEntries = 1000).
+	// supports (effectiveMax <= MaxListEntries = 1000). An empty or
+	// short directory reports io.EOF alongside its (possibly zero)
+	// entries: EOF is the end-of-directory signal, not a failure, so it
+	// is accepted as a valid short/empty listing.
 	want := effectiveMax + 1
 	infos, err := f.ReadDir(want)
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("workspace: listing %q: %w", rel, err)
 	}
 	if len(infos) > effectiveMax {
@@ -521,6 +653,11 @@ func (w *Workspace) Write(rel string, data []byte) error {
 	if w == nil || w.root == nil {
 		return fmt.Errorf("workspace: closed")
 	}
+	// Serialize mutations: concurrent model dispatches must not interleave
+	// temp staging/renames. Reads stay lock-free (os.Root is safe for
+	// concurrent use) and may run alongside one serialized writer.
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	clean, err := cleanRel(rel)
 	if err != nil {
 		return err
@@ -597,15 +734,14 @@ func (w *Workspace) Write(rel string, data []byte) error {
 	return fmt.Errorf("workspace: staging %q: temp name collision", rel)
 }
 
-// MkdirAll creates rel and any missing parents inside the workspace,
-// confined through the root (0700, no symlink following outside the root),
-// so tool flows can create nested report directories without shell access.
-// "" or "." is a no-op (the root already exists); an existing non-directory
-// denies.
 func (w *Workspace) MkdirAll(rel string) error {
 	if w == nil || w.root == nil {
 		return fmt.Errorf("workspace: closed")
 	}
+	// Serialized with Write (see above): concurrent mkdir+write races on
+	// shared parents must not interleave.
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	clean, err := cleanRel(rel)
 	if err != nil {
 		return err

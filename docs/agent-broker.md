@@ -80,8 +80,11 @@ permits `company_id=false` records via an OR-false fragment. Field
 projection is explicit: search/read require a non-empty exact projection
 (omitted/nil/[] deny — Odoo has no default-all through this broker) and the
 broker sends exactly the approved list plus structural `id` (`EnsureID`).
-Dotted traversal denies by default; an approved dotted path requires the
-terminal field explicitly allowlisted on an enforceable target model.
+Dotted traversal is denied unconditionally (minimum safe choice: domain,
+order, group-by, projection, and aggregate references must be single-segment
+allowlisted fields); there is no separately reviewed scoped-traversal
+implementation. Hierarchy operators `child_of`/`parent_of` deny. Schema
+relationships stay readable for discovery but never authorize traversal.
 
 ## Model API (loopback TCP, bearer session token)
 
@@ -122,8 +125,13 @@ Shipped in-tree (implemented, not prose):
   11 typed tools, `fetch` POST to `ODOO_BROKER_URL` with `ODOO_BROKER_TOKEN`;
   no shell). Reviewed config snippets: `odoo agent omp-init --dir <dir>`
   writes OMP + Codex examples without secrets or touching user settings.
-  End-to-end OMP loading is operator-verified at deploy time (no local OMP
-  harness here); broker-side routing/denial is covered by in-process tests.
+  Proven in-tree: `tools/omp/odoo-broker.loader.test.js` drives the real
+  installed OMP loader (`discoverCustomToolPaths` + `loadCustomTools`) in a
+  disposable temp project and executes legitimate + denied calls against a
+  real in-process broker. The denied-leg dispatch0 is inferred from absence
+  of canned rows (the harness dispatch counter is not exported to the
+  driver); direct dispatch-counter denial is proven broker-side by
+  `TestPrefixCaptureDeniedAtRealGate` and `TestRealGateFieldProjection`.
 
 Restrict the session to the broker tools plus only the built-ins the task
 needs (`--tools`), disable everything else (`--no-tools` baseline +

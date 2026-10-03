@@ -105,7 +105,7 @@ func testSnapshot() snapshot.Snapshot {
 	}
 }
 
-func testBroker(t *testing.T, gate *fakeGate, exec *fakeExec) *Broker {
+func testBroker(t *testing.T, gate *fakeGate, exec executor) *Broker {
 	t.Helper()
 	b, err := New(testPolicy(), &config.Instance{Name: "test"}, testSnapshot())
 	if err != nil {
@@ -429,10 +429,13 @@ func TestOversizedResultDeniesInsteadOfFalseComplete(t *testing.T) {
 	}
 }
 
-func TestByteCapTrimsRows(t *testing.T) {
+func TestByteCapDeniesInsteadOfTrimming(t *testing.T) {
+	// Byte-cap deny (not silent trim): a serialized envelope over
+	// MaxResponseBytes denies with 502 instead of presenting a partial
+	// row slice as a complete success. The admitted dispatch stays billed.
 	p := testPolicy()
 	p.Budgets.MaxRowsPerCall = 100
-	p.Budgets.MaxResponseBytes = 60 // tiny: forces trimming
+	p.Budgets.MaxResponseBytes = 60 // tiny: forces over-cap
 	gate := &fakeGate{allow: true}
 	rows := []any{
 		map[string]any{"id": 1, "name": "abcdefghijklmnopqrstuvwxyz"},
@@ -444,19 +447,30 @@ func TestByteCapTrimsRows(t *testing.T) {
 	b.exec = &fakeExec{rows: rows}
 	tok := grantToken(t, b)
 	rec := post(t, b, "/rpc/search", tok, `{"model":"res.partner"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code = %d", rec.Code)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code = %d, want 502 over-cap deny (never truncated success)", rec.Code)
 	}
 	var env struct {
-		Success bool  `json:"success"`
-		Result  []any `json:"result"`
-		Count   int   `json:"count"`
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&env); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if env.Count >= len(rows) {
-		t.Fatalf("byte cap did not trim: count = %d", env.Count)
+	if env.Success {
+		t.Fatal("over-cap response claimed success")
+	}
+	if len(rec.Body.Bytes()) > p.Budgets.MaxResponseBytes {
+		t.Fatalf("error envelope %d bytes exceeds cap %d", len(rec.Body.Bytes()), p.Budgets.MaxResponseBytes)
+	}
+	if len(b.exec.(*fakeExec).calls) != 1 {
+		t.Fatalf("calls = %d, want 1 (denial is post-RPC, attempt billed)", len(b.exec.(*fakeExec).calls))
+	}
+	b.mu.Lock()
+	rowsBilled := b.sessions[tok].rows
+	b.mu.Unlock()
+	if rowsBilled <= 0 {
+		t.Fatalf("rows = %d, want billed reservation kept on deny", rowsBilled)
 	}
 }
 
@@ -872,6 +886,136 @@ func TestServingDigestMismatchDenies(t *testing.T) {
 	if err := verifyServingDigest(p, testSnapshot()); err != nil {
 		t.Fatalf("bound snapshot denied: %v", err)
 	}
+}
+
+func TestOversizeErrorPathStaysCapped(t *testing.T) {
+	// The error fallback itself obeys the cap: when MaxResponseBytes cannot
+	// carry even the minimum JSON denial, the transport denial is an empty
+	// body with the status preserved — never truncated JSON, never an
+	// uncapped write. Uses the real envelope writer (no mocks).
+	p := testPolicy()
+	p.Budgets.MaxRowsPerCall = 100
+	p.Budgets.MaxResponseBytes = 10 // smaller than any JSON denial
+	gate := &fakeGate{allow: true}
+	b, _ := New(p, &config.Instance{Name: "test"}, testSnapshot())
+	b.authz = gate
+	b.exec = &fakeExec{rows: []any{map[string]any{"id": 1}}}
+	tok := grantToken(t, b)
+	rec := post(t, b, "/rpc/search", tok, `{"model":"res.partner"}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code = %d, want 502 bounded denial", rec.Code)
+	}
+	if rec.Body.Len() > p.Budgets.MaxResponseBytes {
+		t.Fatalf("denial body %d bytes exceeds cap %d", rec.Body.Len(), p.Budgets.MaxResponseBytes)
+	}
+	if body := rec.Body.String(); body != "" {
+		var v any
+		if err := json.Unmarshal([]byte(body), &v); err != nil {
+			t.Fatalf("non-empty denial is not JSON: %q", body)
+		}
+	}
+}
+
+func TestParallelOverReservationDenied(t *testing.T) {
+	// POSITIVE+NEGATIVE: one admitted dispatch keeps its rows even on
+	// failure, and a parallel request that would overshoot the remaining
+	// rows denies before dispatch (dispatch recorder proves no second RPC).
+	// testPolicy caps MaxRowsPerSession=1000; shrink to 60 so the default
+	// search limit (50) admits once and the second want overshoots.
+	gate := &fakeGate{allow: true}
+	exec := &fakeExec{err: errors.New("boom")}
+	b := testBroker(t, gate, exec)
+	b.pol.Budgets.MaxRowsPerSession = 60
+	tok := grantToken(t, b)
+	rec := post(t, b, "/rpc/search", tok, `{"model":"res.partner","fields":["name"]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("first dispatch = %d, want 502", rec.Code)
+	}
+	b.mu.Lock()
+	billed := b.sessions[tok].rows
+	b.mu.Unlock()
+	if billed != 50 {
+		t.Fatalf("admitted failure billed %d rows, want 50 (default limit)", billed)
+	}
+	// Remaining = 10; ask for 15: deny pre-RPC with no second dispatch.
+	before := len(exec.calls)
+	if _, err := b.reserveForLimit(tok, 15); !errors.Is(err, ErrSessionBudget) {
+		t.Fatalf("parallel over-reservation = %v, want budget deny", err)
+	}
+	if len(exec.calls) != before {
+		t.Fatal("Execute dispatched despite budget deny")
+	}
+	b.release(tok)
+}
+
+func TestInflightSaturationDeniesBeforeDispatch(t *testing.T) {
+	// Semaphore deny-before-dispatch: with zero free slots the handler
+	// denies 429 and the dispatch recorder proves no RPC ran; the row
+	// reservation rolls back (no RPC) while the Check call rolls back too.
+	p := testPolicy()
+	p.AllowWorkspace = false
+	gate := &fakeGate{allow: true}
+	exec := &fakeExec{rows: []any{map[string]any{"id": 1}}}
+	b, _ := New(p, &config.Instance{Name: "test"}, testSnapshot())
+	b.authz = gate
+	b.exec = exec
+	b.setInflightForTest(1)
+	// Occupy the only slot directly.
+	if !b.tryAcquireInflight() {
+		t.Fatal("could not occupy semaphore")
+	}
+	defer b.releaseInflight()
+	tok := grantToken(t, b)
+	rec := post(t, b, "/rpc/search", tok, `{"model":"res.partner","fields":["name"]}`)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("saturated = %d, want 429", rec.Code)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatal("Execute dispatched despite saturation")
+	}
+}
+
+func TestRPCTimeoutDeniesButStaysBilled(t *testing.T) {
+	// Timeout/cancel propagation: a hung executor denies via the
+	// broker-local wrapper bound, and the admitted reservation stays
+	// billed (dispatch was admitted). Bounded wait: the test would hang
+	// without the wrapper.
+	gate := &fakeGate{allow: true}
+	exec := &blockingExec{release: make(chan struct{})}
+	b := testBroker(t, gate, exec)
+	b.mu.Lock()
+	b.rpcTimeout = 50 * time.Millisecond
+	b.mu.Unlock()
+	tok := grantToken(t, b)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- post(t, b, "/rpc/search", tok, `{"model":"res.partner","fields":["name"]}`)
+	}()
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("timeout = %d, want 502", rec.Code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not time out within 5s")
+	}
+	b.mu.Lock()
+	rows := b.sessions[tok].rows
+	b.mu.Unlock()
+	if rows <= 0 {
+		t.Fatalf("rows = %d, want admitted timeout kept billed", rows)
+	}
+}
+
+// blockingExec hangs until the test ends: proves the wrapper (not the
+// executor) enforces the bound.
+type blockingExec struct {
+	release chan struct{}
+}
+
+func (e *blockingExec) Execute(model, method string, args []any, kwargs map[string]any) (any, error) {
+	<-e.release
+	return []any{}, nil
 }
 
 func TestWorkspaceMkdirBillsOneRow(t *testing.T) {

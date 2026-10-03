@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -91,19 +94,37 @@ func testBrokerServer(t *testing.T, gate *stubGate, exec *stubExec) (*httptest.S
 	return srv, tok
 }
 
+// serveInput runs Serve over input with a deadline and returns everything
+// written before Serve returns (EOF or error). The deadline keeps a framing
+// regression (hang or repeat-decode loop) from stalling the suite: Serve
+// must return promptly either way.
+func serveInput(t *testing.T, srv *Server, input string, timeout time.Duration) (string, error) {
+	t.Helper()
+	srv.In = strings.NewReader(input)
+	var out bytes.Buffer
+	srv.Out = &out
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(context.Background()) }()
+	select {
+	case err := <-done:
+		return out.String(), err
+	case <-time.After(timeout):
+		t.Fatalf("Serve did not return within %v (input %d bytes)", timeout, len(input))
+		return "", nil
+	}
+}
+
 // roundTrip runs one JSON-RPC request through the stdio server and decodes
 // the single response.
 func roundTrip(t *testing.T, srv *Server, req string) map[string]any {
 	t.Helper()
-	srv.In = strings.NewReader(req + "\n")
-	var out bytes.Buffer
-	srv.Out = &out
-	if err := srv.Serve(context.Background()); err != nil {
+	got, err := serveInput(t, srv, req+"\n", 5*time.Second)
+	if err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
 	var res map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &res); err != nil {
-		t.Fatalf("decode response %q: %v", out.String(), err)
+	if err := json.Unmarshal(bytes.TrimSpace([]byte(got)), &res); err != nil {
+		t.Fatalf("decode response %q: %v", got, err)
 	}
 	return res
 }
@@ -233,6 +254,312 @@ func TestTokenNeverLogged(t *testing.T) {
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{}}`)
 	if strings.Contains(strings.ToLower(jsonString(res)), strings.ToLower(tok)) {
 		t.Fatal("token echoed in tools/list")
+	}
+}
+
+// errFailWriter fails every Encode so Serve must abort with an error (the
+// host must exit non-zero, never silently drop responses).
+type errFailWriter struct{}
+
+func (errFailWriter) Write([]byte) (int, error) { return 0, errors.New("boom") }
+
+// A single malformed frame costs one ParseError and Serve keeps framing:
+// garbage, then a valid initialize, yields exactly one error + one result.
+func TestMalformedInputRecovers(t *testing.T) {
+	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	got, err := serveInput(t, srv,
+		"this is not json\n"+`{"jsonrpc":"2.0","id":11,"method":"initialize","params":{}}`+"\n",
+		5*time.Second)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 responses (parse error + initialize), got %d: %q", len(lines), got)
+	}
+	var first, second map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("first line not JSON: %v", err)
+	}
+	if first["error"] == nil {
+		t.Fatalf("malformed frame should be a protocol error: %q", lines[0])
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
+		t.Fatalf("second line not JSON: %v", err)
+	}
+	if second["result"] == nil {
+		t.Fatalf("valid frame after garbage should succeed: %q", lines[1])
+	}
+}
+
+// An over-cap frame is rejected once (one ParseError) and the loop
+// resynchronizes on the next frame instead of spinning on a stuck decoder.
+func TestOversizedFrameRejectedOnce(t *testing.T) {
+	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	big := strings.Repeat("x", maxFrameBytes+100)
+	got, err := serveInput(t, srv,
+		big+"\n"+`{"jsonrpc":"2.0","id":12,"method":"ping","params":{}}`+"\n",
+		5*time.Second)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 responses (parse error + ping), got %d", len(lines))
+	}
+	var first, second map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil || first["error"] == nil {
+		t.Fatalf("oversized frame should be one protocol error: %q", lines[0])
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil || second["result"] == nil {
+		t.Fatalf("frame after oversize should succeed: %q", lines[1])
+	}
+}
+
+// A failing writer must abort Serve promptly with an error (bounded time,
+// no hang): the host learns its output path is broken via a non-zero exit.
+func TestFailingWriterExitsPromptly(t *testing.T) {
+	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	srv.In = strings.NewReader(`{"jsonrpc":"2.0","id":13,"method":"ping","params":{}}` + "\n")
+	srv.Out = errFailWriter{}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(context.Background()) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Serve over a failing writer should return an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve over a failing writer hung")
+	}
+}
+
+// A failing writer on a parse-error path also aborts: the error reply
+// itself cannot be delivered, so Serve must not loop forever.
+func TestFailingWriterOnParseErrorExits(t *testing.T) {
+	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	srv.In = strings.NewReader("garbage\n")
+	srv.Out = errFailWriter{}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(context.Background()) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Serve should return the encoder error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve hung on undeliverable parse error")
+	}
+}
+
+// Cancellation aborts Serve promptly instead of blocking on input.
+func TestCancelledContextExits(t *testing.T) {
+	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	pr, pw := io.Pipe()
+	srv.In = pr
+	var out bytes.Buffer
+	srv.Out = &out
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := srv.Serve(ctx); err == nil {
+		t.Fatal("cancelled Serve should return the context error")
+	}
+	_ = pw.Close()
+}
+
+// Schemas for no-required tools carry no required:null: an empty schema is
+// an omitted key, never an explicit null (which fails JSON Schema
+// validation in strict consumers).
+func TestSchemasHaveNoRequiredNull(t *testing.T) {
+	raw, err := json.Marshal(Tools())
+	if err != nil {
+		t.Fatalf("marshal Tools: %v", err)
+	}
+	if strings.Contains(string(raw), `"required":null`) {
+		t.Fatalf("schema carries required:null: %s", raw)
+	}
+	for _, tool := range Tools() {
+		if v, ok := tool.InputSchema["required"]; ok && v == nil {
+			t.Fatalf("tool %q has nil required", tool.Name)
+		}
+	}
+	for _, name := range []string{"meta", "companies", "catalog"} {
+		for _, tool := range Tools() {
+			if tool.Name != name {
+				continue
+			}
+			if _, ok := tool.InputSchema["required"]; ok {
+				t.Fatalf("tool %q takes optional/no args but declares required", name)
+			}
+		}
+	}
+}
+
+// Unknown or wrong-typed arguments are rejected as InvalidParams before any
+// broker dispatch (the dispatch recorder proves zero outgoing RPC).
+func TestUnknownArgsRejected(t *testing.T) {
+	exec := &stubExec{}
+	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
+	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"],"admin":true}}}`)
+	if res["error"] == nil {
+		t.Fatalf("unknown arg should be InvalidParams: %+v", res)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("unknown-arg call dispatched: %v", exec.calls)
+	}
+	srv2 := New(Config{BaseURL: srvURL.URL, Token: tok})
+	res = roundTrip(t, srv2, `{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":"name"}}}`)
+	if res["error"] == nil {
+		t.Fatalf("wrong-typed arg should be InvalidParams: %+v", res)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("wrong-typed call dispatched: %v", exec.calls)
+	}
+	// GET tools accept no stray body keys: companies with an argument denies.
+	srv3 := New(Config{BaseURL: srvURL.URL, Token: tok})
+	res = roundTrip(t, srv3, `{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"companies","arguments":{"model":"x"}}}`)
+	if res["error"] == nil {
+		t.Fatalf("GET stray arg should be InvalidParams: %+v", res)
+	}
+}
+
+// A non-loopback broker URL is refused before dispatch (zero outgoing RPC):
+// the session token must never travel beyond the local broker.
+func TestNonLoopbackURLRefused(t *testing.T) {
+	exec := &stubExec{}
+	_, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
+	srv := New(Config{BaseURL: "http://192.168.1.10:8471", Token: tok})
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
+	result, _ := res["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatalf("non-loopback URL should be a tool error: %+v", res)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("non-loopback call dispatched: %v", exec.calls)
+	}
+	for _, raw := range []string{"http://127.0.0.1:8471", "http://localhost:8471", "http://[::1]:8471", "http://127.0.0.2:9"} {
+		if !isLoopbackURL(raw) {
+			t.Fatalf("isLoopbackURL(%q) = false, want true", raw)
+		}
+	}
+	for _, raw := range []string{"http://192.168.1.10:8471", "http://127.evil.com:8471", "ftp://127.0.0.1/x", "http://example.com", "::::", ""} {
+		if isLoopbackURL(raw) {
+			t.Fatalf("isLoopbackURL(%q) = true, want false", raw)
+		}
+	}
+}
+
+// Redirects are never followed: a 302 target must see zero requests while
+// the caller gets a tool error (the token never moves off the broker).
+func TestRedirectRefused(t *testing.T) {
+	var evilHits int
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		evilHits++
+		w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(evil.Close)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, evil.URL+"/evil", http.StatusFound)
+	}))
+	t.Cleanup(target.Close)
+	exec := &stubExec{}
+	_, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
+	srv := New(Config{BaseURL: target.URL, Token: tok})
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
+	result, _ := res["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatalf("redirect should be a tool error: %+v", res)
+	}
+	if evilHits != 0 {
+		t.Fatalf("redirect target hit %d times with the token attached", evilHits)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("redirect call dispatched: %v", exec.calls)
+	}
+}
+
+// The meta model query is strictly parsed and QueryEscaped: a model with
+// spaces/& rides the query string encoded, and an unknown trailing query key
+// on a GET request never reaches the broker as a second filter.
+func TestMetaQueryEscapedAndStrict(t *testing.T) {
+	var gotQuery string
+	seen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Write([]byte(`{"success":true,"result":{"model":"res.partner"}}`))
+	}))
+	t.Cleanup(seen.Close)
+	srv := New(Config{BaseURL: seen.URL, Token: "probe-token"})
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"meta","arguments":{"model":"res.partner & co"}}}`)
+	result, _ := res["result"].(map[string]any)
+	if result["isError"] == true {
+		t.Fatalf("meta isError: %+v", res)
+	}
+	if !strings.Contains(gotQuery, "model=res.partner+%26+co") && !strings.Contains(gotQuery, "model=res.partner%20%26%20co") {
+		t.Fatalf("model query not QueryEscaped: %q", gotQuery)
+	}
+	if strings.Contains(gotQuery, " & ") {
+		t.Fatalf("raw concatenation leaked into query: %q", gotQuery)
+	}
+}
+
+// Token redaction: a broker denial echoing the token (raw) surfaces with
+// "***" instead, never the credential.
+func TestTokenRedactedFromErrors(t *testing.T) {
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		w.Write([]byte(`{"success":false,"error":"denied for ` + tok + ` repeat"}`))
+	}))
+	t.Cleanup(bad.Close)
+	_, probe := testBrokerServer(t, &stubGate{allow: true}, &stubExec{})
+	srv := New(Config{BaseURL: bad.URL, Token: probe})
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
+	result, _ := res["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatalf("want isError: %+v", res)
+	}
+	content, _ := result["content"].([]any)
+	text, _ := content[0].(map[string]any)["text"].(string)
+	if strings.Contains(text, probe) {
+		t.Fatalf("token echoed in tool error: %q", text)
+	}
+	if !strings.Contains(text, "***") {
+		t.Fatalf("redaction marker missing: %q", text)
+	}
+}
+
+// initialize negotiates: a supported client version echoes back, an unknown
+// one falls back to the default. ping answers {}.
+func TestInitializeNegotiationAndPing(t *testing.T) {
+	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":40,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`)
+	result, _ := res["result"].(map[string]any)
+	if result["protocolVersion"] != "2025-03-26" {
+		t.Fatalf("negotiation = %+v, want 2025-03-26", result)
+	}
+	srv2 := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	res = roundTrip(t, srv2, `{"jsonrpc":"2.0","id":41,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}`)
+	result, _ = res["result"].(map[string]any)
+	if result["protocolVersion"] != defaultProtocolVersion {
+		t.Fatalf("unknown version should fall back to %q: %+v", defaultProtocolVersion, result)
+	}
+	srv3 := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	res = roundTrip(t, srv3, `{"jsonrpc":"2.0","id":42,"method":"ping","params":{}}`)
+	if res["result"] == nil {
+		t.Fatalf("ping: %+v", res)
+	}
+	// A notifications/initialized frame gets no reply: one request in, one
+	// response out, and the response belongs to the ping.
+	srv4 := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	got, err := serveInput(t, srv4,
+		`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`+"\n"+
+			`{"jsonrpc":"2.0","id":43,"method":"ping","params":{}}`+"\n",
+		5*time.Second)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if n := len(strings.Split(strings.TrimSpace(got), "\n")); n != 1 {
+		t.Fatalf("notification should get no reply (want 1 line, got %d): %q", n, got)
 	}
 }
 

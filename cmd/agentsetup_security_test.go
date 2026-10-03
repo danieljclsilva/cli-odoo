@@ -95,28 +95,8 @@ func TestSetupParseModelSpecCompanyless(t *testing.T) {
 func TestSetupResealStampsDigest(t *testing.T) {
 	dir := t.TempDir()
 	profile := filepath.Join(dir, "profile.json")
-	snap := snapshot.Snapshot{
-		Instance:           "test",
-		CapturedAt:         time.Now().UTC(),
-		CapturedBy:         "test",
-		AvailableCompanies: []snapshot.Company{{ID: 1, Name: "A"}, {ID: 2, Name: "B"}},
-		EnabledCompanies:   []int{1, 2},
-		DefaultCompany:     1,
-		Models: map[string]snapshot.ModelMeta{
-			"res.partner": {Name: "res.partner", Label: "Partner", Provenance: snapshot.ProvServer,
-				Fields: map[string]snapshot.SFieldMeta{"name": {Name: "name", Type: "char", Label: "Name", Provenance: snapshot.ProvServer}}},
-		},
-		MethodManifest: []string{"search_read"},
-	}
-	pol := policy.Policy{
-		Version: policy.PolicyVersion, Instance: "test",
-		Operations:    map[policy.Operation]bool{policy.OpSearch: true},
-		Models:        map[string]policy.ModelRule{"res.partner": {Fields: []string{"name"}, MaxLimit: 50, CompanyField: "company_id"}},
-		Scope:         policy.CompanyScope{Enabled: []int{1, 2}, Default: 1},
-		SharedRecords: policy.SharedDeny,
-		Budgets:       policy.Budgets{MaxLimit: 100, MaxOffset: 1000, MaxRowsPerCall: 10, MaxResponseBytes: 1 << 20, MaxCallsPerSession: 100, MaxRowsPerSession: 1000},
-		SnapshotPath:  filepath.Join(dir, "snap.json"),
-	}
+	snap := validBundleSnapshot()
+	pol := validBundlePolicy(dir)
 	if err := agentSnapshotReseal(profile, "pw", pol, snap); err != nil {
 		t.Fatalf("Reseal: %v", err)
 	}
@@ -190,5 +170,195 @@ func TestSetupSecureReplace0600(t *testing.T) {
 	}
 	if !strings.HasPrefix(func() string { b, _ := os.ReadFile(link); return string(b) }(), "replaced") {
 		t.Fatal("link path was not replaced")
+	}
+}
+
+// validBundleSnapshot returns a minimal snapshot matching pol scope/instance
+// with company_id metadata resolving to a res.company many2one relation, so
+// agentSetupStageSealedBundle serve-time parity passes.
+func validBundleSnapshot() snapshot.Snapshot {
+	return snapshot.Snapshot{
+		Instance:           "test",
+		ServerVersion:      "17.0",
+		CapturedAt:         time.Now().UTC(),
+		CapturedBy:         "test",
+		AvailableCompanies: []snapshot.Company{{ID: 1, Name: "A"}, {ID: 2, Name: "B"}},
+		EnabledCompanies:   []int{1, 2},
+		DefaultCompany:     1,
+		Models: map[string]snapshot.ModelMeta{
+			"res.partner": {Name: "res.partner", Label: "Partner", Provenance: snapshot.ProvServer,
+				CompanyField: "company_id",
+				Fields: map[string]snapshot.SFieldMeta{
+					"name":       {Name: "name", Type: "char", Label: "Name", Provenance: snapshot.ProvServer},
+					"company_id": {Name: "company_id", Type: "many2one", Relation: "res.company", Label: "Company", Provenance: snapshot.ProvServer},
+				}},
+		},
+		MethodManifest: []string{"search_read"},
+	}
+}
+
+// validBundlePolicy returns the sealed policy matching validBundleSnapshot.
+func validBundlePolicy(dir string) policy.Policy {
+	return policy.Policy{
+		Version: policy.PolicyVersion, Instance: "test",
+		Operations:    map[policy.Operation]bool{policy.OpSearch: true},
+		Models:        map[string]policy.ModelRule{"res.partner": {Fields: []string{"company_id", "name"}, MaxLimit: 50, CompanyField: "company_id"}},
+		Scope:         policy.CompanyScope{Enabled: []int{1, 2}, Default: 1},
+		SharedRecords: policy.SharedDeny,
+		Budgets:       policy.Budgets{MaxLimit: 100, MaxOffset: 1000, MaxRowsPerCall: 10, MaxResponseBytes: 1 << 20, MaxCallsPerSession: 100, MaxRowsPerSession: 1000},
+		SnapshotPath:  filepath.Join(dir, "snap.json"),
+	}
+}
+
+// TestSetupBundleCommitAtomic proves the atomic pair: staging validates +
+// seals in memory, commit writes snapshot+profile together, and a failed
+// commit (profile path blocked by a directory) restores the prior bytes.
+func TestSetupBundleCommitAtomic(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "snap.json")
+	profilePath := filepath.Join(dir, "profile.json")
+	priorSnap := validBundleSnapshot()
+	priorPol := validBundlePolicy(dir)
+	priorBundle, err := agentSetupStageSealedBundle(profilePath, snapPath, "pw", priorPol, priorSnap)
+	if err != nil {
+		t.Fatalf("stage prior: %v", err)
+	}
+	if err := agentSetupCommitBundle(priorBundle); err != nil {
+		t.Fatalf("commit prior: %v", err)
+	}
+	wantSnap, err := os.ReadFile(snapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantProf, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Bad password (empty) fails at stage time, before any mutation.
+	if _, err := agentSetupStageSealedBundle(profilePath, snapPath, "", priorPol, priorSnap); err == nil {
+		t.Fatal("empty password staged, want denial")
+	}
+	if got, _ := os.ReadFile(snapPath); string(got) != string(wantSnap) {
+		t.Fatal("failed stage mutated the snapshot")
+	}
+	if got, _ := os.ReadFile(profilePath); string(got) != string(wantProf) {
+		t.Fatal("failed stage mutated the profile")
+	}
+	// Commit failure restores the prior pair: stage the next bundle, then
+	// point it at a profile path inside an unwritable parent (chmod 0500)
+	// so the profile staging fails after the pair's prior bytes were read.
+	// Restore the parent mode before asserting so TempDir cleanup succeeds.
+	nextSnap := validBundleSnapshot()
+	nextSnap.CapturedBy = "server-refresh"
+	nextStaged, err := agentSetupStageSealedBundle(profilePath, snapPath, "pw2", priorPol, nextSnap)
+	if err != nil {
+		t.Fatalf("stage next: %v", err)
+	}
+	profDir := filepath.Join(dir, "profdir")
+	blockedProfile := filepath.Join(profDir, "profile.json")
+	if err := os.MkdirAll(profDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	blocked := nextStaged
+	blocked.snapshotPath = filepath.Join(dir, "snap-next.json")
+	blocked.profilePath = blockedProfile
+	if err := os.Chmod(profDir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	commitErr := agentSetupCommitBundle(blocked)
+	_ = os.Chmod(profDir, 0700)
+	if commitErr == nil {
+		t.Fatal("blocked profile commit passed, want failure")
+	}
+	_ = os.RemoveAll(profDir)
+	_ = os.Remove(filepath.Join(dir, "snap-next.json"))
+	if got, _ := os.ReadFile(snapPath); string(got) != string(wantSnap) {
+		t.Fatal("failed commit left a half-committed snapshot")
+	}
+	got, err := agentSetupOpenPolicy(profilePath, "pw")
+	if err != nil {
+		t.Fatalf("prior profile unrestorable: %v", err)
+	}
+	if got.SnapshotSHA256 == nextStaged.pol.SnapshotSHA256 {
+		t.Fatal("failed commit swapped the profile binding")
+	}
+}
+
+// TestSetupImportCatalogPreservesScope proves import-catalog never widens
+// from metadata: company/shared flags, enabled set/default, and the
+// per-model companyless flag stay exactly as sealed, catalog-only models
+// stay out of the allowlist, and existing fields intersect (never widen).
+func TestSetupImportCatalogPreservesScope(t *testing.T) {
+	sealed := validBundlePolicy(t.TempDir())
+	sealed.SharedRecords = policy.SharedAllowClassified
+	sealed.Models["res.company"] = policy.ModelRule{Fields: []string{"name"}, CompanyIndependent: true}
+	widen := validBundleSnapshot()
+	widen.EnabledCompanies = []int{1, 3}
+	widen.DefaultCompany = 3
+	widen.Models["res.partner"] = snapshot.ModelMeta{Name: "res.partner", Label: "P", Fields: map[string]snapshot.SFieldMeta{
+		"name":       {Name: "name", Type: "char", Label: "N", Provenance: snapshot.ProvManifest},
+		"company_id": {Name: "company_id", Type: "many2one", Relation: "res.company", Label: "C", Provenance: snapshot.ProvManifest},
+		"secret":     {Name: "secret", Type: "char", Label: "S", Provenance: snapshot.ProvManifest},
+	}, CompanyField: "company_ids", CompanyIndependent: false, IncludeCompanyless: true, Provenance: snapshot.ProvManifest}
+	widen.Models["evil.model"] = snapshot.ModelMeta{Name: "evil.model", Label: "E",
+		Fields:       map[string]snapshot.SFieldMeta{"x": {Name: "x", Type: "char", Label: "X", Provenance: snapshot.ProvManifest}},
+		CompanyField: "company_id", Provenance: snapshot.ProvManifest}
+	got := agentSetupApplyCatalogPolicy(sealed, widen)
+	if len(got.Scope.Enabled) != 2 || got.Scope.Enabled[0] != 1 || got.Scope.Enabled[1] != 2 || got.Scope.Default != 1 {
+		t.Fatalf("scope drifted: %+v", got.Scope)
+	}
+	if got.SharedRecords != policy.SharedAllowClassified {
+		t.Fatalf("shared drifted: %q", got.SharedRecords)
+	}
+	if _, ok := got.Models["evil.model"]; ok {
+		t.Fatal("catalog-only model entered the allowlist")
+	}
+	rule := got.Models["res.partner"]
+	for _, f := range rule.Fields {
+		if f == "secret" {
+			t.Fatalf("import widened fields: %v", rule.Fields)
+		}
+	}
+	if len(rule.Fields) != 2 {
+		t.Fatalf("import dropped approved fields: %v", rule.Fields)
+	}
+	if rule.CompanyField != "company_id" || rule.CompanyIndependent {
+		t.Fatalf("company flags drifted: %+v", rule)
+	}
+	if rule.IncludeCompanyless {
+		t.Fatal("catalog metadata opted the model into companyless")
+	}
+	if _, ok := got.Models["res.company"]; !ok {
+		t.Fatal("sealed independent model dropped")
+	}
+}
+
+// TestSetupStageRejectsScopeDrift proves staging denies a candidate whose
+// snapshot scope or company-field metadata disagrees with the sealed policy
+// (serve-time parity), before Seal and before any file mutation.
+func TestSetupStageRejectsScopeDrift(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "snap.json")
+	profilePath := filepath.Join(dir, "profile.json")
+	pol := validBundlePolicy(dir)
+	drift := validBundleSnapshot()
+	drift.EnabledCompanies = []int{1, 3}
+	drift.AvailableCompanies = []snapshot.Company{{ID: 1, Name: "A"}, {ID: 3, Name: "C"}}
+	drift.DefaultCompany = 3
+	if _, err := agentSetupStageSealedBundle(profilePath, snapPath, "pw", pol, drift); err == nil {
+		t.Fatal("scope drift staged, want denial")
+	}
+	badField := validBundleSnapshot()
+	badField.Models["res.partner"] = snapshot.ModelMeta{Name: "res.partner", Label: "P",
+		Fields:       map[string]snapshot.SFieldMeta{"name": {Name: "name", Type: "char", Label: "N", Provenance: snapshot.ProvServer}},
+		CompanyField: "company_id", Provenance: snapshot.ProvServer}
+	if _, err := agentSetupStageSealedBundle(profilePath, snapPath, "pw", pol, badField); err == nil {
+		t.Fatal("unresolvable company field staged, want denial")
+	}
+	if _, err := os.Stat(snapPath); !os.IsNotExist(err) {
+		t.Fatal("failed stage created a snapshot file")
+	}
+	if _, err := os.Stat(profilePath); !os.IsNotExist(err) {
+		t.Fatal("failed stage created a profile file")
 	}
 }

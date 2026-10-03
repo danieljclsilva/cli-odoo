@@ -8,10 +8,19 @@
 // HTTP is stubbed per-test: legitimate routing and denial surfacing are
 // proven against a fake fetch, so no model/backend/Odoo credentials exist
 // anywhere in this file.
+//
+// PROVEN (2026-10-04): factory shape (11 typed tools, 5-arg execute);
+// legitimate routing to typed broker paths; denials surface as isError;
+// strict unknown/wrong-typed args rejected with no fetch; non-loopback
+// broker URLs refused; redirect:'error' set on every request; token
+// redacted from error text. Real-loader binding is proven separately in
+// odoo-broker.loader.test.js (bun + installed discover/loadCustomTools,
+// temp cwd/.omp/tools, REAL in-process broker for legit+denied calls).
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
+const http = require('node:http');
 
 const factory = require('./odoo-broker.js');
 const src = fs.readFileSync(path.join(__dirname, 'odoo-broker.js'), 'utf8');
@@ -23,6 +32,12 @@ function stubPi() {
 function toolsOf() {
   const out = factory(stubPi());
   return Array.isArray(out) ? out : [out];
+}
+
+function byName(name) {
+  const t = toolsOf().find((t) => t.name === name);
+  assert.ok(t, `${name} tool must exist`);
+  return t;
 }
 
 test('factory returns eleven typed tools with execute + JSON-schema parameters', () => {
@@ -81,6 +96,7 @@ test('legitimate call routes to the broker path', async () => {
     assert.strictEqual(seen.length, 1);
     assert.ok(seen[0].url.endsWith('/rpc/search'), `routed to ${seen[0].url}`);
     assert.strictEqual(seen[0].opts.headers.Authorization, 'Bearer tok');
+    assert.strictEqual(seen[0].opts.redirect, 'error', 'redirects must never be followed with the token attached');
     const text = res.content[0].text;
     assert.ok(text.includes('rows'), `result text must carry the broker result, got ${text}`);
   } finally {
@@ -122,6 +138,101 @@ test('workspace.mkdir routes to /rpc/workspace/mkdir', async () => {
     assert.ok(seen[0].endsWith('/rpc/workspace/mkdir'), `routed to ${seen[0]}`);
   } finally {
     global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+test('unknown args rejected with no fetch', async () => {
+  const realFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return { json: async () => ({ success: true, result: {} }) };
+  };
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  try {
+    const search = byName('odoo.search');
+    const bad = await search.execute('id-x', { model: 'res.partner', fields: ['name'], admin: true }, undefined, {}, undefined);
+    assert.strictEqual(bad.isError, true, 'unknown arg must be isError');
+    assert.ok(bad.content[0].text.includes('unknown argument'), `got ${bad.content[0].text}`);
+    const wrong = await search.execute('id-y', { model: 'res.partner', fields: 'name' }, undefined, {}, undefined);
+    assert.strictEqual(wrong.isError, true, 'wrong-typed arg must be isError');
+    assert.ok(wrong.content[0].text.includes('must be'), `got ${wrong.content[0].text}`);
+    assert.strictEqual(calls, 0, 'strict rejection must happen before any fetch');
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+test('non-loopback broker URL refused', async () => {
+  const realFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return { json: async () => ({ success: true, result: {} }) };
+  };
+  process.env.ODOO_BROKER_URL = 'http://192.168.1.10:8471';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  try {
+    const search = byName('odoo.search');
+    const res = await search.execute('id-z', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+    assert.strictEqual(res.isError, true, 'non-loopback URL must be isError');
+    assert.ok(res.content[0].text.includes('loopback'), `got ${res.content[0].text}`);
+    assert.strictEqual(calls, 0, 'no request may leave for a non-loopback host');
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+test('token redacted from error strings', async () => {
+  const realFetch = global.fetch;
+  global.fetch = async () => ({ json: async () => ({ success: false, error: 'denied for token-SECRET-abc token' }) });
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
+  process.env.ODOO_BROKER_TOKEN = 'token-SECRET-abc';
+  try {
+    const search = byName('odoo.search');
+    const res = await search.execute('id-r', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+    assert.strictEqual(res.isError, true);
+    assert.ok(!res.content[0].text.includes('token-SECRET-abc'), `token leaked: ${res.content[0].text}`);
+    assert.ok(res.content[0].text.includes('***'), `redaction marker missing: ${res.content[0].text}`);
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+test('redirect refused before the token moves', async (t) => {
+  // A 302 target that must never see the Authorization header. Uses a real
+  // loopback HTTP server (no mocks): the tool fetch must throw on redirect
+  // (redirect:'error') and surface a tool error instead of following.
+  const evilSeen = [];
+  const evil = http.createServer((req, res) => {
+    evilSeen.push(req.headers.authorization || '');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{}');
+  });
+  await new Promise((resolve) => evil.listen(0, '127.0.0.1', resolve));
+  t.after(() => evil.close());
+  const evilPort = evil.address().port;
+  const target = http.createServer((req, res) => {
+    res.writeHead(302, { Location: `http://127.0.0.1:${evilPort}/evil?next=1` });
+    res.end();
+  });
+  await new Promise((resolve) => target.listen(0, '127.0.0.1', resolve));
+  t.after(() => target.close());
+  process.env.ODOO_BROKER_URL = `http://127.0.0.1:${target.address().port}`;
+  process.env.ODOO_BROKER_TOKEN = 'redirect-probe-token';
+  try {
+    const search = byName('odoo.search');
+    const res = await search.execute('id-redir', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+    assert.strictEqual(res.isError, true, 'redirect must surface isError, not follow');
+    assert.strictEqual(evilSeen.length, 0, 'evil server must never be hit with the token');
+  } finally {
+    delete process.env.ODOO_BROKER_URL;
     delete process.env.ODOO_BROKER_TOKEN;
   }
 });

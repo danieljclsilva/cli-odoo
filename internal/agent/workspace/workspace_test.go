@@ -500,6 +500,64 @@ func TestMkdirAllNested(t *testing.T) {
 	}
 }
 
+func TestEmptyDirListReturnsZeroRows(t *testing.T) {
+	// REGRESSION: empty-dir List("", 5) errored with EOF. io.EOF is the
+	// end-of-directory signal, not a failure: an empty directory lists
+	// zero rows with no error.
+	w, _ := openTestWorkspace(t)
+	got, err := w.List("", 5)
+	if err != nil {
+		t.Fatalf("List(empty): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("List(empty) = %d rows, want 0", len(got))
+	}
+}
+
+func TestListRefusesFifoWithoutBlocking(t *testing.T) {
+	// MALICIOUS: a planted FIFO must deny without blocking for a writer.
+	// List opens nonblocking (like Read) and judges the held handle, so
+	// the whole denial completes with no writer ever arriving.
+	w, dir := openTestWorkspace(t)
+	if err := makeFifo(filepath.Join(dir, "pipe")); err != nil {
+		t.Skipf("fifos unsupported: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.List("pipe", 100)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("List(fifo): expected denial, got listing (would block)")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("List(fifo): blocked over 5s with no writer — nonblocking open missing")
+	}
+}
+
+func TestOpenValidatedHoldsValidatedRoot(t *testing.T) {
+	// LEGITIMATE+MALICIOUS: OpenValidated serves the validated directory,
+	// and a protected overlap still denies before Open runs.
+	base := t.TempDir()
+	dir := filepath.Join(base, "ws")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	ws, err := OpenValidated(dir, []string{filepath.Join(base, "protected")})
+	if err != nil {
+		t.Fatalf("OpenValidated(legitimate): %v", err)
+	}
+	_ = ws.Close()
+	if _, err := OpenValidated(dir, []string{dir}); err == nil {
+		t.Fatal("OpenValidated(protected overlap): expected denial")
+	}
+	if err := ws.RevalidateProtectedSeparation([]string{dir}); err == nil {
+		t.Fatal("RevalidateProtectedSeparation(overlap): expected denial")
+	}
+}
+
 func TestMaxEntriesCannotWiden(t *testing.T) {
 	w, _ := openTestWorkspace(t)
 	for i := range 3 {

@@ -293,6 +293,80 @@ func Write(path string, s Snapshot) error {
 	return nil
 }
 
+// MarshalFile validates s and returns the exact versioned JSON bytes Write
+// would persist (0600 envelope, trailing newline), without touching disk.
+// Staging callers (setup bundle commit) marshal first so validation and
+// size-cap checks complete before any snapshot/profile mutation.
+func MarshalFile(s Snapshot) ([]byte, error) {
+	if err := s.validate(); err != nil {
+		return nil, fmt.Errorf("snapshot: refusing to marshal invalid snapshot: %w", err)
+	}
+	f := snapshotFile{
+		Version:            FormatVersion,
+		Instance:           s.Instance,
+		ServerVersion:      s.ServerVersion,
+		CapturedAt:         s.CapturedAt,
+		CapturedBy:         s.CapturedBy,
+		AvailableCompanies: s.AvailableCompanies,
+		EnabledCompanies:   s.EnabledCompanies,
+		DefaultCompany:     s.DefaultCompany,
+		Models:             s.Models,
+		MethodManifest:     s.MethodManifest,
+	}
+	b, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: encoding: %w", err)
+	}
+	b = append(b, '\n')
+	if int64(len(b)) > MaxFileBytes {
+		return nil, fmt.Errorf("snapshot: encoded snapshot %d bytes exceeds cap %d", len(b), MaxFileBytes)
+	}
+	return b, nil
+}
+
+// WriteBytes validates the pre-marshaled envelope bytes (strict decode +
+// snapshot validate, version + cap checks) and persists them via the same
+// atomic secure-replace as Write (O_EXCL temp + fsync + rename, no symlink
+// sink). The parent directory must already exist: WriteBytes creates no
+// directories. Bundle commit uses this so the bytes sealed into the profile
+// digest are byte-identical to the bytes on disk.
+func WriteBytes(path string, b []byte) error {
+	if int64(len(b)) > MaxFileBytes {
+		return fmt.Errorf("snapshot: staged snapshot %d bytes exceeds cap %d", len(b), MaxFileBytes)
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var f snapshotFile
+	if err := dec.Decode(&f); err != nil {
+		return fmt.Errorf("snapshot: staged snapshot decode: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("snapshot: staged snapshot: trailing data after document")
+	}
+	if f.Version != FormatVersion {
+		return fmt.Errorf("snapshot: staged snapshot version %d (want %d)", f.Version, FormatVersion)
+	}
+	s := Snapshot{
+		Instance:           f.Instance,
+		ServerVersion:      f.ServerVersion,
+		CapturedAt:         f.CapturedAt,
+		CapturedBy:         f.CapturedBy,
+		AvailableCompanies: f.AvailableCompanies,
+		EnabledCompanies:   f.EnabledCompanies,
+		DefaultCompany:     f.DefaultCompany,
+		Models:             f.Models,
+		MethodManifest:     f.MethodManifest,
+	}
+	if err := s.validate(); err != nil {
+		return fmt.Errorf("snapshot: refusing to write invalid staged snapshot: %w", err)
+	}
+	if err := secureReplaceFile(path, b); err != nil {
+		return fmt.Errorf("snapshot: writing %q: %w", path, err)
+	}
+	return nil
+}
+
 // CanonicalDigest returns the hex-encoded SHA-256 digest of the canonical
 // JSON encoding of the Snapshot value. Canonical here means exactly what
 // encoding/json emits for this shape: struct fields in declaration order,

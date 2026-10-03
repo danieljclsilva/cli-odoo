@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -31,6 +32,155 @@ var (
 // earliest-expiring session when full so the table cannot grow without
 // bound; eviction is deterministic (never random).
 const maxLiveSessions = 64
+
+// defaultInflightLimit bounds concurrent admitted RPC dispatches when the
+// policy carries no usable concurrency signal. It is deliberately small:
+// each in-flight call may hold a full row reservation plus an upstream
+// connection, so unbounded fan-out would let one session exhaust both.
+const defaultInflightLimit = 8
+
+// defaultRPCTimeout bounds one admitted Execute call. The underlying
+// executor has no context parameter, so callExec enforces this with a
+// wrapper goroutine (see below).
+const defaultRPCTimeout = 30 * time.Second
+
+// inflightLimit derives the dispatch semaphore capacity from validated
+// Policy.Budgets centrally: MaxCallsPerSession, when positive, caps the
+// useful concurrency (more in-flight calls than session calls can never be
+// admitted anyway); otherwise the small default applies. Invalid budgets
+// cannot reach here — New rejects them via pol.Validate — so there is no
+// second budget-validation path to drift.
+func inflightLimit(p *policy.Policy) int {
+	if p != nil && p.Budgets.MaxCallsPerSession > 0 && p.Budgets.MaxCallsPerSession < defaultInflightLimit {
+		return int(p.Budgets.MaxCallsPerSession)
+	}
+	return defaultInflightLimit
+}
+
+// rpcTimeoutFor derives the per-RPC bound. There is currently no separate
+// timeout budget in Policy.Budgets (frozen cross-slice contract), so the
+// broker applies the fixed default; a future Budgets.MaxRPCSeconds field
+// would be read here, centrally, with invalid values rejected by Validate.
+func rpcTimeoutFor(_ *policy.Policy) time.Duration {
+	return defaultRPCTimeout
+}
+
+// setInflightForTest replaces the semaphore capacity (tests only).
+func (b *Broker) setInflightForTest(n int) {
+	if n < 1 {
+		n = 1
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.inflight = make(chan struct{}, n)
+}
+
+// tryAcquireInflight takes one dispatch slot without blocking. False means
+// the mux is saturated: the caller denies 429 and releases its Check
+// reservation (no RPC ran, nothing billed beyond the rollback).
+func (b *Broker) tryAcquireInflight() bool {
+	b.mu.Lock()
+	ch := b.inflight
+	b.mu.Unlock()
+	if ch == nil {
+		return true
+	}
+	select {
+	case ch <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// releaseInflight frees one dispatch slot.
+func (b *Broker) releaseInflight() {
+	b.mu.Lock()
+	ch := b.inflight
+	b.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	default:
+	}
+}
+
+// rpcTimeoutOf reads the per-RPC bound.
+func (b *Broker) rpcTimeoutOf() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.rpcTimeout <= 0 {
+		return defaultRPCTimeout
+	}
+	return b.rpcTimeout
+}
+
+// execResult carries one Execute outcome across the timeout wrapper.
+type execResult struct {
+	res any
+	err error
+}
+
+// callExec bounds exec.Execute with a timeout/abandonment wrapper: the RPC
+// runs in a child goroutine while the caller waits on ctx (the request
+// context) and an internal timer. On expiry/cancel it returns a ctx.Err()-class
+// failure and the admitted reservation stays billed (the dispatch was
+// admitted). The running Execute is NOT cancelled — the wrapper abandons the
+// child goroutine (executor takes no context; internal/odoo is frozen for
+// this slice), so a hung backend leaks one goroutine until it returns. Slot
+// freed via defer; repeated timeouts accumulate leaks (no reaper).
+func (b *Broker) callExec(ctx context.Context, exec executor, model, method string, args []any, kwargs map[string]any) (any, error) {
+	if exec == nil {
+		return nil, errors.New("broker not serving")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := b.rpcTimeoutOf()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan execResult, 1)
+	go func() {
+		res, err := exec.Execute(model, method, args, kwargs)
+		select {
+		case done <- execResult{res, err}:
+		case <-ctx.Done():
+		}
+	}()
+	select {
+	case out := <-done:
+		return out.res, out.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// errBrokerNotServing reports a missing executor (nil until Serve builds it).
+var errBrokerNotServing = errors.New("broker not serving")
+
+// dispatchExec is the single admitted-dispatch path for RPC handlers: it
+// takes one in-flight slot (deny 429 when saturated), runs callExec with
+// the request context, and frees the slot. Reserved rows are owned by the
+// caller: on semaphore denial the caller rolls back via releaseReserve
+// (no RPC ran); on dispatch (success or failure) the reservation stays
+// billed and the slot frees.
+func (b *Broker) dispatchExec(r *http.Request, model, method string, args []any, kwargs map[string]any) (any, error) {
+	exec := b.execOf()
+	if exec == nil {
+		return nil, errBrokerNotServing
+	}
+	if !b.tryAcquireInflight() {
+		return nil, ErrSessionBudget
+	}
+	defer b.releaseInflight()
+	var ctx context.Context
+	if r != nil {
+		ctx = r.Context()
+	}
+	return b.callExec(ctx, exec, model, method, args, kwargs)
+}
 
 // Session is a minted model credential. The token is returned once at
 // Grant time; it is never listed again (status exposes counts/expiry only).
@@ -92,6 +242,20 @@ type Broker struct {
 	paths    ServingPaths
 	sessions map[string]*sess
 
+	// inflight bounds concurrent admitted RPC dispatches (ModelMux
+	// half of the budget story). The semaphore capacity derives from
+	// Policy.Budgets at New time (see inflightLimit); requests beyond it
+	// deny with 429 instead of queueing unboundedly. Tests may replace
+	// the channel via setInflightForTest.
+	inflight chan struct{}
+	// rpcTimeout bounds one admitted Execute call. exec.Execute has no
+	// context parameter (internal/odoo is frozen for this slice), so the
+	// broker enforces the bound with a context-aware wrapper inside this
+	// package (callExec): the RPC runs in a child goroutine and the
+	// wrapper returns ctx.Err() on expiry. An HTTP WriteTimeout alone is
+	// insufficient: it bounds the response write, not the upstream call.
+	rpcTimeout time.Duration
+
 	authz     authorizer
 	exec      executor
 	frag      func(policy.ModelRule, policy.CompanyScope) ([]any, bool)
@@ -128,15 +292,17 @@ func New(p *policy.Policy, inst *config.Instance, snap snapshot.Snapshot, paths 
 		sp = paths[0]
 	}
 	return &Broker{
-		pol:       p,
-		inst:      inst,
-		snap:      snap,
-		paths:     sp,
-		sessions:  map[string]*sess{},
-		authz:     policyGate{p: p},
-		frag:      policy.CompanyDomain,
-		buildExec: realBuildExec,
-		resolve:   config.Resolve,
+		pol:        p,
+		inst:       inst,
+		snap:       snap,
+		paths:      sp,
+		sessions:   map[string]*sess{},
+		inflight:   make(chan struct{}, inflightLimit(p)),
+		rpcTimeout: rpcTimeoutFor(p),
+		authz:      policyGate{p: p},
+		frag:       policy.CompanyDomain,
+		buildExec:  realBuildExec,
+		resolve:    config.Resolve,
 	}, nil
 }
 
@@ -146,6 +312,17 @@ func (b *Broker) SetAdminSocket(path string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.adminSock = path
+}
+
+// SetWorkspaceForTest injects an os.Root-confined workspace for in-process
+// protocol tests (mcpadapter, broker tests) exercising workspace ops
+// against the real mux via ModelMuxForTest with AllowWorkspace. Tests own
+// the workspace lifetime (Open/Close); Serve overwrites it. Nil clears it
+// (workspace unavailable denial).
+func (b *Broker) SetWorkspaceForTest(ws *workspace.Workspace) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ws = ws
 }
 
 // ModelMuxForTest exposes the loopback model mux for in-process protocol

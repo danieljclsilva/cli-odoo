@@ -14,8 +14,9 @@
 //
 // Field-projection invariant: search/read require a non-empty explicit
 // projection (omitted, nil, or empty Fields deny; there is no default-all).
-// Every entry must normalize, must not be a wildcard, and dotted entries
-// resolve via the same policy-gated traversal check as domains. Odoo
+// Every entry must normalize, must not be a wildcard, and must be
+// single-segment: dotted entries deny unconditionally (minimum safe choice;
+// no separately reviewed scoped traversal implementation exists). Odoo
 // implicitly returns `id` on search_read even when unrequested; the broker
 // sends exactly the authorized list and MUST append `id` if absent (see
 // EnsureID). Authorize therefore accepts projections lacking `id` as

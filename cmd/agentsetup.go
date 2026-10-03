@@ -932,65 +932,28 @@ MethodManifest in the snapshot is informational only, never executable.`,
 				output.Fail(tool, err)
 				return
 			}
-			if err := agentSetupEnsureParent(snapshotPath); err != nil {
-				output.Fail(tool, err)
-				return
-			}
-			if int64(len(mustJSONSetup(snap))) > agentSetupMaxSnapshotBytes {
-				output.Fail(tool, fmt.Errorf("built snapshot exceeds cap %d", agentSetupMaxSnapshotBytes))
-				return
-			}
-			if err := snapshot.Write(snapshotPath, snap); err != nil {
-				output.Fail(tool, err)
-				return
-			}
-			// written: the broker recomputes CanonicalDigest at serve time
-			// and refuses a swapped snapshot.
-			digest, err := snapshot.CanonicalDigest(snap)
-			if err != nil {
-				output.Fail(tool, err)
-				return
-			}
-			pol.SnapshotSHA256 = digest
-			if err := pol.Validate(); err != nil {
-				output.Fail(tool, fmt.Errorf("sealing invalid policy: %w", err))
-				return
-			}
-
-			policyJSON, err := json.Marshal(pol)
-			if err != nil {
-				output.Fail(tool, fmt.Errorf("encoding policy: %w", err))
-				return
-			}
-			if int64(len(policyJSON)) > agentSetupMaxProfileBytes {
-				output.Fail(tool, fmt.Errorf("sealed policy %d bytes exceeds cap %d", len(policyJSON), agentSetupMaxProfileBytes))
-				return
-			}
 			// New password seals the replacement (the overwrite guard
 			// above already verified the current one, unless --reset
-			// recovery applied).
+			// recovery applied). The password is collected BEFORE any
+			// snapshot/profile mutation so cancel/error leaves the prior
+			// working pair untouched.
 			_ = resetRecovery
 			adminPassword, err := agentSetupAdminPassword(adminStdin, true)
 			if err != nil {
 				output.Fail(tool, err)
 				return
 			}
-			prof, err := lock.Seal(policyJSON, adminPassword)
+			// Stage ALL validation + new-password Seal in memory first;
+			// commit the snapshot+profile pair together or roll back.
+			bundle, err := agentSetupStageSealedBundle(profilePath, snapshotPath, adminPassword, pol, snap)
 			if err != nil {
 				output.Fail(tool, err)
 				return
 			}
-			profJSON, err := json.MarshalIndent(prof, "", "  ")
-			if err != nil {
-				output.Fail(tool, fmt.Errorf("encoding profile: %w", err))
-				return
-			}
-			if err := agentSetupEnsureParent(profilePath); err != nil {
+			// written pair: the broker recomputes CanonicalDigest at serve
+			// time and refuses a swapped snapshot.
+			if err := agentSetupCommitBundle(bundle); err != nil {
 				output.Fail(tool, err)
-				return
-			}
-			if err := agentSetupSecureReplace(profilePath, append(profJSON, '\n')); err != nil {
-				output.Fail(tool, fmt.Errorf("writing profile: %w", err))
 				return
 			}
 			modelNames := make([]string, 0, len(models))
@@ -1059,38 +1022,233 @@ rewritten without the admin password.`,
 	return c
 }
 
-// agentSnapshotReseal stamps the digest of snap into pol, validates,
-// re-seals under the already-verified admin password, and atomically
-// replaces the profile. Every seal/reseal path funnels here so the
-// snapshot_sha256 binding can never be forgotten.
-func agentSnapshotReseal(profilePath, adminPassword string, pol policy.Policy, snap snapshot.Snapshot) error {
+// agentSetupSealedBundle is the validated in-memory commit unit for every
+// human-locked mutation path (setup, snapshot refresh, import-catalog):
+// the candidate snapshot, the candidate policy bound to its digest, and the
+// exact bytes staged for each file. Nothing is built here touches disk.
+type agentSetupSealedBundle struct {
+	snap         snapshot.Snapshot
+	pol          policy.Policy
+	snapBytes    []byte
+	profBytes    []byte
+	snapshotPath string
+	profilePath  string
+}
+
+// agentSetupStageSealedBundle builds and validates the full candidate bundle
+// in memory BEFORE any snapshot/profile mutation: the snapshot must be
+// internally valid (scope, company metadata, approval hygiene), the digest
+// is recomputed and stamped into the candidate policy, the policy must
+// Validate, both payloads must sit under their byte caps, and the policy
+// payload is sealed with the NEW admin password (lock.Seal) while the old
+// files are still untouched. The returned bundle holds the exact bytes to
+// commit; commit happens only via agentSetupCommitBundle.
+func agentSetupStageSealedBundle(profilePath, snapshotPath, adminPassword string, pol policy.Policy, snap snapshot.Snapshot) (agentSetupSealedBundle, error) {
+	var out agentSetupSealedBundle
+	if strings.TrimSpace(profilePath) == "" || strings.TrimSpace(snapshotPath) == "" {
+		return out, fmt.Errorf("empty profile or snapshot path")
+	}
+	if adminPassword == "" {
+		return out, fmt.Errorf("empty admin password")
+	}
+	pol.SnapshotPath = snapshotPath
+	// Serve-time parity (broker Serve order, pre-credential subset): the
+	// snapshot scope must match the sealed scope exactly (ordered enabled
+	// set plus default, instance kept distinct from discovery), and every
+	// allowlisted model's company field must resolve through the candidate
+	// snapshot schema to a res.company many2one/many2many relation
+	// (policy.CompanyFieldValid). Staging denies here — before Seal and
+	// before any file mutation — so an invalid bundle can never commit.
+	if snap.Instance != pol.Instance {
+		return out, fmt.Errorf("snapshot instance %q != policy instance %q", snap.Instance, pol.Instance)
+	}
+	if snap.DefaultCompany != pol.Scope.Default {
+		return out, fmt.Errorf("snapshot default company %d != policy default %d", snap.DefaultCompany, pol.Scope.Default)
+	}
+	if len(snap.EnabledCompanies) != len(pol.Scope.Enabled) {
+		return out, fmt.Errorf("snapshot enabled companies %v != policy scope %v", snap.EnabledCompanies, pol.Scope.Enabled)
+	}
+	for i, id := range snap.EnabledCompanies {
+		if id != pol.Scope.Enabled[i] {
+			return out, fmt.Errorf("snapshot enabled companies %v != policy scope %v", snap.EnabledCompanies, pol.Scope.Enabled)
+		}
+	}
+	for name := range pol.Models {
+		if _, ok := policy.NormalizeName(name); !ok {
+			return out, fmt.Errorf("bad model name %q", name)
+		}
+		if err := pol.CompanyFieldValid(snap, name); err != nil {
+			return out, fmt.Errorf("sealing invalid company field: %w", err)
+		}
+	}
 	digest, err := snapshot.CanonicalDigest(snap)
 	if err != nil {
-		return err
+		return out, err
 	}
 	pol.SnapshotSHA256 = digest
 	if err := pol.Validate(); err != nil {
-		return fmt.Errorf("resealing invalid policy: %w", err)
+		return out, fmt.Errorf("sealing invalid policy: %w", err)
+	}
+	snapBytes, err := snapshot.MarshalFile(snap)
+	if err != nil {
+		return out, err
+	}
+	if int64(len(snapBytes)) > agentSetupMaxSnapshotBytes {
+		return out, fmt.Errorf("snapshot %d bytes exceeds cap %d", len(snapBytes), agentSetupMaxSnapshotBytes)
 	}
 	policyJSON, err := json.Marshal(pol)
 	if err != nil {
-		return fmt.Errorf("encoding policy: %w", err)
+		return out, fmt.Errorf("encoding policy: %w", err)
 	}
 	if int64(len(policyJSON)) > agentSetupMaxProfileBytes {
-		return fmt.Errorf("sealed policy %d bytes exceeds cap %d", len(policyJSON), agentSetupMaxProfileBytes)
+		return out, fmt.Errorf("sealed policy %d bytes exceeds cap %d", len(policyJSON), agentSetupMaxProfileBytes)
 	}
 	prof, err := lock.Seal(policyJSON, adminPassword)
 	if err != nil {
-		return err
+		return out, err
 	}
 	profJSON, err := json.MarshalIndent(prof, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encoding profile: %w", err)
+		return out, fmt.Errorf("encoding profile: %w", err)
+	}
+	profJSON = append(profJSON, '\n')
+	if int64(len(profJSON)) > agentSetupMaxProfileBytes {
+		return out, fmt.Errorf("sealed profile %d bytes exceeds cap %d", len(profJSON), agentSetupMaxProfileBytes)
+	}
+	out = agentSetupSealedBundle{
+		snap: snap, pol: pol,
+		snapBytes: snapBytes, profBytes: profJSON,
+		snapshotPath: snapshotPath, profilePath: profilePath,
+	}
+	return out, nil
+}
+
+// agentSetupCommitBundle writes the staged bundle while preserving the prior
+// working pair: both existing files are read first (missing = first setup,
+// nothing to restore), parents are ensured, then the snapshot and the
+// profile are each replaced via the O_EXCL-temp + fsync + rename path (no
+// WriteFile symlink sink). If the profile commit fails after the snapshot
+// was replaced, the prior snapshot bytes are restored before returning, so
+// cancel/error never leaves a half-committed pair (new snapshot bound to an
+// old profile, or vice versa). The seal (validation + new-password Seal)
+// already happened in agentSetupStageSealedBundle.
+func agentSetupCommitBundle(b agentSetupSealedBundle) error {
+	var priorSnap, priorProf []byte
+	var haveSnap, haveProf bool
+	if cur, err := os.ReadFile(b.snapshotPath); err == nil {
+		priorSnap = append([]byte(nil), cur...)
+		haveSnap = true
+	}
+	if cur, err := os.ReadFile(b.profilePath); err == nil {
+		priorProf = append([]byte(nil), cur...)
+		haveProf = true
+	}
+	restore := func() error {
+		var errs []string
+		if haveSnap {
+			if err := snapshot.WriteBytes(b.snapshotPath, priorSnap); err != nil {
+				errs = append(errs, "restore snapshot: "+err.Error())
+			}
+		} else {
+			if err := os.Remove(b.snapshotPath); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, "remove partial snapshot: "+err.Error())
+			}
+		}
+		if haveProf {
+			if err := agentSetupSecureReplace(b.profilePath, priorProf); err != nil {
+				errs = append(errs, "restore profile: "+err.Error())
+			}
+		} else {
+			if err := os.Remove(b.profilePath); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, "remove partial profile: "+err.Error())
+			}
+		}
+		if len(errs) > 0 {
+			return fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
+		return nil
+	}
+	if err := agentSetupEnsureParent(b.snapshotPath); err != nil {
+		return err
+	}
+	if err := agentSetupEnsureParent(b.profilePath); err != nil {
+		return err
+	}
+	if err := snapshot.WriteBytes(b.snapshotPath, b.snapBytes); err != nil {
+		if rerr := restore(); rerr != nil {
+			return fmt.Errorf("writing snapshot: %v (rollback: %v)", err, rerr)
+		}
+		return err
+	}
+	if err := agentSetupSecureReplace(b.profilePath, b.profBytes); err != nil {
+		if rerr := restore(); rerr != nil {
+			return fmt.Errorf("writing profile: %v (rollback: %v)", err, rerr)
+		}
+		return fmt.Errorf("writing profile: %w", err)
+	}
+	return nil
+}
+
+// agentSetupApplyCatalogPolicy folds transcribed catalog metadata into a copy
+// of the sealed policy WITHOUT widening it: catalog-only models stay out of
+// the allowlist (quarantined as discoverable), existing models keep the
+// intersection of transcribed vs already-approved fields, and the
+// company/shared permission flags plus the enabled set/default are preserved
+// verbatim from the sealed policy (catalog scope fields never apply). The
+// sealed per-model IncludeCompanyless flag is preserved as-is: catalog
+// metadata alone never opts a model in. Any attempt to widen (new model, new
+// field, new companyless opt-in, scope/default/shared drift) is ignored here
+// so the bundle validator, not the importer, has final say.
+func agentSetupApplyCatalogPolicy(pol policy.Policy, snap snapshot.Snapshot) policy.Policy {
+	out := pol
+	out.Scope = pol.Scope
+	out.SharedRecords = pol.SharedRecords
+	out.Models = make(map[string]policy.ModelRule, len(pol.Models))
+	for name, rule := range pol.Models {
+		meta, ok := snap.Models[name]
+		if !ok {
+			out.Models[name] = rule
+			continue
+		}
+		approved := make(map[string]bool, len(rule.Fields))
+		for _, f := range rule.Fields {
+			approved[f] = true
+		}
+		kept := make([]string, 0, len(rule.Fields))
+		for fname := range meta.Fields {
+			if approved[fname] {
+				kept = append(kept, fname)
+			}
+		}
+		sort.Strings(kept)
+		rule.Fields = kept
+		out.Models[name] = rule
+	}
+	return out
+}
+
+// agentSnapshotReseal stamps the digest of snap into pol, validates,
+// re-seals under the already-verified admin password, and atomically
+// replaces the profile. It stages the sealed profile bytes first (validation
+// + Seal before mutation) and commits only the profile file. Its only
+// production-adjacent caller is its unit test; setup/refresh/import-catalog
+// inline stage+commit directly (agentSetupStageSealedBundle +
+// agentSetupCommitBundle) and never call reseal. Every seal path funnels
+// through agentSetupStageSealedBundle so the snapshot_sha256 binding can
+// never be forgotten.
+func agentSnapshotReseal(profilePath, adminPassword string, pol policy.Policy, snap snapshot.Snapshot) error {
+	snapPath := pol.SnapshotPath
+	if strings.TrimSpace(snapPath) == "" {
+		snapPath = DefaultAgentSnapshotPath()
+	}
+	bundle, err := agentSetupStageSealedBundle(profilePath, snapPath, adminPassword, pol, snap)
+	if err != nil {
+		return err
 	}
 	if err := agentSetupEnsureParent(profilePath); err != nil {
 		return err
 	}
-	if err := agentSetupSecureReplace(profilePath, append(profJSON, '\n')); err != nil {
+	if err := agentSetupSecureReplace(profilePath, bundle.profBytes); err != nil {
 		return fmt.Errorf("writing profile: %w", err)
 	}
 	return nil
@@ -1167,12 +1325,16 @@ func newAgentSnapshotRefreshCmd() *cobra.Command {
 				output.Fail(tool, err)
 				return
 			}
-			if err := agentSnapshotBoundedWrite(snapshotPath, snap); err != nil {
+			// Stage ALL validation + Seal BEFORE any mutation; commit the
+			// snapshot+profile pair together or roll back to the prior
+			// working pair. The admin password was already verified (unlock
+			// above) and reseals under it.
+			bundle, err := agentSetupStageSealedBundle(profilePath, snapshotPath, adminPassword, pol, snap)
+			if err != nil {
 				output.Fail(tool, err)
 				return
 			}
-			pol.SnapshotPath = snapshotPath
-			if err := agentSnapshotReseal(profilePath, adminPassword, pol, snap); err != nil {
+			if err := agentSetupCommitBundle(bundle); err != nil {
 				output.Fail(tool, err)
 				return
 			}
@@ -1238,44 +1400,21 @@ unlock); the sealed policy is never rewritten without it.`,
 			if strings.TrimSpace(snapshotPath) == "" {
 				snapshotPath = DefaultAgentSnapshotPath()
 			}
-			if err := agentSnapshotBoundedWrite(snapshotPath, snap); err != nil {
+			// Never widen from metadata: preserve the sealed company/shared
+			// flags and the enabled set/default verbatim; intersect fields.
+			// Catalog-only models stay out of the allowlist (quarantined as
+			// discoverable); the sealed per-model IncludeCompanyless flag is
+			// preserved as-is (metadata alone never opts in).
+			candidate := agentSetupApplyCatalogPolicy(pol, snap)
+			// Stage ALL validation + Seal BEFORE any mutation; commit the
+			// snapshot+profile pair together or roll back to the prior
+			// working pair.
+			bundle, err := agentSetupStageSealedBundle(profilePath, snapshotPath, adminPassword, candidate, snap)
+			if err != nil {
 				output.Fail(tool, err)
 				return
 			}
-			pol.SnapshotPath = snapshotPath
-			for name, meta := range snap.Models {
-				fields := make([]string, 0, len(meta.Fields))
-				for fname := range meta.Fields {
-					fields = append(fields, fname)
-				}
-				sort.Strings(fields)
-				rule, ok := pol.Models[name]
-				if !ok {
-					// Catalog-only models are quarantined: recorded in the
-					// snapshot as discoverable, never inserted into the sealed
-					// allowlist, so they stay denied to read/call until a
-					// human explicitly approves them via setup/refresh.
-					continue
-				}
-				// Existing models: intersect transcribed fields with the
-				// already-approved set — import never widens the allowlist.
-				approved := make(map[string]bool, len(rule.Fields))
-				for _, f := range rule.Fields {
-					approved[f] = true
-				}
-				kept := make([]string, 0, len(fields))
-				for _, f := range fields {
-					if approved[f] {
-						kept = append(kept, f)
-					}
-				}
-				rule.Fields = kept
-				if meta.IncludeCompanyless {
-					rule.IncludeCompanyless = true
-				}
-				pol.Models[name] = rule
-			}
-			if err := agentSnapshotReseal(profilePath, adminPassword, pol, snap); err != nil {
+			if err := agentSetupCommitBundle(bundle); err != nil {
 				output.Fail(tool, err)
 				return
 			}

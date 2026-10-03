@@ -164,16 +164,17 @@ func (p *Policy) Validate() error {
 //  4. Field projection: search/read require a non-empty explicit
 //     projection (omitted, nil, or empty Fields deny — there is no
 //     default-all-fields). Every entry must normalize, must not contain
-//     a wildcard, and dotted entries resolve via checkPath (root
-//     allowlisted, intermediates relational, terminal explicitly
-//     approved on an enforceable target). Single `id` is structural and
+//     a wildcard, and must be single-segment: any dotted entry denies
+//     under the minimum safe choice (no separately reviewed scoped
+//     traversal implementation exists). Single `id` is structural and
 //     always permitted; a projection lacking `id` is a legitimate exact
 //     projection — the broker appends `id` (see EnsureID) because Odoo
 //     implicitly returns it on search_read.
-//  5. Every field referenced in Domain, Order, and GroupBy must resolve
-//     (dot-paths via checkPath with the same traversal rules).
-//     Malformed domain/order shapes — including unknown operators and
-//     unbounded operands — deny.
+//  5. Every field referenced in Domain, Order, and GroupBy must be
+//     single-segment and allowlisted (dotted references deny as above).
+//     Malformed domain/order shapes — including unknown operators,
+//     hierarchy operators (child_of, parent_of), and unbounded operands —
+//     deny.
 //  6. Limit/Offset must sit within budgets. Over-max DENIES — it never
 //     clamps, because clamping would silently return a narrower slice
 //     than the caller asked for and mask budget bypasses. Row-returning
@@ -326,11 +327,15 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 // validDomainOp reports whether op is a known Odoo domain operator in the
 // strict allowlist. Unknown operators deny rather than pass through to the
 // server, so a mistyped or server-specific operator can never widen a query.
+// Hierarchy operators (child_of, parent_of) are deliberately absent: they
+// authorize server-side hierarchy traversal and deny unconditionally under
+// the minimum safe choice (no separately reviewed scoped implementation
+// exists).
 func validDomainOp(op string) bool {
 	switch op {
 	case "=", "!=", ">", "<", ">=", "<=",
 		"in", "not in", "like", "ilike",
-		"=like", "=ilike", "child_of", "parent_of":
+		"=like", "=ilike":
 		return true
 	default:
 		return false
@@ -475,32 +480,14 @@ func checkOrder(p *Policy, allowed map[string]bool, schema SchemaView, model, or
 	return true
 }
 
-// targetEnforceable reports whether a traversal target model's rule carries
-// its own enforceable company scope: human-reviewed independent under
-// allow-classified with no company field, or a scoped rule with a usable
-// CompanyField. Anything else (contradictory, fieldless scoped) denies the
-// traversal.
-func targetEnforceable(p *Policy, rule ModelRule) bool {
-	if rule.CompanyIndependent {
-		return p.SharedRecords == SharedAllowClassified && rule.CompanyField == ""
-	}
-	_, ok := NormalizeName(rule.CompanyField)
-	return ok
-}
-
-// checkPath resolves one field reference. Single-segment names must
-// normalize and sit in the rule allowlist. Dotted paths (e.g.
-// "partner_id.name") default DENY and are allowed only when the full path
-// is explicitly approved: the root sits in the requesting model's rule,
-// every intermediate segment resolves through SchemaView to a relational
-// field (Relation != ""), the terminal field exists on the target model AND
-// is explicitly listed in the target model's Policy.Models entry
-// (structural `id` is exempt from both terminal checks), and the target
-// rule is itself enforceable via targetEnforceable. Schema existence alone
-// never approves: a terminal present in the schema but absent from the
-// target rule, or a target model absent from the policy, denies. Unknown
-// models, missing fields, non-relational intermediates, missing schemas,
-// and missing policies all deny.
+// checkPath resolves one single-segment field reference against the
+// requesting model's allowlist. Dotted paths (e.g. "partner_id.name") are
+// unconditionally denied under the minimum safe choice: cross-model
+// references (domain, order, group-by, projection, aggregate) deny unless a
+// separately reviewed complete scoped implementation exists. Discovery
+// relationships (schema metadata, snapshot field relations) stay readable
+// for display, but never authorize traversal. Single-segment names must
+// normalize and sit in the rule allowlist; anything else denies.
 func checkPath(p *Policy, allowed map[string]bool, schema SchemaView, model, path string) bool {
 	raw := strings.Split(strings.TrimSpace(path), ".")
 	segs := make([]string, 0, len(raw))
@@ -514,52 +501,8 @@ func checkPath(p *Policy, allowed map[string]bool, schema SchemaView, model, pat
 	if len(segs) == 0 {
 		return false
 	}
-	if !allowed[segs[0]] {
+	if len(segs) != 1 {
 		return false
 	}
-	if len(segs) == 1 {
-		return true
-	}
-	if p == nil || schema == nil {
-		return false
-	}
-	cur, ok := schema.Model(model)
-	if !ok {
-		return false
-	}
-	target := ""
-	for _, s := range segs[:len(segs)-1] {
-		fm, ok := cur.Field(s)
-		if !ok || fm.Relation == "" {
-			return false
-		}
-		target = fm.Relation
-		cur, ok = schema.Model(fm.Relation)
-		if !ok {
-			return false
-		}
-	}
-	terminal := segs[len(segs)-1]
-	if terminal != "id" {
-		if _, ok := cur.Field(terminal); !ok {
-			return false
-		}
-	}
-	targetRule, ok := p.Models[target]
-	if !ok {
-		return false
-	}
-	if terminal != "id" {
-		found := false
-		for _, f := range targetRule.Fields {
-			if nf, ok := NormalizeName(f); ok && nf == terminal {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return targetEnforceable(p, targetRule)
+	return allowed[segs[0]]
 }
