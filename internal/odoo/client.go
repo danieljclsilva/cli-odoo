@@ -14,9 +14,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -90,7 +92,7 @@ func isValidModelName(model string) bool {
 // Only loopback ever defaults to cleartext HTTP; every other bare host
 // defaults to HTTPS (see normalizeURL).
 func isLoopbackHost(host string) bool {
-	h := strings.ToLower(strings.TrimSpace(host))
+	h := strings.TrimSpace(host)
 	// Strip an optional :port suffix, including bracketed IPv6 "[::1]:8069".
 	if strings.HasPrefix(h, "[") {
 		if i := strings.Index(h, "]:"); i >= 0 {
@@ -101,8 +103,66 @@ func isLoopbackHost(host string) bool {
 			h = h[:i]
 		}
 	}
-	return h == "localhost" || strings.HasPrefix(h, "127.") ||
-		h == "::1" || h == "[::1]"
+	// Exact hostname match only: a remote DNS name that merely starts
+	// with "127." (e.g. 127.erp.example.com) must NOT count as loopback.
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	addrStr := h
+	if strings.HasPrefix(addrStr, "[") && strings.HasSuffix(addrStr, "]") {
+		addrStr = addrStr[1 : len(addrStr)-1]
+	}
+	// Real IP-literal test: 127.0.0.0/8, ::1, and IPv4-in-IPv6 forms.
+	if addr, err := netip.ParseAddr(addrStr); err == nil {
+		return addr.WithZone("").Unmap().IsLoopback()
+	}
+	// netip.ParseAddr is strict dotted-quad; resolvers also accept
+	// inet_aton shorthand (e.g. "127.1" == 127.0.0.1), so expand those.
+	return isIPv4LoopbackShorthand(addrStr)
+}
+
+// isIPv4LoopbackShorthand reports whether s is a numeric dotted IPv4
+// literal in inet_aton shorthand (1-4 parts) falling in 127.0.0.0/8.
+// Anything malformed (empty parts, non-digits, out-of-range parts,
+// ambiguous leading zeros) returns false so the caller fails closed to
+// HTTPS.
+func isIPv4LoopbackShorthand(s string) bool {
+	if s == "" || strings.Contains(s, ":") {
+		return false
+	}
+	parts := strings.Split(s, ".")
+	n := len(parts)
+	if n > 4 {
+		return false
+	}
+	var v uint32
+	for i, p := range parts {
+		if p == "" {
+			return false
+		}
+		// Reject leading zeros: resolvers may read them as octal while
+		// we parse decimal, so refuse rather than misclassify.
+		if len(p) > 1 && strings.HasPrefix(p, "0") {
+			return false
+		}
+		for j := range p {
+			if p[j] < '0' || p[j] > '9' {
+				return false
+			}
+		}
+		width := 8
+		shift := 24 - 8*i
+		if i == n-1 {
+			width = 32 - 8*(n-1)
+			shift = 0
+		}
+		num, err := strconv.ParseUint(p, 10, width)
+		if err != nil {
+			return false
+		}
+		v |= uint32(num) << shift
+	}
+	return v>>24 == 127
 }
 
 // warnCleartextHTTP warns when credentials are about to be sent over an
@@ -117,6 +177,75 @@ func warnCleartextHTTP(base string) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "warning: Odoo URL %q uses cleartext HTTP; credentials are sent unencrypted (use https)\n", base)
+}
+
+// originKey identifies the exact configured Odoo origin (scheme, host,
+// port) with equivalent representations normalized: letter case, default
+// ports, IPv6 brackets, and trailing dots compare equal.
+type originKey struct {
+	scheme string
+	host   string
+	port   string
+}
+
+// originOf normalizes u for origin comparison. An empty port maps to the
+// scheme default so https://host and https://host:443 are one origin.
+func originOf(u *url.URL) originKey {
+	if u == nil {
+		return originKey{}
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return originKey{scheme: scheme, host: host, port: port}
+}
+
+// checkRedirectToOrigin is the CheckRedirect policy for credential-bearing
+// requests: same-origin redirects are followed (up to Go's default limit of
+// 10 hops), anything else (cross-host, cross-port, or scheme downgrade) is
+// refused before credentials move.
+func checkRedirectToOrigin(origin originKey) func(req *http.Request, via []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return nil
+		}
+		if originOf(req.URL) != origin {
+			return fmt.Errorf("odoo: refusing redirect to %q: cross-origin redirects are blocked to protect credentials", req.URL.Redacted())
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+}
+
+// originGuardRoundTripper is the shared redirect boundary for both
+// transports. kolo/xmlrpc builds its own http.Client (default redirect
+// policy) around the RoundTripper it is given, so origin enforcement here
+// is what protects XML-RPC authenticate/execute_kw; the json2 client
+// shares the same guard as its Transport plus checkRedirectToOrigin.
+type originGuardRoundTripper struct {
+	rt     http.RoundTripper
+	origin originKey
+}
+
+func (g originGuardRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	if originOf(r.URL) != g.origin {
+		return nil, fmt.Errorf("odoo: refusing request to %q: off-origin requests are blocked to protect credentials", r.URL.Redacted())
+	}
+	rt := g.rt
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	return rt.RoundTrip(r)
 }
 
 // New connects to inst and validates credentials.
@@ -161,6 +290,17 @@ func New(inst *config.Instance) (*Client, error) {
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: !inst.VerifySSL}, //nolint:gosec // user-opt-in via verify_ssl=false
 	}
 
+	// Shared credential-redirect boundary: the exact configured origin.
+	// Both transports enforce it — c.http via Transport+CheckRedirect,
+	// the xmlrpc-owned client via the wrapped RoundTripper (it builds its
+	// own http.Client with the default redirect policy).
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return nil, errors.New("odoo: invalid URL (set ODOO_URL)")
+	}
+	origin := originOf(baseURL)
+	redirectGuard := originGuardRoundTripper{rt: baseTransport, origin: origin}
+
 	c := &Client{
 		URL:       base,
 		DB:        inst.DB,
@@ -173,8 +313,9 @@ func New(inst *config.Instance) (*Client, error) {
 		Lang:      inst.Lang,
 		secret:    secret,
 		http: &http.Client{
-			Timeout:   timeout,
-			Transport: baseTransport,
+			Timeout:       timeout,
+			Transport:     redirectGuard,
+			CheckRedirect: checkRedirectToOrigin(origin),
 		},
 	}
 
@@ -186,7 +327,7 @@ func New(inst *config.Instance) (*Client, error) {
 		return c, nil
 	}
 
-	rt := timeoutRoundTripper{rt: baseTransport, d: timeout}
+	rt := timeoutRoundTripper{rt: redirectGuard, d: timeout}
 	common, err := xmlrpc.NewClient(base+"/xmlrpc/2/common", rt)
 	if err != nil {
 		return nil, c.sanitizeErr(fmt.Errorf("odoo: dial common endpoint: %w", err))

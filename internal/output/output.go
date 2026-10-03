@@ -139,7 +139,11 @@ func toRows(v any) [][]string {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	rows := [][]string{keys}
+	display := make([]string, len(keys))
+	for i, k := range keys {
+		display[i] = sanitizeTableCell(k)
+	}
+	rows := [][]string{display}
 	for _, item := range list {
 		m, ok := item.(map[string]any)
 		if !ok {
@@ -147,11 +151,47 @@ func toRows(v any) [][]string {
 		}
 		row := make([]string, len(keys))
 		for i, k := range keys {
-			row[i] = stringify(m[k])
+			row[i] = sanitizeTableCell(stringify(m[k]))
 		}
 		rows = append(rows, row)
 	}
 	return rows
+}
+
+// sanitizeTableCell escapes terminal control characters in table headers
+// and cells. Odoo strings reach the terminal raw here (JSON/YAML paths
+// escape via their encoders instead), so C0 controls (including ESC and
+// CR, which enable terminal display manipulation such as clipboard
+// alteration and line spoofing), DEL, and C1 controls render as printable
+// escapes. Ordinary Unicode is untouched. Output is control-free, so
+// re-rendering sanitized text cannot reintroduce controls.
+func sanitizeTableCell(s string) string {
+	if strings.IndexFunc(s, isTableUnsafe) < 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02X`, r)
+		case r >= 0x80 && r <= 0x9f:
+			fmt.Fprintf(&b, `\u%04X`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func isTableUnsafe(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
 }
 
 func stringify(v any) string {

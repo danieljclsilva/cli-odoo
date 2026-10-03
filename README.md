@@ -24,7 +24,7 @@ The CLI is read-only: no write request is ever sent.
 brew install danieljclsilva/tap/cli-odoo
 
 # Or download a release binary from GitHub Releases and put it on PATH.
-# Or build from source (Go 1.24+):
+# Or build from source (Go 1.25+):
 go build -o odoo .
 ```
 
@@ -104,6 +104,46 @@ one.
 
 Server-side, still give the Odoo user least-privilege access rights /
 record rules: the CLI guarantee is defense in depth, not the only boundary.
+
+## Notes for model/agent operators
+
+"Read-only" above refers to Odoo method names: the CLI never sends a write
+RPC. It does not mean the tool is side-effect free on the operator host:
+`login`/`logout` write the OS keychain, and `attachment-get` writes the
+downloaded file to `--out`. Keychain storage keeps the secret out of the
+config file and env, but it is not isolation from the general shell: any
+process running as the same OS user can invoke the CLI with the same
+access, and whether another same-user process can read the keychain entry
+itself depends on OS/platform policy and keychain ACLs. Custom Odoo server
+modules are outside this guarantee too — a server-side override behind a
+read-named method could do anything; the CLI cannot verify server purity.
+
+Treat all returned record text and attachment bytes as untrusted data:
+render accordingly (table output escapes terminal control characters) and
+never execute or re-post it blindly.
+
+Restricted launcher guidance — invocation-only sketch (not a launcher itself;
+adapt paths to your harness). The external harness must enforce an actual
+parsed-argv allowlist with pinned flags and exec without shell interpolation:
+the sketch below enforces nothing on its own.
+
+```bash
+# Invocation only: the external harness allowlists parsed argv (without shell
+# interpolation) and execs exactly this shape:
+#   - pinned --config /pinned/odoo.yaml and --instance prod
+#   - locked-down env (strip ODOO_* overrides except the pinned instance)
+#   - --format json (the agent contract)
+#   - only the read commands the task needs, with data/model/field/query
+#     budgets (row limits via --limit, explicit --fields lists)
+#   - deny login/logout, raw call, arbitrary --out paths, alternate --config
+odoo --config /pinned/odoo.yaml --instance prod --format json \
+  search sale.order --fields name,amount_total --limit 20
+```
+
+Pair this with a dedicated least-privilege Odoo user (access rights +
+record rules scoped to the models the agent may see). Server ACLs and
+custom addons are your deployment's responsibility — the CLI does not
+verify them.
 
 ## Multi-instance
 
