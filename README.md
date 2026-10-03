@@ -122,6 +122,14 @@ Treat all returned record text and attachment bytes as untrusted data:
 render accordingly (table output escapes terminal control characters) and
 never execute or re-post it blindly.
 
+Attachment downloads require a trusted destination directory and trusted
+ancestors, including any directory symlinks. Trusted symlinked directories
+(such as macOS `/tmp`) are supported. `--force` replaces the destination entry
+without writing through a raced final symlink or an existing hardlink. It does
+not isolate the temporary source from an attacker who can replace entries in
+that directory; use a private download directory or exclude downloads from the
+model's command allowlist.
+
 Restricted launcher guidance — invocation-only sketch (not a launcher itself;
 adapt paths to your harness). The external harness must enforce an actual
 parsed-argv allowlist with pinned flags and exec without shell interpolation:

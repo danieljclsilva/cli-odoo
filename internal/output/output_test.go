@@ -1,6 +1,10 @@
 package output
 
 import (
+	"encoding/json"
+	"gopkg.in/yaml.v3"
+	"io"
+	"os"
 	"strings"
 	"testing"
 )
@@ -55,5 +59,43 @@ func TestToRowsEscapesCellsAndHeaders(t *testing.T) {
 	}
 	if !strings.Contains(rows[0][0], `\x1B`) {
 		t.Errorf("header not escaped: %q", rows[0])
+	}
+}
+
+func TestPrintPreservesStructuredDataAndEscapesTable(t *testing.T) {
+	value := "Müller 北京 🙂\x1b]52;c;Zg==\x07\r\u0085"
+	for _, format := range []Format{JSON, YAML, Table} {
+		oldFormat, oldStdout := def, os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		def, os.Stdout = format, w
+		Ok("read_record", []any{map[string]any{"name": value}}, 1)
+		w.Close()
+		def, os.Stdout = oldFormat, oldStdout
+		encoded, err := io.ReadAll(r)
+		r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if format == Table {
+			if strings.ContainsAny(string(encoded), "\x1b\x07\r\u0085") || !strings.Contains(string(encoded), "北京 🙂") {
+				t.Fatalf("unsafe or corrupted table: %q", encoded)
+			}
+			continue
+		}
+		var got struct {
+			Success bool                `json:"success" yaml:"success"`
+			Result  []map[string]string `json:"result" yaml:"result"`
+		}
+		if format == JSON {
+			err = json.Unmarshal(encoded, &got)
+		} else {
+			err = yaml.Unmarshal(encoded, &got)
+		}
+		if err != nil || !got.Success || len(got.Result) != 1 || got.Result[0]["name"] != value {
+			t.Fatalf("format=%s changed payload: %q, err=%v", format, encoded, err)
+		}
 	}
 }

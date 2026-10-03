@@ -18,7 +18,7 @@ func TestIsLoopbackHost(t *testing.T) {
 		// Acceptance cases.
 		{"127.erp.example.com", false},
 		{"127.0.0.1", true},
-		{"127.1", true},
+		{"127.1", false},
 		{"[::1]", true},
 		{"localhost", true},
 		{"localhost:8069", true},
@@ -27,7 +27,7 @@ func TestIsLoopbackHost(t *testing.T) {
 		{"127.0.0.2", true},
 		{"127.255.255.255", true},
 		{"127.0.0.1:8069", true},
-		{"127.1:8069", true},
+		{"127.1:8069", false},
 		{"LOCALHOST", true},
 		{" Localhost ", true},
 		{"::1", true},
@@ -74,8 +74,15 @@ func TestNormalizeURLLoopbackVsRemote(t *testing.T) {
 	if got != "https://127.erp.example.com" {
 		t.Errorf("normalizeURL(127.erp.example.com) = %q, want https default", got)
 	}
+	for _, raw := range []string{"127.1", "127.1:8069", "2130706433", "127.0.1"} {
+		got, err := normalizeURL(raw)
+		if err != nil || !strings.HasPrefix(got, "https://") {
+			t.Fatalf("normalizeURL(%q)=%q, err=%v; shorthand must default to HTTPS", raw, got, err)
+		}
+	}
+
 	// True loopback still defaults to HTTP.
-	for _, raw := range []string{"127.0.0.1:8069", "localhost:8069", "127.1", "[::1]:8069"} {
+	for _, raw := range []string{"127.0.0.1:8069", "localhost:8069", "[::1]:8069"} {
 		got, err := normalizeURL(raw)
 		if err != nil {
 			t.Fatalf("normalizeURL(%q): %v", raw, err)

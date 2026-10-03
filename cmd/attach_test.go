@@ -114,7 +114,11 @@ func TestWriteAttachmentFileSymlinkRefused(t *testing.T) {
 func TestCommitAttachmentTempReplacesRacedSymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.bin")
-	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+	if err := os.WriteFile(target, []byte("secret"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(target)
+	if err != nil {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "out.bin")
@@ -144,6 +148,13 @@ func TestCommitAttachmentTempReplacesRacedSymlink(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(target); string(got) != "secret" {
 		t.Fatalf("link target overwritten through rename: %q", got)
+	}
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Mode() != before.Mode() {
+		t.Fatalf("target mode changed: %v -> %v", before.Mode(), after.Mode())
 	}
 	if fi, err := os.Lstat(out); err != nil {
 		t.Fatal(err)
@@ -244,7 +255,7 @@ func TestWriteAttachmentFileRefusesDirectory(t *testing.T) {
 	}
 }
 
-func TestWriteAttachmentFileRefusesSymlinkedParent(t *testing.T) {
+func TestWriteAttachmentFileTrustedSymlinkedParent(t *testing.T) {
 	for _, force := range []bool{false, true} {
 		dir := t.TempDir()
 		real := filepath.Join(dir, "real")
@@ -256,11 +267,64 @@ func TestWriteAttachmentFileRefusesSymlinkedParent(t *testing.T) {
 			t.Skipf("symlinks unavailable: %v", err)
 		}
 		out := filepath.Join(link, "a.bin")
-		if err := writeAttachmentFile(out, []byte("x"), force); err == nil {
-			t.Fatalf("force=%v: expected refusal through a symlinked parent dir", force)
+		if force {
+			if err := os.WriteFile(out, []byte("old"), 0o600); err != nil {
+				t.Fatal(err)
+			}
 		}
-		if _, err := os.Lstat(filepath.Join(real, "a.bin")); !os.IsNotExist(err) {
-			t.Fatalf("force=%v: nothing should have been written, lstat err = %v", force, err)
+		if err := writeAttachmentFile(out, []byte("x"), force); err != nil {
+			t.Fatalf("force=%v: trusted symlinked parent: %v", force, err)
 		}
+		if got, err := os.ReadFile(filepath.Join(real, "a.bin")); err != nil || string(got) != "x" {
+			t.Fatalf("force=%v: content=%q, err=%v", force, got, err)
+		}
+	}
+}
+
+// Source-entry substitution is outside the trusted-directory guarantee, but
+// the production commit must never chmod or write through the substituted link.
+func TestCommitAttachmentTempSourceSwapLeavesOutsideTargetUntouched(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "outside.bin")
+	if err := os.WriteFile(target, []byte("secret"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp, err := os.CreateTemp(dir, ".attachment-get-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tmp.Write([]byte("download")); err != nil {
+		tmp.Close()
+		t.Fatal(err)
+	}
+	if err := os.Remove(tmp.Name()); err != nil {
+		tmp.Close()
+		t.Skipf("open-file replacement unavailable: %v", err)
+	}
+	if err := os.Symlink(target, tmp.Name()); err != nil {
+		tmp.Close()
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	out := filepath.Join(dir, "out.bin")
+	if err := commitAttachmentTemp(tmp, out); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "secret" {
+		t.Fatalf("outside bytes=%q, err=%v", got, err)
+	}
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Mode() != before.Mode() {
+		t.Fatalf("outside mode changed: %v -> %v", before.Mode(), after.Mode())
+	}
+	// Demonstrate the documented limitation rather than claiming source isolation.
+	if fi, err := os.Lstat(out); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected substituted source link, info=%v, err=%v", fi, err)
 	}
 }

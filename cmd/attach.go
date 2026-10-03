@@ -107,28 +107,22 @@ func newAttachmentGetCmd() *cobra.Command {
 // pre-existing hardlink to the destination: linked copies keep the old
 // content, which is the safe direction.
 //
-// The guarantee is destination-entry safety only, not that --out always
-// ends up holding the downloaded bytes. The parent directory itself
-// remains trusted: it must already exist and must not itself be a
-// symlink (refused), but an attacker able to swap entries in the parent
-// could substitute the temp source file between its creation and the
-// rename, so --out could receive bytes other than the downloaded
-// attachment. There is no fully portable (macOS/Linux/Windows) way to
-// pin the parent without openat-style APIs, so callers must treat the
-// --out parent directory as trusted. The attachment metadata "name"
-// never influences the path.
+// The guarantee is destination-entry safety only. The parent directory and
+// its ancestors must be trusted against concurrent replacement, including
+// any symlinks in those paths. Trusted symlinked directories are supported.
+// An attacker able to replace the temp source entry could substitute bytes
+// or a symlink that is renamed into out. This helper does not provide complete
+// isolation from such an attacker. Attachment metadata never chooses the path.
 func writeAttachmentFile(out string, data []byte, force bool) error {
 	if strings.TrimSpace(out) == "" {
 		return fmt.Errorf("missing --out destination file path")
 	}
 	dir := filepath.Dir(out)
-	if di, err := os.Lstat(dir); err != nil {
+	if di, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("destination directory %q does not exist: %w", dir, err)
 		}
 		return err
-	} else if di.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("destination directory %q is a symlink (refusing to write through it)", dir)
 	} else if !di.IsDir() {
 		return fmt.Errorf("destination parent %q is not a directory", dir)
 	}
@@ -176,8 +170,8 @@ func writeAttachmentFile(out string, data []byte, force bool) error {
 // commitAttachmentTemp closes the held temp file (already 0600 from
 // os.CreateTemp) and renames it over out, removing the temp entry if
 // the close or the rename fails. The caller passes the still-open file
-// so no pathname-based lookup (and no chmod/stat gap) sits between the
-// write and the rename.
+// so no pathname-based chmod can change a substituted symlink target.
+// Rename still resolves the source entry; the parent-trust requirement applies.
 func commitAttachmentTemp(tmp *os.File, out string) error {
 	tmpName := tmp.Name()
 	if err := tmp.Close(); err != nil {

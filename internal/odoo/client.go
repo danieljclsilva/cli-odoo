@@ -18,7 +18,6 @@ import (
 	"net/url"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -116,53 +115,8 @@ func isLoopbackHost(host string) bool {
 	if addr, err := netip.ParseAddr(addrStr); err == nil {
 		return addr.WithZone("").Unmap().IsLoopback()
 	}
-	// netip.ParseAddr is strict dotted-quad; resolvers also accept
-	// inet_aton shorthand (e.g. "127.1" == 127.0.0.1), so expand those.
-	return isIPv4LoopbackShorthand(addrStr)
-}
-
-// isIPv4LoopbackShorthand reports whether s is a numeric dotted IPv4
-// literal in inet_aton shorthand (1-4 parts) falling in 127.0.0.0/8.
-// Anything malformed (empty parts, non-digits, out-of-range parts,
-// ambiguous leading zeros) returns false so the caller fails closed to
-// HTTPS.
-func isIPv4LoopbackShorthand(s string) bool {
-	if s == "" || strings.Contains(s, ":") {
-		return false
-	}
-	parts := strings.Split(s, ".")
-	n := len(parts)
-	if n > 4 {
-		return false
-	}
-	var v uint32
-	for i, p := range parts {
-		if p == "" {
-			return false
-		}
-		// Reject leading zeros: resolvers may read them as octal while
-		// we parse decimal, so refuse rather than misclassify.
-		if len(p) > 1 && strings.HasPrefix(p, "0") {
-			return false
-		}
-		for j := range p {
-			if p[j] < '0' || p[j] > '9' {
-				return false
-			}
-		}
-		width := 8
-		shift := 24 - 8*i
-		if i == n-1 {
-			width = 32 - 8*(n-1)
-			shift = 0
-		}
-		num, err := strconv.ParseUint(p, 10, width)
-		if err != nil {
-			return false
-		}
-		v |= uint32(num) << shift
-	}
-	return v>>24 == 127
+	// Resolver-dependent shorthand is not a parsed IP literal: fail closed.
+	return false
 }
 
 // warnCleartextHTTP warns when credentials are about to be sent over an
