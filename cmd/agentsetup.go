@@ -1074,13 +1074,15 @@ func agentSetupStageSealedBundle(profilePath, snapshotPath, adminPassword string
 	if err := agentSetupVerifyBundlePaths(profilePath, snapshotPath, pol.WorkspaceDir); err != nil {
 		return out, err
 	}
-	// Serve-time parity (broker Serve order, pre-credential subset): the
-	// snapshot scope must match the sealed scope exactly (ordered enabled
-	// set plus default, instance kept distinct from discovery), and every
+	// Serve-time scope parity, checked at stage time: the snapshot scope
+	// must match the sealed scope exactly (ordered enabled set plus
+	// default, instance kept distinct from discovery), and every
 	// allowlisted model's company field must resolve through the candidate
-	// snapshot schema to a res.company many2one/many2many relation
-	// (policy.CompanyFieldValid). Staging denies here — before Seal and
-	// before any file mutation — so an invalid bundle can never commit.
+	// snapshot schema to a res.company many2one relation (many2many fails
+	// closed this release: policy.CompanyFieldValid). Staging denies here —
+	// before Seal and before any file mutation — so an invalid bundle can
+	// never commit. (Serve runs the same checks pre-credential; setup/
+	// refresh/import run them post-unlock after any live reads, pre-commit.)
 	if snap.Instance != pol.Instance {
 		return out, fmt.Errorf("snapshot instance %q != policy instance %q", snap.Instance, pol.Instance)
 	}

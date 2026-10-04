@@ -97,17 +97,18 @@ func CompanyDomain(rule ModelRule, scope CompanyScope) (frag []any, enforce bool
 }
 
 // CompanyFieldValid verifies that rule CompanyField (for model) normalizes
-// AND resolves via schema to a relational field whose relation is a company
-// model. Accepted: Relation == "res.company" with Type many2one or
-// many2many — the direct company link (company_id) or the multi-company link
-// (company_ids). A res.users company-field chain root is NOT accepted here:
-// it names users, not companies, and would let a scoped rule pass on a
-// field that does not itself filter by company. The broker calls this
-// pre-credential (before any credential resolution or RPC) so a scoped rule
-// with a syntactically valid but semantically non-company field denies
-// before secrets are touched. Company-independent rules without a
-// CompanyField pass trivially (nothing to verify); a contradictory
-// independent rule WITH a CompanyField fails.
+// AND resolves via schema to a many2one field whose relation is res.company
+// (the direct company link, e.g. company_id). many2many company links
+// (e.g. company_ids) FAIL CLOSED in this release: multi-company membership
+// has no enforceable fragment shape yet, so a many2many field resolving to
+// res.company is rejected as non-enforceable. A res.users company-field
+// chain root is NOT accepted here: it names users, not companies, and would
+// let a scoped rule pass on a field that does not itself filter by company.
+// The broker calls this pre-credential (before any credential resolution or
+// RPC) so a scoped rule with a syntactically valid but semantically
+// non-company field denies before secrets are touched.
+// Company-independent rules without a CompanyField pass trivially (nothing
+// to verify); a contradictory independent rule WITH a CompanyField fails.
 func (p *Policy) CompanyFieldValid(schema SchemaView, model string) error {
 	if p == nil {
 		return fmt.Errorf("policy: nil policy")
@@ -141,8 +142,10 @@ func (p *Policy) CompanyFieldValid(schema SchemaView, model string) error {
 		return fmt.Errorf("policy: model %q company field %q relation %q is not res.company", model, field, fm.Relation)
 	}
 	switch fm.Type {
-	case "many2one", "many2many":
+	case "many2one":
 		return nil
+	case "many2many":
+		return fmt.Errorf("policy: model %q company field %q is many2many: multi-company links are not enforceable in this release (only many2one company fields are supported)", model, field)
 	default:
 		return fmt.Errorf("policy: model %q company field %q type %q is not a company relation", model, field, fm.Type)
 	}

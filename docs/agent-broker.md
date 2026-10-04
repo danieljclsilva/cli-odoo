@@ -48,8 +48,8 @@ printf '%s' "$ADMIN_PW" | odoo agent setup --companies 1,2 ... --admin-password-
 # 3. Inspect and refresh bounded metadata (human only, deliberate server reads).
 odoo agent companies [--live]
 odoo agent snapshot refresh        # rebuild + reseal (restamps snapshot digest)
-odoo agent snapshot import-catalog --file catalog.json    # operator-transcribed
-odoo agent snapshot import-manifest --file methods.json   # informational only
+odoo agent snapshot import-catalog --catalog catalog.json    # operator-transcribed
+odoo agent snapshot import-manifest --manifest methods.json   # informational only
 odoo agent workspace           # show sealed workspace dir + bounded listing
 
 # 4. Serve (unlocks profile, resolves keychain once, dials Odoo once).
@@ -67,13 +67,17 @@ hand-edit fails closed at serve time until a human re-runs refresh/import and
 reseals),
 `~/.config/odoo-cli/agent-snapshot.json` (approved metadata). The workspace
 default is `~/odoo-agent-workspace` (never inside the config dir; the old
-config-nested path is rejected with a migration note). Sealed with
+config-nested path is rejected with a migration note). Sealed with the admin
+password (TTY prompt or `--admin-password-stdin`, never args/env).
 
 Company scope: the broker ANDs the sealed company fragment into every
 domain **after** caller conditions and **overwrites** `allowed_company_ids`
 / `company_id`. The model cannot select companies. `read` by ID is converted
-to a scoped `search_read` so company scoping always applies. Models without
-a usable company field deny unless a human classified them
+to a scoped `search_read` so company scoping always applies. Only direct
+many2one company fields (e.g. `company_id` → `res.company`) are enforceable:
+many2many links (e.g. `company_ids`) fail closed at setup/serve time with a
+clear error — multi-company overlap has no safe fragment in this release.
+Models without a usable company field deny unless a human classified them
 company-independent *and* the policy allows classified shared records.
 Per-model `IncludeCompanyless` (default deny, human-reviewed) additionally
 permits `company_id=false` records via an OR-false fragment. Field
@@ -85,6 +89,53 @@ order, group-by, projection, and aggregate references must be single-segment
 allowlisted fields); there is no separately reviewed scoped-traversal
 implementation. Hierarchy operators `child_of`/`parent_of` deny. Schema
 relationships stay readable for discovery but never authorize traversal.
+
+## Offline catalog / manifest import (human only)
+
+Two distinct commands, different effects:
+
+- `snapshot import-manifest --manifest methods.json` **inspects only**: reads
+  a `{"methods": [...]}` file and prints the entries for review. It writes
+  nothing and reseals nothing. The list is informational only — no Execute
+  path may take a name from it.
+- `snapshot import-catalog --catalog catalog.json` **converts + reseals**:
+  converts a human-transcribed offline catalog into a snapshot, writes it
+  0600, and reseals the profile so `snapshot_sha256` binds the new bytes.
+  Requires the admin password (human unlock). Sealed scope is never widened:
+  company/shared flags, the enabled set/default, and per-model
+  `include_companyless` stay as sealed; catalog-only models stay
+  discoverable-only (`executable: false`), never auto-enabled.
+
+Bounded import schema (strict JSON, unknown fields rejected, file max 4 MiB;
+caps: models ≤512, fields/model ≤2048, `method_manifest` ≤1024,
+companies ≤10000; provenance is `server|manifest|unknown`, empty defaults
+to `unknown` on import):
+
+```json
+{
+  "instance": "prod", "captured_by": "operator:name", "server_version": "17.0",
+  "available_companies": [{"id": 1, "name": "Acme"}],
+  "enabled_companies": [1], "default_company": 1,
+  "models": {
+    "res.partner": {
+      "label": "Partner", "provenance": "manifest", "executable": false,
+      "company_field": "company_id", "company_independent": false,
+      "include_companyless": false,
+      "fields": {
+        "name": {"type": "char", "relation": "", "label": "Name", "provenance": "manifest"}
+      }
+    }
+  },
+  "method_manifest": ["search_read", "read"]
+}
+```
+
+Operator steps: transcribe offline → `import-catalog --catalog <file>`
+(+ admin password) → review the sealed result → `serve`. Use
+`import-manifest --manifest <file>` to review a method list before
+transcribing it into `method_manifest`. `GET /rpc/catalog` serves the sealed
+models plus `method_manifest` informational-only, with per-model/per-field
+`provenance` and an `unknown_provenance` list for unattested fields.
 
 ## Model API (loopback TCP, bearer session token)
 
@@ -114,13 +165,13 @@ sessions, and the HTTP server enforces read/write/idle timeouts.
 
 Shipped in-tree (implemented, not prose):
 
-- MCP stdio adapter: `odoo agent mcp [--broker URL]` — JSON-RPC 2.0 over
+- MCP stdio adapter: `odoo agent mcp [--url URL]` — JSON-RPC 2.0 over
   stdio with `initialize` / `tools/list` / `tools/call` for the 11 typed
   broker tools only (search, read, count, aggregate, meta, companies,
   catalog, workspace.list/read/write/mkdir). The session token comes from
   `ODOO_BROKER_TOKEN` (env only, never logged or echoed). Codex stdio
   example: `codex mcp add odoo-broker -- odoo agent mcp
-  --broker http://127.0.0.1:8471` with the token env var set.
+  --url http://127.0.0.1:8471` with the token env var set.
 - OMP custom tool module: `tools/omp/odoo-broker.js` (CommonJS factory,
   11 typed tools, `fetch` POST to `ODOO_BROKER_URL` with `ODOO_BROKER_TOKEN`;
   no shell). Reviewed config snippets: `odoo agent omp-init --dir <dir>`

@@ -44,7 +44,13 @@
 // written to disk. No child_process, no shell fallback, no secrets in
 // output. Redirects are never followed (redirect:'error'): a 3xx from the
 // broker surfaces a tool error instead of moving the Bearer token.
-// Broker URLs are loopback-only (127.0.0.0/8, ::1, localhost, exact match).
+// Broker URLs are loopback-only (127.0.0.0/8, ::1, localhost, exact match);
+// the joined base+path URL is re-validated BEFORE fetch, failing closed.
+// Responses stream at most MAX_BODY_BYTES+1 bytes (exactly 4 MiB cap)
+// BEFORE JSON decode; overflow is denied whole with no body bytes echoed.
+// Every request races a DEFAULT_TIMEOUT_MS (exactly 30s) AbortController
+// bound combined with the caller signal (headers AND body covered);
+// streams cancel and timers/listeners clear on every path.
 // Error text is token-redacted before it reaches the model.
 //
 // Typed broker ops only: odoo.search/read/count/aggregate/meta/companies/
@@ -136,15 +142,168 @@ function checkKind(kind, v) {
   }
 }
 
-async function fetchNoRedirect(url, opts) {
+// Bounded broker transport. MAX_BODY_BYTES is exactly 4 MiB (4*1024*1024);
+// DEFAULT_TIMEOUT_MS is exactly 30000 (30s). ODOO_BROKER_TIMEOUT_MS
+// overrides the timeout in milliseconds when set to a finite value in
+// (0, MAX_TIMEOUT_MS] (test hook; missing, invalid, or over-cap values
+// fall back to 30s so the bound cannot be disabled via env).
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
+const DEFAULT_TIMEOUT_MS = 30000;
+const MAX_TIMEOUT_MS = 300000;
+
+function resolveTimeoutMs() {
+  const raw = process.env.ODOO_BROKER_TIMEOUT_MS;
+  if (raw == null || raw === '') return DEFAULT_TIMEOUT_MS;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0 && n <= MAX_TIMEOUT_MS) return Math.floor(n);
+  return DEFAULT_TIMEOUT_MS;
+}
+
+// readBoundedJSON streams at most MAX_BODY_BYTES+1 bytes BEFORE JSON
+// decode: overflow (including a valid prefix padded with whitespace plus
+// one more byte) denies the whole response with no body bytes echoed.
+// The stream is cancelled on overflow, read error, and abort.
+async function readBoundedJSON(res, signal) {
+  const body = res ? res.body : null;
+  if (body && typeof body.getReader === 'function') {
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      for (;;) {
+        if (signal && signal.aborted) {
+          const aborted = new Error('The operation was aborted.');
+          aborted.name = 'AbortError';
+          throw aborted;
+        }
+        const next = await reader.read();
+        if (next.done) break;
+        const value = next.value;
+        const len = value ? (value.byteLength != null ? value.byteLength : (value.length || 0)) : 0;
+        total += len;
+        if (total > MAX_BODY_BYTES) {
+          try { await reader.cancel(); } catch {}
+          return { overflow: true };
+        }
+        if (value) chunks.push(value);
+      }
+    } catch (e) {
+      try { await reader.cancel(); } catch {}
+      throw e;
+    } finally {
+      try { reader.releaseLock(); } catch {}
+    }
+    const buf = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      const u8 = c instanceof Uint8Array ? c : Uint8Array.from(c);
+      buf.set(u8, off);
+      off += u8.byteLength;
+    }
+    try {
+      return { env: JSON.parse(new TextDecoder('utf-8').decode(buf)) };
+    } catch {
+      return { nonJSON: true };
+    }
+  }
+  // Non-streaming fetch shapes below are TEST-ONLY fallbacks: production
+  // fetch (undici/WHATWG) always exposes a getReader() body, handled above
+  // with byte counting BEFORE allocation completes. These branches exist
+  // only so the in-process unit tests can stub fetch without a stream;
+  // they still deny over-cap envelopes (fail closed) but cannot bound
+  // allocation the way the streaming branch does.
+  if (res && typeof res.text === 'function') {
+    const text = await res.text();
+    if (Buffer.byteLength(text, 'utf8') > MAX_BODY_BYTES) {
+      try {
+        if (res.body && typeof res.body.cancel === 'function') await res.body.cancel();
+      } catch {}
+      return { overflow: true };
+    }
+    try {
+      return { env: JSON.parse(text) };
+    } catch {
+      return { nonJSON: true };
+    }
+  }
+  // Legacy stub shape ({ json } only, no streamable body): no raw bytes
+  // to bound, so the re-encoded envelope length stands in for the wire
+  // bytes and over-cap envelopes deny the same way (fail closed).
+  if (res && typeof res.json === 'function') {
+    let env;
+    try {
+      env = await res.json();
+    } catch {
+      return { nonJSON: true };
+    }
+    try {
+      if (Buffer.byteLength(JSON.stringify(env), 'utf8') > MAX_BODY_BYTES) return { overflow: true };
+    } catch {
+      return { nonJSON: true };
+    }
+    return { env };
+  }
+  return { nonJSON: true };
+}
+
+// requestJSON is the ONE bounded request helper shared by postJSON and
+// getJSON. It validates the joined base+path URL against the loopback gate
+// BEFORE fetch (failing closed on parse failure), sends with
+// redirect:'error', and races every request against a DEFAULT_TIMEOUT_MS
+// AbortController combined with the caller signal, so headers AND body are
+// covered. The timer and the caller-abort listener clear on every path.
+async function requestJSON(urlInput, init, path) {
+  const url = String(urlInput);
+  let loopback = false;
+  try {
+    loopback = isLoopbackURL(url);
+  } catch {
+    loopback = false;
+  }
+  if (!loopback) return err('ODOO_BROKER_URL must be a loopback http(s) URL');
+  const caller = init && init.signal ? init.signal : undefined;
+  if (caller && caller.aborted) return err('broker request aborted at ' + path);
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const onCallerAbort = () => ctrl.abort(caller.reason);
+  if (caller) caller.addEventListener('abort', onCallerAbort, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort(new Error('broker request timed out at ' + path));
+  }, resolveTimeoutMs());
+  if (timer && typeof timer.unref === 'function') timer.unref();
   let res;
   try {
-    res = await fetch(url, { ...opts, redirect: 'error' });
-  } catch (e) {
-    if (e && e.name === 'AbortError') return { aborted: true };
-    throw e;
+    try {
+      res = await fetch(url, {
+        method: init && init.method,
+        headers: init && init.headers,
+        body: init && init.body,
+        redirect: 'error',
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      if (timedOut) return err('broker request timed out at ' + path);
+      if ((e && e.name === 'AbortError') || ctrl.signal.aborted) return err('broker request aborted at ' + path);
+      return err('broker unreachable at ' + path);
+    }
+    let out;
+    try {
+      out = await readBoundedJSON(res, ctrl.signal);
+    } catch (e) {
+      if (timedOut) return err('broker request timed out at ' + path);
+      if ((e && e.name === 'AbortError') || ctrl.signal.aborted) return err('broker request aborted at ' + path);
+      return err('broker returned non-JSON at ' + path);
+    }
+    if (out.overflow) return err('broker response exceeded 4 MiB limit at ' + path);
+    if (out.nonJSON || !out.env) return err('broker returned non-JSON at ' + path);
+    const env = out.env;
+    if (!env.success) return err(env.error || ('broker denied ' + path));
+    return ok(JSON.stringify(env.result));
+  } finally {
+    clearTimeout(timer);
+    if (caller) caller.removeEventListener('abort', onCallerAbort);
   }
-  return { res };
 }
 
 async function postJSON(path, body, signal) {
@@ -160,22 +319,18 @@ async function postJSON(path, body, signal) {
   } catch (e) {
     return err(e.message);
   }
-  let out;
+  let payload;
   try {
-    out = await fetchNoRedirect(base + path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + t },
-      body: JSON.stringify(body || {}),
-      signal,
-    });
+    payload = JSON.stringify(body || {});
   } catch {
-    return err('broker unreachable at ' + path);
+    return err('broker request failed at ' + path);
   }
-  if (out.aborted) return err('broker request aborted at ' + path);
-  const env = await out.res.json().catch(() => null);
-  if (!env) return err('broker returned non-JSON at ' + path);
-  if (!env.success) return err(env.error || ('broker denied ' + path));
-  return ok(JSON.stringify(env.result));
+  return requestJSON(base + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + t },
+    body: payload,
+    signal,
+  }, path);
 }
 
 async function getJSON(path, signal) {
@@ -191,27 +346,11 @@ async function getJSON(path, signal) {
   } catch (e) {
     return err(e.message);
   }
-  let url;
-  try {
-    url = new URL(base + path);
-  } catch {
-    return err('broker request failed at ' + path);
-  }
-  let out;
-  try {
-    out = await fetchNoRedirect(url, {
-      method: 'GET',
-      headers: { Authorization: 'Bearer ' + t },
-      signal,
-    });
-  } catch {
-    return err('broker unreachable at ' + path);
-  }
-  if (out.aborted) return err('broker request aborted at ' + path);
-  const env = await out.res.json().catch(() => null);
-  if (!env) return err('broker returned non-JSON at ' + path);
-  if (!env.success) return err(env.error || ('broker denied ' + path));
-  return ok(JSON.stringify(env.result));
+  return requestJSON(base + path, {
+    method: 'GET',
+    headers: { Authorization: 'Bearer ' + t },
+    signal,
+  }, path);
 }
 
 function str(desc) { return { type: 'string', description: desc }; }

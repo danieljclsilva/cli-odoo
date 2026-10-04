@@ -855,15 +855,37 @@ func TestCompanyFieldValid(t *testing.T) {
 	if err := p.CompanyFieldValid(schema, "res.company"); err != nil {
 		t.Fatalf("independent without field: %v", err)
 	}
-	// many2many company link also passes (company_ids multi-company).
+	// many2many company links fail closed in this release: company_ids
+	// resolves to res.company but is not an enforceable many2one link.
 	m2m := validPolicy()
 	m2m.Models["res.partner"] = ModelRule{Fields: []string{"company_ids", "name"}, CompanyField: "company_ids"}
 	m2mSchema := testSchema{"res.partner": testModel{
 		"company_ids": {Name: "company_ids", Type: "many2many", Relation: "res.company"},
 		"name":        {Name: "name", Type: "char"},
 	}}
-	if err := m2m.CompanyFieldValid(m2mSchema, "res.partner"); err != nil {
-		t.Fatalf("company_ids many2many valid: %v", err)
+	if err := m2m.CompanyFieldValid(m2mSchema, "res.partner"); err == nil {
+		t.Fatal("company_ids many2many passed, want deny (release limitation: many2one only)")
+	} else if !strings.Contains(err.Error(), "many2many") {
+		t.Fatalf("many2many denial should name the release limitation, got: %v", err)
+	}
+}
+
+func TestCompanyMany2OneScopedAuthorize(t *testing.T) {
+	schema := testSchemaView()
+	p := validPolicy()
+	// Legitimate two-company many2one scope authorizes through real policy.
+	if err := p.CompanyFieldValid(schema, "res.partner"); err != nil {
+		t.Fatalf("many2one company_id rejected: %v", err)
+	}
+	if d := p.Authorize(schema, validSearch()); !d.Allow {
+		t.Fatalf("many2one scoped request denied: %+v", d)
+	}
+	// Caller-supplied company selection still denies: the scope stays
+	// server-enforced, never caller-chosen.
+	r := validSearch()
+	r.CompanyIDs = []int{1}
+	if d := p.Authorize(schema, r); d.Allow || d.Reason != ReasonCompanySelectDenied {
+		t.Fatalf("company select = %+v, want deny company-select-denied", d)
 	}
 }
 

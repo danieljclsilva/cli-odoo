@@ -31,9 +31,14 @@
 // (unknown/wrong-typed arguments are rejected before dispatch); the session
 // token is redacted from every error surface.
 //
-// Session: tools/call before a successful initialize gets a deterministic
-// not-initialized error and never dispatches; initialize is idempotent,
-// and ping/tools/list/notifications need no session.
+// Session lifecycle: uninitialized -> awaiting-initialized (after a
+// successful initialize response) -> ready (after the
+// notifications/initialized notification). tools/list and tools/call
+// before ready get a deterministic not-initialized error and never
+// dispatch; ping is allowed anytime; initialize is idempotent and
+// re-answers deterministically (a repeat while ready stays ready, never
+// regresses or widens); a notifications/initialized notification with no
+// prior initialize is a no-op.
 package mcpadapter
 
 import (
@@ -247,13 +252,31 @@ type Server struct {
 	cfg Config
 	In  io.Reader
 	Out io.Writer
-	// initialized gates state-changing/model tool calls: it is set only by
-	// a successful initialize request, so tools/call before initialize gets
-	// a deterministic not-initialized error instead of a broker dispatch.
-	initialized atomic.Bool
+	// Session lifecycle state: sessionUninitialized -> sessionAwaitInit
+	// (after a successful initialize RESPONSE is sent) -> sessionReady
+	// (after the notifications/initialized notification). tools/list and
+	// tools/call require sessionReady; ping needs nothing; initialize is
+	// idempotent. Stored as an atomic int32 so concurrent handler paths
+	// observe a monotonic lifecycle without a mutex.
+	state atomic.Int32
 }
 
-// errNotInitialized marks a tools/call before a successful initialize.
+// Session lifecycle states. The order is the lifecycle order: transitions
+// move forward only, never backward.
+const (
+	sessionUninitialized int32 = iota
+	sessionAwaitInit
+	sessionReady
+)
+
+// ready reports whether the session reached ready (initialize response
+// sent, then notifications/initialized received).
+func (s *Server) ready() bool {
+	return s != nil && s.state.Load() == sessionReady
+}
+
+// errNotInitialized marks tools/call and tools/list before ready (no
+// successful initialize response followed by notifications/initialized yet).
 var errNotInitialized = errors.New("mcpadapter: session not initialized (send initialize first)")
 
 // New returns a stdio server bound to cfg (resolved) with process stdio.
@@ -457,42 +480,70 @@ func (s *Server) Serve(ctx context.Context) error {
 		if werr := respond(rpcResponse{JSONRPC: "2.0", ID: id, Result: res}); werr != nil {
 			return fail(werr)
 		}
+		if req.Method == "initialize" {
+			// The session advances to awaiting-initialized only when the
+			// initialize RESPONSE was actually sent: a failed encode
+			// above returns, so this marks successful handshakes only.
+			// A repeat initialize while ready stays ready (monotonic CAS:
+			// uninitialized -> awaiting-initialized only).
+			s.state.CompareAndSwap(sessionUninitialized, sessionAwaitInit)
+		}
 	}
 }
 
 func (s *Server) handleNotification(method string, _ json.RawMessage) {
-	// Handshake/shutdown notifications (notifications/initialized and any
-	// other notification) carry no ID and get no reply by JSON-RPC rule.
-	_ = method
+	// Only the handshake notification advances the session, and only from
+	// awaiting-initialized: an initialized notification with no prior
+	// successful initialize RESPONSE is a no-op (stays uninitialized), a
+	// repeat while ready stays ready, and every other notification is
+	// ignored. Notifications carry no ID and get no reply by JSON-RPC rule.
+	if method == "notifications/initialized" {
+		if s.state.CompareAndSwap(sessionAwaitInit, sessionReady) {
+			return
+		}
+	}
 }
 
-// negotiateVersion echoes the client's protocolVersion when the adapter
-// supports it, and the default otherwise. Version negotiation is
-// deterministic; the only session state initialize confers is the
-// initialized flag gating tools/call.
+// negotiateVersion resolves the client's protocolVersion deterministically.
+// Params must be a JSON object; protocolVersion must be a non-empty string.
+// A non-object payload, a missing/empty/non-string version, or an unknown
+// version all negotiate the default — never an error, never a widening
+// echo of attacker-chosen text.
 func negotiateVersion(params json.RawMessage) string {
-	var in struct {
-		ProtocolVersion string `json:"protocolVersion"`
+	if len(bytes.TrimSpace(params)) == 0 {
+		return defaultProtocolVersion
 	}
-	if len(params) > 0 {
-		if err := json.Unmarshal(params, &in); err == nil {
-			for _, v := range supportedVersions {
-				if in.ProtocolVersion == v {
-					return v
-				}
-			}
+	var raw map[string]json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(params))
+	if err := dec.Decode(&raw); err != nil || raw == nil {
+		return defaultProtocolVersion
+	}
+	vraw, ok := raw["protocolVersion"]
+	if !ok {
+		return defaultProtocolVersion
+	}
+	var v string
+	if err := json.Unmarshal(vraw, &v); err != nil || v == "" {
+		return defaultProtocolVersion
+	}
+	for _, s := range supportedVersions {
+		if v == s {
+			return v
 		}
 	}
 	return defaultProtocolVersion
 }
-
 func (s *Server) handle(ctx context.Context, method string, params json.RawMessage) (any, *rpcErr) {
 	switch method {
 	case "initialize":
-		// Idempotent: every successful initialize answers deterministically
-		// and (re)marks the session initialized. Notifications named
-		// "notifications/initialized" carry no ID and never reach here.
-		s.initialized.Store(true)
+		// Idempotent: every initialize request answers deterministically.
+		// The lifecycle advance happens only in Serve after the RESPONSE
+		// is sent, so a failed encode never advances the session; a
+		// repeat while ready stays ready (the Serve transition only
+		// moves uninitialized -> awaiting-initialized). Malformed params
+		// never error: negotiation falls back to the default version.
+		// Notifications named "notifications/initialized" carry no ID
+		// and never reach here.
 		return map[string]any{
 			"protocolVersion": negotiateVersion(params),
 			"serverInfo":      map[string]any{"name": "odoo-broker", "version": Version},
@@ -501,12 +552,17 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 	case "ping":
 		return map[string]any{}, nil
 	case "tools/list":
+		// Session gate before any listing: not-ready gets one
+		// deterministic error and the broker sees zero requests.
+		if !s.ready() {
+			return nil, &rpcErr{Code: -32002, Message: errNotInitialized.Error()}
+		}
 		return map[string]any{"tools": Tools()}, nil
 	case "tools/call":
 		// Session gate comes before any params decode or dispatch: an
 		// uninitialized caller gets one deterministic error and the
 		// broker sees zero requests.
-		if !s.initialized.Load() {
+		if !s.ready() {
 			return nil, &rpcErr{Code: -32002, Message: errNotInitialized.Error()}
 		}
 		var in struct {

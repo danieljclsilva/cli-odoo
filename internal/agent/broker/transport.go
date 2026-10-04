@@ -1,21 +1,23 @@
-// Runtime consumption findings (verified 2026-10-03, read-only):
+// Runtime consumption (in-tree, implemented):
 //
-//   - `codex mcp add --help`: supports `--url <URL>` for a "streamable HTTP
-//     MCP server" plus `--bearer-token-env-var` (bearer auth), and stdio
-//     servers via `-- <COMMAND>...`. Codex CAN consume MCP Streamable HTTP.
-//   - `codex mcp list`: shows configured servers (stdio commands and HTTP
-//     URLs observed live), confirming both transports in real use.
-//   - `omp --help` (v18.2.6): NO mcp subcommand and no MCP client flags
-//     (`grep -i mcp` over full help: no match). OMP has `--no-tools` /
-//     `--tools=<list>` (tool gating, already known) and `--extension` /
-//     `--hook` files, but no documented way to attach a remote MCP server
-//     in this version. OMP MCP consumption is UNVERIFIED.
+//   - Typed broker: plain typed JSON-RPC POST on the loopback model
+//     listener (search/read/count/aggregate/meta/companies/catalog/
+//     workspace.list/read/write/mkdir), curl-consumable by any runtime.
+//   - MCP stdio adapter (`agent mcp`, internal/agent/mcpadapter):
+//     JSON-RPC 2.0 over stdio forwarding ONLY the 11 typed broker tools
+//     (search, read, count, aggregate, meta, companies, catalog,
+//     workspace.list/read/write/mkdir). No admin/raw routing; the session
+//     token comes from ODOO_BROKER_TOKEN (env only).
+//   - OMP custom-tool module tools/omp/odoo-broker.js: CommonJS factory
+//     exposing the same 11 typed tools over the broker HTTP endpoints.
+//     Covered by the real loader harness
+//     tools/omp/odoo-broker.loader.test.js (real OMP loader +
+//     in-process broker).
 //
-// Decision: serve plain typed JSON-RPC POST only (curl-consumable by any
-// runtime, including OMP extensions/shell), no MCP Streamable HTTP endpoint.
-// Adding a full MCP session protocol (initialize/tools-list/tools-call)
-// for one runtime while the other cannot verifiably consume it would be an
-// unaudited second surface. Revisit when OMP documents MCP consumption.
+// Decision: serve plain typed JSON-RPC POST only, no MCP Streamable HTTP
+// endpoint. A full MCP session protocol (initialize/tools-list/tools-call
+// over HTTP) would be an unaudited second surface; runtimes that speak MCP
+// use the stdio adapter above.
 //
 // Same-user posture (honest): the loopback listener and the 0600 unix admin
 // socket assume a non-hostile local user. Any local process as the same
@@ -170,10 +172,10 @@ func verifyServingDigest(pol *policy.Policy, snap snapshot.Snapshot) error {
 
 // verifyCompanyFields runs policy.CompanyFieldValid for every allowlisted
 // model BEFORE credential resolution: scoped models must resolve their
-// CompanyField through the snapshot schema to a res.company
-// many2one/many2many relation, and contradictory independent-with-field
-// rules fail. Syntactically valid but semantically non-company fields deny
-// before secrets are touched.
+// CompanyField through the snapshot schema to a res.company many2one
+// relation (many2many fails closed this release), and contradictory
+// independent-with-field rules fail. Syntactically valid but semantically
+// non-company fields deny before secrets are touched.
 func verifyCompanyFields(pol *policy.Policy, snap snapshot.Snapshot) error {
 	for name := range pol.Models {
 		norm, ok := policy.NormalizeName(name)

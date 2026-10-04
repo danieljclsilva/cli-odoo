@@ -129,14 +129,37 @@ func roundTrip(t *testing.T, srv *Server, req string) map[string]any {
 	return res
 }
 
-// initServer runs one successful initialize against srv so the session gate
-// opens for tools/call. Every tools/call test below must open the session
-// first: tools/call before initialize is denied without dispatch.
+// initServer runs the full lifecycle against srv so the session reaches
+// ready: initialize RESPONSE (which advances to awaiting-initialized) plus
+// the notifications/initialized notification (which advances to ready).
+// Every tools/list and tools/call test below must ready the session first:
+// both are denied without dispatch until ready.
 func initServer(t *testing.T, srv *Server) {
 	t.Helper()
-	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`)
-	if res["result"] == nil {
-		t.Fatalf("initialize should succeed: %+v", res)
+	readyServer(t, srv)
+}
+
+// readyServer drives initialize + notifications/initialized over one Serve
+// invocation (the Serve loop owns both transitions), then asserts ready.
+func readyServer(t *testing.T, srv *Server) {
+	t.Helper()
+	got, err := serveInput(t, srv,
+		`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`+"\n"+
+			`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`+"\n",
+		5*time.Second)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("want 1 response (initialize; notification is silent), got %d: %q", len(lines), got)
+	}
+	var res map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &res); err != nil || res["result"] == nil {
+		t.Fatalf("initialize should succeed: %q err=%v", got, err)
+	}
+	if !srv.ready() {
+		t.Fatal("session should be ready after initialize + notification")
 	}
 }
 
@@ -160,18 +183,60 @@ func TestToolsListTypedOnly(t *testing.T) {
 	if m, p, ok := endpoint("workspace.mkdir"); !ok || m != "POST" || p != "/rpc/workspace/mkdir" {
 		t.Fatalf("endpoint(workspace.mkdir) = %q %q %v, want POST /rpc/workspace/mkdir true", m, p, ok)
 	}
-	// initialize + tools/list over stdio.
+	// Full lifecycle then tools/list over stdio.
 	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
-	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
-	if res["result"] == nil {
-		t.Fatalf("initialize: %+v", res)
-	}
-	srv2 := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
-	res = roundTrip(t, srv2, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
+	initServer(t, srv)
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
 	result, _ := res["result"].(map[string]any)
 	tools, _ := result["tools"].([]any)
 	if len(tools) != 11 {
 		t.Fatalf("tools/list = %d tools, want 11", len(tools))
+	}
+}
+
+func TestToolsListRequiresReady(t *testing.T) {
+	exec := &stubExec{rows: []any{map[string]any{"id": 1}}}
+	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
+	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	// tools/list before any init: deterministic not-initialized error.
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":70,"method":"tools/list","params":{}}`)
+	if res["error"] == nil {
+		t.Fatalf("uninitialized tools/list should be an error: %+v", res)
+	}
+	if got := res["error"].(map[string]any)["message"].(string); got != errNotInitialized.Error() {
+		t.Fatalf("uninitialized tools/list message = %q, want %q", got, errNotInitialized.Error())
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("uninitialized list dispatched: %v", exec.calls)
+	}
+	// Initialize RESPONSE alone still gates: awaiting-initialized is not ready.
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":71,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`)
+	if res["result"] == nil {
+		t.Fatalf("initialize: %+v", res)
+	}
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":72,"method":"tools/list","params":{}}`)
+	if res["error"] == nil {
+		t.Fatalf("awaiting-initialized tools/list should be an error: %+v", res)
+	}
+	if got := res["error"].(map[string]any)["message"].(string); got != errNotInitialized.Error() {
+		t.Fatalf("awaiting tools/list message = %q, want %q", got, errNotInitialized.Error())
+	}
+	// The notification completes the lifecycle: the next list is allowed.
+	got, err := serveInput(t, srv, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`+"\n", 5*time.Second)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if strings.TrimSpace(got) != "" {
+		t.Fatalf("notification should get no reply, got %q", got)
+	}
+	if !srv.ready() {
+		t.Fatal("session should be ready after notification")
+	}
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":73,"method":"tools/list","params":{}}`)
+	result, _ := res["result"].(map[string]any)
+	tools, _ := result["tools"].([]any)
+	if len(tools) != 11 {
+		t.Fatalf("ready tools/list = %d tools, want 11", len(tools))
 	}
 }
 
@@ -550,8 +615,9 @@ func TestTokenRedactedFromErrors(t *testing.T) {
 	}
 }
 
-// initialize negotiates: a supported client version echoes back, an unknown
-// one falls back to the default. ping answers {}.
+// initialize negotiates deterministically: a supported client version echoes
+// back, anything else (unknown, empty, missing, wrong-typed, non-object
+// params) falls back to the default without error. ping answers anytime.
 func TestInitializeNegotiationAndPing(t *testing.T) {
 	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":40,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`)
@@ -564,6 +630,24 @@ func TestInitializeNegotiationAndPing(t *testing.T) {
 	result, _ = res["result"].(map[string]any)
 	if result["protocolVersion"] != defaultProtocolVersion {
 		t.Fatalf("unknown version should fall back to %q: %+v", defaultProtocolVersion, result)
+	}
+	// Malformed init params are deterministic: missing, empty, wrong-typed,
+	// and non-object params all answer with the default version, never an
+	// error and never an echo of attacker-chosen text.
+	for i, p := range []string{
+		`{"jsonrpc":"2.0","id":44,"method":"initialize"}`,
+		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":{}}`,
+		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":{"protocolVersion":""}}`,
+		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":{"protocolVersion":42}}`,
+		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":[1,2]}`,
+		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":"2025-03-26"}`,
+	} {
+		srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+		res := roundTrip(t, srv, p)
+		result, _ := res["result"].(map[string]any)
+		if res["error"] != nil || result["protocolVersion"] != defaultProtocolVersion {
+			t.Fatalf("case %d params %s = %+v, want default %q", i, p, res, defaultProtocolVersion)
+		}
 	}
 	srv3 := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
 	res = roundTrip(t, srv3, `{"jsonrpc":"2.0","id":42,"method":"ping","params":{}}`)
@@ -585,9 +669,10 @@ func TestInitializeNegotiationAndPing(t *testing.T) {
 	}
 }
 
-// tools/call before initialize is denied deterministically without dispatch
-// (the dispatch recorder proves zero outgoing RPC); the same server answers
-// after initialize, and initialize stays idempotent.
+// tools/call lifecycle: denied before init (zero dispatch), still denied
+// after the initialize RESPONSE alone (awaiting-initialized is not ready),
+// then dispatches after notifications/initialized; a repeat initialize
+// stays ready and dispatches again (never regresses, never widens).
 func TestToolsCallRequiresInitialize(t *testing.T) {
 	exec := &stubExec{rows: []any{map[string]any{"id": 1, "name": "a"}}}
 	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
@@ -602,15 +687,94 @@ func TestToolsCallRequiresInitialize(t *testing.T) {
 	if len(exec.calls) != 0 {
 		t.Fatalf("uninitialized call dispatched: %v", exec.calls)
 	}
-	initServer(t, srv)
-	initServer(t, srv)
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":54,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`)
+	if res["result"] == nil {
+		t.Fatalf("initialize: %+v", res)
+	}
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
+	if res["error"] == nil {
+		t.Fatalf("awaiting-initialized tools/call should be an error: %+v", res)
+	}
+	if got := res["error"].(map[string]any)["message"].(string); got != errNotInitialized.Error() {
+		t.Fatalf("awaiting tools/call message = %q, want %q", got, errNotInitialized.Error())
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("awaiting-initialized call dispatched: %v", exec.calls)
+	}
+	got, err := serveInput(t, srv, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`+"\n", 5*time.Second)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if strings.TrimSpace(got) != "" {
+		t.Fatalf("notification should get no reply, got %q", got)
+	}
 	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
 	result, _ := res["result"].(map[string]any)
 	if result["isError"] == true {
-		t.Fatalf("initialized search isError: %+v", res)
+		t.Fatalf("ready search isError: %+v", res)
 	}
 	if len(exec.calls) != 1 || exec.calls[0] != "res.partner/search_read" {
 		t.Fatalf("routing = %v, want [res.partner/search_read]", exec.calls)
+	}
+	// Repeated initialize stays ready: re-answers, keeps dispatching.
+	initServer(t, srv)
+	if !srv.ready() {
+		t.Fatal("repeated initialize left ready session not-ready")
+	}
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
+	result, _ = res["result"].(map[string]any)
+	if result["isError"] == true {
+		t.Fatalf("post-repeat-init search isError: %+v", res)
+	}
+	if len(exec.calls) != 2 {
+		t.Fatalf("calls = %v, want 2 dispatches", exec.calls)
+	}
+}
+
+// notifications/initialized with no prior initialize is a no-op: the session
+// stays uninitialized (tools gated, ping still allowed).
+func TestInitializedNotificationWithoutInitializeIsNoop(t *testing.T) {
+	exec := &stubExec{rows: []any{map[string]any{"id": 1}}}
+	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
+	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	got, err := serveInput(t, srv, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`+"\n", 5*time.Second)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if strings.TrimSpace(got) != "" {
+		t.Fatalf("notification should get no reply, got %q", got)
+	}
+	if srv.ready() {
+		t.Fatal("notification without initialize reached ready")
+	}
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
+	if res["error"] == nil {
+		t.Fatalf("tools/call after lone notification should be an error: %+v", res)
+	}
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":81,"method":"tools/list","params":{}}`)
+	if res["error"] == nil {
+		t.Fatalf("tools/list after lone notification should be an error: %+v", res)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("lone-notification session dispatched: %v", exec.calls)
+	}
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":82,"method":"ping","params":{}}`)
+	if res["result"] == nil {
+		t.Fatalf("ping after lone notification: %+v", res)
+	}
+}
+
+// ping is allowed pre-init and never dispatches.
+func TestPingPreInitAllowed(t *testing.T) {
+	exec := &stubExec{rows: []any{map[string]any{"id": 1}}}
+	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
+	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":90,"method":"ping","params":{}}`)
+	if res["result"] == nil {
+		t.Fatalf("pre-init ping: %+v", res)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("ping dispatched: %v", exec.calls)
 	}
 }
 

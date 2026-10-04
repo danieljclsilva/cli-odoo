@@ -77,6 +77,8 @@ test('no shell fallback, token via env only, factory ignores pi', () => {
   assert.ok(src.includes('ODOO_BROKER_TOKEN'), 'token must come from env');
   // tools/omp discovery: the loader scans .omp/tools for factory modules.
   assert.ok(src.includes('.omp/tools'), 'must document the .omp/tools load path');
+  // Timeout env override must be capped so the bound cannot be disabled.
+  assert.ok(src.includes('MAX_TIMEOUT_MS'), 'timeout override must have a ceiling');
 });
 
 test('legitimate call routes to the broker path', async () => {
@@ -234,5 +236,180 @@ test('redirect refused before the token moves', async (t) => {
   } finally {
     delete process.env.ODOO_BROKER_URL;
     delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+test('malformed broker URL fails closed before fetch', async () => {
+  const realFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return { json: async () => ({ success: true, result: {} }) };
+  };
+  process.env.ODOO_BROKER_URL = '::::not a url::::';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  try {
+    const search = byName('odoo.search');
+    const res = await search.execute('id-badurl', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+    assert.strictEqual(res.isError, true, 'unparseable broker URL must be isError');
+    assert.ok(res.content[0].text.includes('loopback'), `got ${res.content[0].text}`);
+    assert.strictEqual(calls, 0, 'unparseable URL must never reach fetch');
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+test('userinfo-smuggled loopback refused before fetch', async () => {
+  // http://127.0.0.1@evil.example/ has a loopback-looking userinfo but a
+  // non-loopback host: the joined base+path URL must fail the gate.
+  const realFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return { json: async () => ({ success: true, result: {} }) };
+  };
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1@evil.example/';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  try {
+    const search = byName('odoo.search');
+    const res = await search.execute('id-userinfo', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+    assert.strictEqual(res.isError, true, 'userinfo-smuggled URL must be isError');
+    assert.ok(res.content[0].text.includes('loopback'), `got ${res.content[0].text}`);
+    assert.strictEqual(calls, 0, 'smuggled host must never reach fetch');
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+const TEST_CAP = 4 * 1024 * 1024;
+
+function streamedResponse(chunks, onCancel) {
+  let i = 0;
+  return {
+    body: {
+      getReader() {
+        return {
+          read: async () => (i < chunks.length
+            ? { done: false, value: chunks[i++] }
+            : { done: true, value: undefined }),
+          cancel: async () => { if (onCancel) onCancel(); },
+          releaseLock() {},
+        };
+      },
+    },
+  };
+}
+
+test('over-cap body denied whole with no bytes echoed', async () => {
+  const realFetch = global.fetch;
+  const sentinel = `SENTINEL-${'z'.repeat(64)}`;
+  const head = Buffer.from(`{"success":true,"result":"${sentinel}`);
+  const big = Buffer.alloc(TEST_CAP, 0x20);
+  const tail = Buffer.from('"}');
+  let cancelled = false;
+  global.fetch = async () => streamedResponse([head, big, tail], () => { cancelled = true; });
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  try {
+    const search = byName('odoo.search');
+    const res = await search.execute('id-cap', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+    assert.strictEqual(res.isError, true, 'over-cap body must be isError');
+    assert.ok(res.content[0].text.includes('exceeded'), `got ${res.content[0].text}`);
+    assert.ok(!res.content[0].text.includes(sentinel), 'no body bytes may be echoed on overflow');
+    assert.strictEqual(cancelled, true, 'overflow must cancel the stream');
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+test('valid prefix padded to cap+1 with whitespace still denied', async () => {
+  // A fully valid envelope plus trailing whitespace is still one byte too
+  // many: the denial is on total bytes, not on parseability of a prefix.
+  const realFetch = global.fetch;
+  const prefix = Buffer.from('{"success":true,"result":{}}');
+  const pad = Buffer.alloc(TEST_CAP - prefix.length + 1, 0x20);
+  global.fetch = async () => streamedResponse([prefix, pad], () => {});
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  try {
+    const search = byName('odoo.search');
+    const res = await search.execute('id-capws', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+    assert.strictEqual(res.isError, true, 'cap+1 body must be isError even with a valid prefix');
+    assert.ok(res.content[0].text.includes('exceeded'), `got ${res.content[0].text}`);
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+test('default timeout fires without caller signal', async () => {
+  const realFetch = global.fetch;
+  global.fetch = (url, opts) => new Promise((resolve, reject) => {
+    const sig = opts && opts.signal;
+    if (sig) {
+      sig.addEventListener('abort', () => {
+        const e = new Error('The operation was aborted.');
+        e.name = 'AbortError';
+        reject(e);
+      }, { once: true });
+    }
+  });
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  process.env.ODOO_BROKER_TIMEOUT_MS = '25';
+  try {
+    const search = byName('odoo.search');
+    const t0 = Date.now();
+    const res = await search.execute('id-timeout', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+    const dt = Date.now() - t0;
+    assert.strictEqual(res.isError, true, 'hung broker must time out to isError');
+    assert.ok(res.content[0].text.includes('timed out'), `got ${res.content[0].text}`);
+    assert.ok(dt < 1000, `timeout must fire fast, took ${dt}ms`);
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+    delete process.env.ODOO_BROKER_TIMEOUT_MS;
+  }
+});
+
+test('caller abort still aborts mid-flight', async () => {
+  const realFetch = global.fetch;
+  let calls = 0;
+  global.fetch = (url, opts) => {
+    calls += 1;
+    return new Promise((resolve, reject) => {
+      opts.signal.addEventListener('abort', () => {
+        const e = new Error('The operation was aborted.');
+        e.name = 'AbortError';
+        reject(e);
+      }, { once: true });
+    });
+  };
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  process.env.ODOO_BROKER_TIMEOUT_MS = '500';
+  try {
+    const search = byName('odoo.search');
+    const ctrl = new AbortController();
+    const p = search.execute('id-abort', { model: 'res.partner', fields: ['name'] }, undefined, {}, ctrl.signal);
+    await new Promise((r) => setImmediate(r));
+    ctrl.abort();
+    const res = await p;
+    assert.strictEqual(res.isError, true, 'caller abort must surface isError');
+    assert.ok(res.content[0].text.includes('aborted'), `got ${res.content[0].text}`);
+    assert.strictEqual(calls, 1, 'abort must combine with the in-flight request, not bypass it');
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+    delete process.env.ODOO_BROKER_TIMEOUT_MS;
   }
 });
