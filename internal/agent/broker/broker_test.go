@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1048,5 +1050,189 @@ func TestWorkspaceMkdirBillsOneRow(t *testing.T) {
 	b.mu.Unlock()
 	if rows != 1 {
 		t.Fatalf("rows = %d, want 1 (mkdir bills one row)", rows)
+	}
+}
+
+// blockingRecorder is a dispatch-routing harness (bounding only, no Odoo
+// semantics): each Execute blocks on release, then records exactly one
+// completed call. started proves a worker parked; calls counts completions.
+type blockingRecorder struct {
+	release chan struct{}
+	started chan struct{}
+	done    chan struct{}
+	calls   atomic.Int64
+}
+
+func newBlockingRecorder() *blockingRecorder {
+	return &blockingRecorder{
+		release: make(chan struct{}),
+		started: make(chan struct{}, 16),
+		done:    make(chan struct{}),
+	}
+}
+
+func (e *blockingRecorder) Execute(model, method string, args []any, kwargs map[string]any) (any, error) {
+	e.started <- struct{}{}
+	select {
+	case <-e.release:
+	case <-e.done:
+		return nil, context.Canceled
+	}
+	e.calls.Add(1)
+	return []any{map[string]any{"id": 1}}, nil
+}
+
+func inflightOutstanding(b *Broker) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.inflight)
+}
+
+func waitForParked(t *testing.T, rec *blockingRecorder, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for range n {
+		select {
+		case <-rec.started:
+		case <-time.After(time.Until(deadline)):
+			t.Fatal("dispatch did not park: slot not retained")
+		}
+	}
+}
+
+type dispatchOutcome struct {
+	res any
+	err error
+}
+
+func dispatchAsync(b *Broker, r *http.Request) chan dispatchOutcome {
+	ch := make(chan dispatchOutcome, 1)
+	go func() {
+		res, err := b.dispatchExec(r, "res.partner", "search_read", nil, nil)
+		ch <- dispatchOutcome{res, err}
+	}()
+	return ch
+}
+
+func TestLegacySlotRetainedAcrossTimeoutRounds(t *testing.T) {
+	// Slot-retention evidence: fill every dispatch slot with blocked
+	// legacy calls, run repeated timeout rounds, and prove the
+	// outstanding count stays at capacity while work is parked, fresh
+	// attempts keep denying until real completion, and a late release
+	// drains to legitimate success.
+	gate := &fakeGate{allow: true}
+	rec := newBlockingRecorder()
+	defer close(rec.done)
+	b := testBroker(t, gate, rec)
+	b.setInflightForTest(2)
+	b.mu.Lock()
+	b.rpcTimeout = 50 * time.Millisecond
+	b.mu.Unlock()
+	req, _ := http.NewRequest(http.MethodPost, "/rpc/search", nil)
+	// Fill all slots with blocked calls.
+	first := dispatchAsync(b, req)
+	second := dispatchAsync(b, req)
+	waitForParked(t, rec, 2)
+	if got := inflightOutstanding(b); got != 2 {
+		t.Fatalf("outstanding = %d, want 2 (slots retained while blocked)", got)
+	}
+	// Repeated timeout rounds: the two parked calls report timeout, yet the
+	// slots stay occupied because the workers are still parked; repeated
+	// cancel/timeout rounds keep the pin while the recorder proves no new
+	// RPC ran.
+	for _, ch := range []chan dispatchOutcome{first, second} {
+		select {
+		case out := <-ch:
+			if out.err == nil {
+				t.Fatal("blocked call succeeded before release")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("dispatch did not time out")
+		}
+	}
+	for round := range 3 {
+		if got := inflightOutstanding(b); got != 2 {
+			t.Fatalf("round %d: outstanding = %d, want 2 (timeout must not free the slot)", round, got)
+		}
+		before := rec.calls.Load()
+		if _, err := b.dispatchExec(req, "res.partner", "search_read", nil, nil); !errors.Is(err, ErrSessionBudget) {
+			t.Fatalf("round %d: saturated dispatch = %v, want budget deny", round, err)
+		}
+		if got := rec.calls.Load(); got != before {
+			t.Fatalf("round %d: Execute ran despite saturation", round)
+		}
+		// A cancelled-context attempt also denies without touching the
+		// recorder or the slot count.
+		cctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		creq := req.WithContext(cctx)
+		if _, err := b.dispatchExec(creq, "res.partner", "search_read", nil, nil); err == nil {
+			t.Fatalf("round %d: cancelled dispatch succeeded, want deny", round)
+		}
+		if got := inflightOutstanding(b); got != 2 {
+			t.Fatalf("round %d: outstanding = %d, want 2 (cancelled probe must not disturb slots)", round, got)
+		}
+		async := dispatchAsync(b, req)
+		select {
+		case out := <-async:
+			if !errors.Is(out.err, ErrSessionBudget) {
+				t.Fatalf("round %d: async saturated = %v, want budget deny", round, out.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: async saturated attempt hung", round)
+		}
+	}
+	// Late release drains real work: parked workers complete, slots free,
+	// and a legitimate dispatch succeeds afterwards.
+	close(rec.release)
+	deadline := time.Now().Add(5 * time.Second)
+	for inflightOutstanding(b) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("slots did not drain after release (outstanding=%d)", inflightOutstanding(b))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := rec.calls.Load(); got != 2 {
+		t.Fatalf("completed dispatches = %d, want 2 (both parked calls ran)", got)
+	}
+	rec2 := &fakeExec{rows: []any{map[string]any{"id": 1}}}
+	b.mu.Lock()
+	b.exec = rec2
+	b.mu.Unlock()
+	if _, err := b.dispatchExec(req, "res.partner", "search_read", nil, nil); err != nil {
+		t.Fatalf("post-release dispatch = %v, want success", err)
+	}
+	if len(rec2.calls) != 1 {
+		t.Fatalf("post-release Execute calls = %d, want 1", len(rec2.calls))
+	}
+}
+
+func TestDispatchNilExecutorDenied(t *testing.T) {
+	b := testBroker(t, &fakeGate{allow: true}, &fakeExec{})
+	b.mu.Lock()
+	b.exec = nil
+	b.mu.Unlock()
+	req, _ := http.NewRequest(http.MethodPost, "/rpc/search", nil)
+	before := inflightOutstanding(b)
+	if _, err := b.dispatchExec(req, "res.partner", "search_read", nil, nil); err == nil {
+		t.Fatal("nil executor dispatch succeeded, want fail-closed deny")
+	}
+	if got := inflightOutstanding(b); got != before {
+		t.Fatalf("outstanding = %d, want %d (nil executor must not leak a slot)", got, before)
+	}
+}
+
+func TestDispatchPreCancelledContextDenied(t *testing.T) {
+	b := testBroker(t, &fakeGate{allow: true}, &fakeExec{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req, _ := http.NewRequest(http.MethodPost, "/rpc/search", nil)
+	req = req.WithContext(ctx)
+	before := inflightOutstanding(b)
+	if _, err := b.dispatchExec(req, "res.partner", "search_read", nil, nil); err == nil {
+		t.Fatal("pre-cancelled dispatch succeeded, want fail-closed deny")
+	}
+	if got := inflightOutstanding(b); got != before {
+		t.Fatalf("outstanding = %d, want %d (cancelled dispatch must not leak a slot)", got, before)
 	}
 }

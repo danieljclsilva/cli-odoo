@@ -52,8 +52,9 @@ type Client struct {
 	jsonBase string // json2 endpoint root: {url}/api/v2
 	// objectURL is the XML-RPC object endpoint for the context-aware
 	// ExecuteContext path (raw POST via c.http with the request context,
-	// so cancellation aborts the upstream call). Legacy Execute keeps
-	// using c.object (kolo/xmlrpc, no context).
+	// so cancellation aborts the upstream call). c.object is the legacy
+	// kolo/xmlrpc handle kept for New/dial compatibility; Execute always
+	// routes through ExecuteContext, never through c.object.
 	objectURL string
 }
 

@@ -1164,8 +1164,12 @@ func agentSetupStageSealedBundle(profilePath, snapshotPath, adminPassword string
 // protected files outside these two recorded paths). If the profile commit
 // fails after the snapshot was replaced, the recorded prior bytes (or
 // removal of a staged file that had no prior) are restored before
-// returning, so cancel/error never leaves a half-committed pair (new
-// snapshot bound to an old profile, or vice versa). The seal (validation +
+// returning, so a failed commit attempts a recoverable rollback to the
+// prior working pair instead of leaving the staged mix in place. The
+// rollback itself is best-effort: a crash between the two writes, or a
+// rollback write that itself fails, can still leave the pair mixed (new
+// snapshot bound to an old profile, or vice versa); the error reports
+// the rollback outcome so the human can recover. The seal (validation +
 // new-password Seal) already happened in agentSetupStageSealedBundle.
 func agentSetupCommitBundle(b agentSetupSealedBundle) error {
 	if err := agentSetupVerifyBundlePaths(b.profilePath, b.snapshotPath, b.pol.WorkspaceDir); err != nil {

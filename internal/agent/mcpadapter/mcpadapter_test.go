@@ -129,6 +129,17 @@ func roundTrip(t *testing.T, srv *Server, req string) map[string]any {
 	return res
 }
 
+// initServer runs one successful initialize against srv so the session gate
+// opens for tools/call. Every tools/call test below must open the session
+// first: tools/call before initialize is denied without dispatch.
+func initServer(t *testing.T, srv *Server) {
+	t.Helper()
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`)
+	if res["result"] == nil {
+		t.Fatalf("initialize should succeed: %+v", res)
+	}
+}
+
 func TestToolsListTypedOnly(t *testing.T) {
 	names := map[string]bool{}
 	for _, tool := range Tools() {
@@ -168,6 +179,7 @@ func TestCallDeniedSurfacesDenial(t *testing.T) {
 	exec := &stubExec{}
 	srvURL, tok := testBrokerServer(t, &stubGate{allow: false, reason: "test-deny"}, exec)
 	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	initServer(t, srv)
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
 	result, _ := res["result"].(map[string]any)
 	if result["isError"] != true {
@@ -179,9 +191,10 @@ func TestCallDeniedSurfacesDenial(t *testing.T) {
 }
 
 func TestCallSearchRoutes(t *testing.T) {
-	exec := &stubExec{rows: []any{map[string]any{"id": 1, "name": "a"}}}
+	exec := &stubExec{}
 	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
 	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	initServer(t, srv)
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
 	result, _ := res["result"].(map[string]any)
 	if result["isError"] == true {
@@ -200,6 +213,7 @@ func TestCatalogCarriesManifestAndProvenance(t *testing.T) {
 	exec := &stubExec{}
 	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
 	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	initServer(t, srv)
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"catalog","arguments":{}}}`)
 	result, _ := res["result"].(map[string]any)
 	if result["isError"] == true {
@@ -236,6 +250,7 @@ func TestCatalogCarriesManifestAndProvenance(t *testing.T) {
 
 func TestUnknownToolIsProtocolError(t *testing.T) {
 	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	initServer(t, srv)
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"grant","arguments":{}}}`)
 	if res["error"] == nil {
 		t.Fatalf("admin tool should be a protocol error: %+v", res)
@@ -401,6 +416,7 @@ func TestUnknownArgsRejected(t *testing.T) {
 	exec := &stubExec{}
 	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
 	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	initServer(t, srv)
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"],"admin":true}}}`)
 	if res["error"] == nil {
 		t.Fatalf("unknown arg should be InvalidParams: %+v", res)
@@ -409,6 +425,7 @@ func TestUnknownArgsRejected(t *testing.T) {
 		t.Fatalf("unknown-arg call dispatched: %v", exec.calls)
 	}
 	srv2 := New(Config{BaseURL: srvURL.URL, Token: tok})
+	initServer(t, srv2)
 	res = roundTrip(t, srv2, `{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":"name"}}}`)
 	if res["error"] == nil {
 		t.Fatalf("wrong-typed arg should be InvalidParams: %+v", res)
@@ -418,6 +435,7 @@ func TestUnknownArgsRejected(t *testing.T) {
 	}
 	// GET tools accept no stray body keys: companies with an argument denies.
 	srv3 := New(Config{BaseURL: srvURL.URL, Token: tok})
+	initServer(t, srv3)
 	res = roundTrip(t, srv3, `{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"companies","arguments":{"model":"x"}}}`)
 	if res["error"] == nil {
 		t.Fatalf("GET stray arg should be InvalidParams: %+v", res)
@@ -430,6 +448,7 @@ func TestNonLoopbackURLRefused(t *testing.T) {
 	exec := &stubExec{}
 	_, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
 	srv := New(Config{BaseURL: "http://192.168.1.10:8471", Token: tok})
+	initServer(t, srv)
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
 	result, _ := res["result"].(map[string]any)
 	if result["isError"] != true {
@@ -466,6 +485,7 @@ func TestRedirectRefused(t *testing.T) {
 	exec := &stubExec{}
 	_, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
 	srv := New(Config{BaseURL: target.URL, Token: tok})
+	initServer(t, srv)
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
 	result, _ := res["result"].(map[string]any)
 	if result["isError"] != true {
@@ -490,6 +510,7 @@ func TestMetaQueryEscapedAndStrict(t *testing.T) {
 	}))
 	t.Cleanup(seen.Close)
 	srv := New(Config{BaseURL: seen.URL, Token: "probe-token"})
+	initServer(t, srv)
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"meta","arguments":{"model":"res.partner & co"}}}`)
 	result, _ := res["result"].(map[string]any)
 	if result["isError"] == true {
@@ -513,6 +534,7 @@ func TestTokenRedactedFromErrors(t *testing.T) {
 	t.Cleanup(bad.Close)
 	_, probe := testBrokerServer(t, &stubGate{allow: true}, &stubExec{})
 	srv := New(Config{BaseURL: bad.URL, Token: probe})
+	initServer(t, srv)
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
 	result, _ := res["result"].(map[string]any)
 	if result["isError"] != true {
@@ -560,6 +582,135 @@ func TestInitializeNegotiationAndPing(t *testing.T) {
 	}
 	if n := len(strings.Split(strings.TrimSpace(got), "\n")); n != 1 {
 		t.Fatalf("notification should get no reply (want 1 line, got %d): %q", n, got)
+	}
+}
+
+// tools/call before initialize is denied deterministically without dispatch
+// (the dispatch recorder proves zero outgoing RPC); the same server answers
+// after initialize, and initialize stays idempotent.
+func TestToolsCallRequiresInitialize(t *testing.T) {
+	exec := &stubExec{rows: []any{map[string]any{"id": 1, "name": "a"}}}
+	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
+	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
+	if res["error"] == nil {
+		t.Fatalf("uninitialized tools/call should be an error: %+v", res)
+	}
+	if got := res["error"].(map[string]any)["message"].(string); got != errNotInitialized.Error() {
+		t.Fatalf("uninitialized tools/call message = %q, want %q", got, errNotInitialized.Error())
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("uninitialized call dispatched: %v", exec.calls)
+	}
+	initServer(t, srv)
+	initServer(t, srv)
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`)
+	result, _ := res["result"].(map[string]any)
+	if result["isError"] == true {
+		t.Fatalf("initialized search isError: %+v", res)
+	}
+	if len(exec.calls) != 1 || exec.calls[0] != "res.partner/search_read" {
+		t.Fatalf("routing = %v, want [res.partner/search_read]", exec.calls)
+	}
+}
+
+// Whole-response overflow: an exact-cap body is accepted, while a valid JSON
+// prefix plus whitespace plus one extra byte over the cap is denied before
+// any decode, for both success and error envelopes. The over-cap fixture is
+// exactly the truncation trap: a cap+1 body whose first cap bytes are valid
+// JSON plus trailing whitespace (which json.Unmarshal would accept), so a
+// truncate-then-decode reader would decode the attacker-chosen prefix.
+func TestBrokerResponseOverflowDenied(t *testing.T) {
+	newSrv := func(body string) *Server {
+		t.Helper()
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body))
+		}))
+		t.Cleanup(upstream.Close)
+		srv := New(Config{BaseURL: upstream.URL, Token: "probe-token"})
+		initServer(t, srv)
+		return srv
+	}
+	callSearch := `{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner"}}}`
+	// Exact-cap valid body accepted.
+	exactPrefix := `{"success":true,"result":"`
+	exactBody := exactPrefix + strings.Repeat("a", maxBrokerResponseBytes-len(exactPrefix)-len(`"}`)) + `"` + "}"
+	if len(exactBody) != maxBrokerResponseBytes {
+		t.Fatalf("fixture = %d bytes, want cap %d", len(exactBody), maxBrokerResponseBytes)
+	}
+	res := roundTrip(t, newSrv(exactBody), callSearch)
+	if result, _ := res["result"].(map[string]any); result["isError"] == true {
+		t.Fatalf("exact-cap success body denied: %+v", res)
+	}
+	// Valid-prefix + whitespace + 1 byte over cap denied (success envelope):
+	// the first cap bytes are valid JSON with trailing whitespace, which a
+	// truncating reader would decode as success.
+	validCore := `{"success":true,"result":"` + strings.Repeat("a", maxBrokerResponseBytes-1-len(`{"success":true,"result":"`)-len(`"}`)) + `"` + "}"
+	if len(validCore) != maxBrokerResponseBytes-1 {
+		t.Fatalf("core = %d bytes, want cap-1 %d", len(validCore), maxBrokerResponseBytes-1)
+	}
+	overSuccess := validCore + " " + "X"
+	if len(overSuccess) != maxBrokerResponseBytes+1 {
+		t.Fatalf("fixture = %d bytes, want cap+1 %d", len(overSuccess), maxBrokerResponseBytes+1)
+	}
+	res = roundTrip(t, newSrv(overSuccess), callSearch)
+	result, _ := res["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatalf("prefix+whitespace+1-byte over-cap success body accepted: %+v", res)
+	}
+	content, _ := result["content"].([]any)
+	text, _ := content[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "exceeds 4 MiB") {
+		t.Fatalf("over-cap success denial text = %q, want 4 MiB bound", text)
+	}
+	// Over-cap error envelope denied the same way (never decoded).
+	errCore := `{"success":false,"error":"` + strings.Repeat("e", maxBrokerResponseBytes-1-len(`{"success":false,"error":"`)-len(`"}`)) + `"` + "}"
+	if len(errCore) != maxBrokerResponseBytes-1 {
+		t.Fatalf("core = %d bytes, want cap-1 %d", len(errCore), maxBrokerResponseBytes-1)
+	}
+	overErr := errCore + " " + "X"
+	if len(overErr) != maxBrokerResponseBytes+1 {
+		t.Fatalf("fixture = %d bytes, want cap+1 %d", len(overErr), maxBrokerResponseBytes+1)
+	}
+	res = roundTrip(t, newSrv(overErr), callSearch)
+	result, _ = res["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatalf("over-cap error envelope accepted: %+v", res)
+	}
+	content, _ = result["content"].([]any)
+	text, _ = content[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "exceeds 4 MiB") {
+		t.Fatalf("over-cap error denial text = %q, want 4 MiB bound", text)
+	}
+}
+
+// Overflow denial lives in callTool, independent of session state: without
+// any initialize, a direct callTool against a valid-prefix + whitespace + 1
+// byte over-cap body is still denied before decode (never dispatched past
+// the bound, never truncated-then-decoded).
+func TestBrokerResponseOverflowDeniedWithoutInitialize(t *testing.T) {
+	core := `{"success":true,"result":"` + strings.Repeat("a", maxBrokerResponseBytes-1-len(`{"success":true,"result":"`)-len(`"}`)) + `"` + "}"
+	if len(core) != maxBrokerResponseBytes-1 {
+		t.Fatalf("core = %d bytes, want cap-1 %d", len(core), maxBrokerResponseBytes-1)
+	}
+	body := core + " " + "X"
+	if len(body) != maxBrokerResponseBytes+1 {
+		t.Fatalf("fixture = %d bytes, want cap+1 %d", len(body), maxBrokerResponseBytes+1)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(body))
+	}))
+	t.Cleanup(upstream.Close)
+	srv := New(Config{BaseURL: upstream.URL, Token: "probe-token"})
+	text, toolErr, perr := srv.callTool(context.Background(), "search", map[string]any{"model": "res.partner"})
+	if perr != nil {
+		t.Fatalf("over-cap body should be a tool error, not a protocol error: %+v", perr)
+	}
+	if !toolErr {
+		t.Fatalf("prefix+whitespace+1-byte over-cap body accepted without initialize: %q", text)
+	}
+	if !strings.Contains(text, "exceeds 4 MiB") {
+		t.Fatalf("over-cap denial text = %q, want 4 MiB bound", text)
 	}
 }
 

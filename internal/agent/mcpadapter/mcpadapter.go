@@ -22,12 +22,18 @@
 //
 // Transport bounds: one newline-terminated stdio frame per request capped
 // at 1 MiB (oversized input gets one ParseError and resynchronizes on the
-// next frame, never a repeat-decode loop); an encoder failure aborts Serve
+// next frame, never a repeat-decode loop); one whole broker response body
+// capped at 4 MiB (over-cap bodies are denied before any JSON decode, never
+// truncated-then-decoded); an encoder failure aborts Serve
 // with an error so the host exits non-zero; cancellation flows from Serve
 // into every broker request; the broker client never follows redirects and
 // only dials loopback http(s); tool arguments are strictly typed
 // (unknown/wrong-typed arguments are rejected before dispatch); the session
 // token is redacted from every error surface.
+//
+// Session: tools/call before a successful initialize gets a deterministic
+// not-initialized error and never dispatches; initialize is idempotent,
+// and ping/tools/list/notifications need no session.
 package mcpadapter
 
 import (
@@ -43,6 +49,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -57,6 +64,12 @@ const maxFrameBytes = 1 << 20 // 1 MiB
 // maxDiscardBytes bounds recovery after an over-cap frame: at most this
 // many bytes are dropped looking for the next newline before reporting.
 const maxDiscardBytes = 8 << 20 // 8 MiB
+
+// maxBrokerResponseBytes bounds one whole broker response body. The body is
+// read with a cap+1 limit and rejected before any JSON decode when it
+// exceeds the cap, so an unbounded response can never materialize (truncated
+// reads would otherwise decode attacker-chosen prefixes as valid).
+const maxBrokerResponseBytes = 4 << 20 // 4 MiB
 
 // defaultProtocolVersion is negotiated when the client offers nothing the
 // adapter supports.
@@ -234,7 +247,14 @@ type Server struct {
 	cfg Config
 	In  io.Reader
 	Out io.Writer
+	// initialized gates state-changing/model tool calls: it is set only by
+	// a successful initialize request, so tools/call before initialize gets
+	// a deterministic not-initialized error instead of a broker dispatch.
+	initialized atomic.Bool
 }
+
+// errNotInitialized marks a tools/call before a successful initialize.
+var errNotInitialized = errors.New("mcpadapter: session not initialized (send initialize first)")
 
 // New returns a stdio server bound to cfg (resolved) with process stdio.
 func New(cfg Config) *Server {
@@ -447,8 +467,9 @@ func (s *Server) handleNotification(method string, _ json.RawMessage) {
 }
 
 // negotiateVersion echoes the client's protocolVersion when the adapter
-// supports it, and the default otherwise. The adapter keeps no session
-// state: every initialize gets a deterministic answer.
+// supports it, and the default otherwise. Version negotiation is
+// deterministic; the only session state initialize confers is the
+// initialized flag gating tools/call.
 func negotiateVersion(params json.RawMessage) string {
 	var in struct {
 		ProtocolVersion string `json:"protocolVersion"`
@@ -468,6 +489,10 @@ func negotiateVersion(params json.RawMessage) string {
 func (s *Server) handle(ctx context.Context, method string, params json.RawMessage) (any, *rpcErr) {
 	switch method {
 	case "initialize":
+		// Idempotent: every successful initialize answers deterministically
+		// and (re)marks the session initialized. Notifications named
+		// "notifications/initialized" carry no ID and never reach here.
+		s.initialized.Store(true)
 		return map[string]any{
 			"protocolVersion": negotiateVersion(params),
 			"serverInfo":      map[string]any{"name": "odoo-broker", "version": Version},
@@ -478,6 +503,12 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 	case "tools/list":
 		return map[string]any{"tools": Tools()}, nil
 	case "tools/call":
+		// Session gate comes before any params decode or dispatch: an
+		// uninitialized caller gets one deterministic error and the
+		// broker sees zero requests.
+		if !s.initialized.Load() {
+			return nil, &rpcErr{Code: -32002, Message: errNotInitialized.Error()}
+		}
 		var in struct {
 			Name      string          `json:"name"`
 			Arguments map[string]any  `json:"arguments"`
@@ -730,9 +761,16 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		return "broker unreachable", true, nil
 	}
 	defer res.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	// Whole-response bound, checked BEFORE any JSON decode: read cap+1 and
+	// deny when the body exceeds the cap, so a valid-prefix-plus-trailing-
+	// bytes over-cap body (success or error envelope) is rejected instead
+	// of decoding its attacker-chosen prefix as valid.
+	raw, err := io.ReadAll(io.LimitReader(res.Body, maxBrokerResponseBytes+1))
 	if err != nil {
 		return "reading broker response failed", true, nil
+	}
+	if len(raw) > maxBrokerResponseBytes {
+		return "broker response exceeds 4 MiB", true, nil
 	}
 	var env struct {
 		Success bool            `json:"success"`
@@ -741,7 +779,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		Error   string          `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return "invalid broker response", true, nil
+		return "broker response is not valid", true, nil
 	}
 	if !env.Success {
 		msg := strings.TrimSpace(env.Error)
