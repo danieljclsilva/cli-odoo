@@ -8,7 +8,6 @@ package odoo
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -246,9 +245,7 @@ func New(inst *config.Instance) (*Client, error) {
 		timeout = 10 * time.Second
 	}
 
-	baseTransport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: !inst.VerifySSL}, //nolint:gosec // user-opt-in via verify_ssl=false
-	}
+	baseTransport := newHTTPTransport(inst.VerifySSL, timeout)
 
 	// Shared credential-redirect boundary: the exact configured origin.
 	// Both transports enforce it — c.http via Transport+CheckRedirect,
