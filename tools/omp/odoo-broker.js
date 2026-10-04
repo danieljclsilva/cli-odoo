@@ -20,7 +20,7 @@
 // discoverCustomToolPaths([], tmpCwd) discovers
 // <tmpCwd>/.omp/tools/odoo-broker.js with source
 // {provider:"native",providerName:"OMP",level:"project"}, and loadCustomTools
-// binds this factory to 11 tools (see tools/omp/odoo-broker.loader.test.js).
+// binds this factory to 12 tools (see tools/omp/odoo-broker.loader.test.js).
 // This module exports the FACTORY directly (module.exports = factory), for
 // tools the loader discovers at `.omp/tools/` (+ plugin/configured paths;
 // see discoverCustomToolPaths in loader.d.ts). Copy this file to
@@ -400,8 +400,16 @@ const WS_LIST_ARGS = { path: 'string', max_entries: 'int' };
 const WS_PATH_ARGS = { path: 'string' };
 const WS_WRITE_ARGS = { path: 'string', content: 'string' };
 
+const EVIDENCE_ARGS = { model: 'string', id: 'int', kind: 'string', limit: 'int', offset: 'int', tracking_offset:'int', attachment_id: 'int', path: 'string' };
+
 function buildTools() {
   return [
+    {
+      name: 'odoo.evidence', label: 'Odoo linked evidence',
+      description: 'Read chatter/tracking/attachments for a visible approved parent. Download linked binary attachments up to 2 MiB into the workspace. Tracking: offset pages messages; tracking_offset pages changes within those messages; response carries paging hints.',
+      parameters: { type: 'object', properties: { model: str('Approved parent model'), id: {type:'integer'}, kind: str('chatter, tracking, attachments or download'), limit:{type:'integer'}, offset:{type:'integer'}, tracking_offset:{type:'integer'}, attachment_id:{type:'integer'}, path:str('Download destination relative to workspace') }, required:['model','id','kind'] },
+      execute: exec('odoo.evidence', '/rpc/evidence', EVIDENCE_ARGS, (p) => ({ model:p.model, id:p.id, kind:p.kind, limit:p.limit, offset:p.offset, tracking_offset:p.tracking_offset, attachment_id:p.attachment_id, path:p.path })),
+    },
     {
       name: 'odoo.search',
       label: 'Odoo search',

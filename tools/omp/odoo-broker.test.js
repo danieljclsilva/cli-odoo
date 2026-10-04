@@ -10,7 +10,7 @@
 // path exercised, so no model/backend/Odoo credentials exist anywhere in
 // this file.
 //
-// PROVEN (2026-10-04): factory shape (11 typed tools, 5-arg execute);
+// PROVEN (2026-10-04): factory shape (12 typed tools, 5-arg execute);
 // legitimate routing to typed broker paths; denials surface as isError;
 // strict unknown/wrong-typed args rejected with no fetch; non-loopback
 // broker URLs refused; redirect:'error' set on every request; token
@@ -41,7 +41,7 @@ function byName(name) {
   return t;
 }
 
-test('factory returns eleven typed tools with execute + JSON-schema parameters', () => {
+test('factory returns twelve typed tools with execute + JSON-schema parameters', () => {
   assert.strictEqual(typeof factory, 'function', 'module must export the factory function');
   const tools = toolsOf();
   const names = tools.map((t) => t.name).sort();
@@ -50,6 +50,7 @@ test('factory returns eleven typed tools with execute + JSON-schema parameters',
     'odoo.catalog',
     'odoo.companies',
     'odoo.count',
+    'odoo.evidence',
     'odoo.meta',
     'odoo.read',
     'odoo.search',

@@ -4,12 +4,12 @@
 //     listener (search/read/count/aggregate/meta/companies/catalog/
 //     workspace.list/read/write/mkdir), curl-consumable by any runtime.
 //   - MCP stdio adapter (`agent mcp`, internal/agent/mcpadapter):
-//     JSON-RPC 2.0 over stdio forwarding ONLY the 11 typed broker tools
+//     JSON-RPC 2.0 over stdio forwarding ONLY the 12 typed broker tools
 //     (search, read, count, aggregate, meta, companies, catalog,
 //     workspace.list/read/write/mkdir). No admin/raw routing; the session
 //     token comes from ODOO_BROKER_TOKEN (env only).
 //   - OMP custom-tool module tools/omp/odoo-broker.js: CommonJS factory
-//     exposing the same 11 typed tools over the broker HTTP endpoints.
+//     exposing the same 12 typed tools over the broker HTTP endpoints.
 //     Covered by the real loader harness
 //     tools/omp/odoo-broker.loader.test.js (real OMP loader +
 //     in-process broker).
@@ -485,6 +485,7 @@ func (b *Broker) modelMux() *http.ServeMux {
 	m.HandleFunc("/rpc/read", b.requirePost(b.handleRead))
 	m.HandleFunc("/rpc/count", b.requirePost(b.handleCount))
 	m.HandleFunc("/rpc/aggregate", b.requirePost(b.handleAggregate))
+	m.HandleFunc("/rpc/evidence", b.requirePost(b.handleEvidence))
 	m.HandleFunc("/rpc/meta", b.requireGet(b.handleMeta))
 	m.HandleFunc("/rpc/companies", b.requireGet(b.handleCompanies))
 	m.HandleFunc("/rpc/catalog", b.requireGet(b.handleCatalog))
@@ -687,6 +688,9 @@ func (b *Broker) scopedArgs(rule policy.ModelRule, domain any) ([]any, map[strin
 			"company_id":          scope.Default,
 		},
 	}
+	if b.pol.IncludeArchived {
+		kwargs["context"].(map[string]any)["active_test"] = false
+	}
 	return full, kwargs, nil
 }
 
@@ -817,7 +821,7 @@ func (b *Broker) handleSearch(w http.ResponseWriter, r *http.Request) {
 	res, err := b.dispatchExec(r, in.Model, "search_read", nil, kwargs)
 	if err != nil {
 		if errors.Is(err, ErrSessionBudget) {
-			b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+			b.writeError(w, r, http.StatusTooManyRequests, err.Error())
 			b.releaseReserve(tok, reserved)
 			return
 		}
@@ -892,7 +896,7 @@ func (b *Broker) handleRead(w http.ResponseWriter, r *http.Request) {
 	res, err := b.dispatchExec(r, in.Model, "search_read", nil, kwargs)
 	if err != nil {
 		if errors.Is(err, ErrSessionBudget) {
-			b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+			b.writeError(w, r, http.StatusTooManyRequests, err.Error())
 			b.releaseReserve(tok, reserved)
 			return
 		}
@@ -951,7 +955,7 @@ func (b *Broker) handleCount(w http.ResponseWriter, r *http.Request) {
 	res, err := b.dispatchExec(r, in.Model, "search_count", []any{domain}, kwargs)
 	if err != nil {
 		if errors.Is(err, ErrSessionBudget) {
-			b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+			b.writeError(w, r, http.StatusTooManyRequests, err.Error())
 			b.releaseReserve(tok, reserved)
 			return
 		}
@@ -1058,7 +1062,7 @@ func (b *Broker) handleAggregate(w http.ResponseWriter, r *http.Request) {
 	res, err := b.dispatchExec(r, in.Model, "read_group", []any{domain, fields, gb}, kwargs)
 	if err != nil {
 		if errors.Is(err, ErrSessionBudget) {
-			b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+			b.writeError(w, r, http.StatusTooManyRequests, err.Error())
 			b.releaseReserve(tok, reserved)
 			return
 		}
@@ -1151,13 +1155,17 @@ func (b *Broker) handleMeta(w http.ResponseWriter, r *http.Request) {
 	for name, rule := range b.pol.Models {
 		models[name] = map[string]any{
 			"fields": rule.Fields, "max_limit": rule.MaxLimit,
-			"allow_aggregate": rule.AllowAggregate,
+			"allow_aggregate":      rule.AllowAggregate,
+			"linked_evidence_only": rule.LinkedEvidence,
 		}
 	}
 	b.record(tok, 0)
 	b.writeEnvelope(w, r, tok, map[string]any{
 		"instance": b.pol.Instance, "operations": ops, "models": models,
 		"default_company": b.pol.Scope.Default, "workspace": b.pol.AllowWorkspace,
+		"budgets": b.pol.Budgets, "require_bounded_queries": b.pol.RequireBoundedQueries,
+		"include_archived": b.pol.IncludeArchived, "allow_linked_evidence": b.pol.AllowLinkedEvidence,
+		"bounded_domain_guidance": "For scoped models use flat AND conditions: positive ID/reference IDs (up to 100), exact name/code/default_code/origin/client_order_ref/partner_ref, or lower and upper bounds on the same date field spanning at most 31 days. Maximum 64 projected fields and 3 group-by fields. Follow RPC pacing and back off on 429.",
 	}, len(models))
 }
 
@@ -1266,7 +1274,7 @@ func (b *Broker) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	models := make(map[string]any, len(b.snap.Models)+len(b.pol.Models))
 	for name, meta := range b.snap.Models {
-		_, exec := b.pol.Models[name]
+		rule, exec := b.pol.Models[name]
 		fields, unknown := catalogFields(meta)
 		entry := map[string]any{
 			"label": meta.Label, "provenance": meta.Provenance,
@@ -1275,6 +1283,7 @@ func (b *Broker) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		if len(unknown) > 0 {
 			entry["unknown_provenance"] = unknown
 		}
+		catalogPermissions(entry, rule, exec)
 		models[name] = entry
 	}
 	for name, rule := range b.pol.Models {
@@ -1295,6 +1304,7 @@ func (b *Broker) handleCatalog(w http.ResponseWriter, r *http.Request) {
 			"executable": true, "fields": fields,
 			"unknown_provenance": unknown,
 		}
+		catalogPermissions(entry, rule, true)
 		models[name] = entry
 	}
 	manifest := append([]string(nil), b.snap.MethodManifest...)
@@ -1323,13 +1333,26 @@ func catalogFields(meta snapshot.ModelMeta) (map[string]any, []string) {
 	return fields, unknown
 }
 
+// Metadata discovery does not grant value access. Evidence models have a
+// separate parent-bound route and are never generic executable models.
+func catalogPermissions(entry map[string]any, rule policy.ModelRule, enabled bool) {
+	entry["executable"] = enabled && !rule.LinkedEvidence
+	entry["linked_evidence_only"] = enabled && rule.LinkedEvidence
+	fields, _ := entry["fields"].(map[string]any)
+	for name, raw := range fields {
+		if field, ok := raw.(map[string]any); ok {
+			field["readable"] = enabled && !rule.LinkedEvidence && containsField(rule.Fields, name)
+		}
+	}
+}
+
 // catalogEntry renders one model's catalog entry (same shape as the
 // per-model values in handleCatalog, without the manifest wrapper).
 func (b *Broker) catalogEntry(name string) (map[string]any, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if meta, ok := b.snap.Models[name]; ok {
-		_, exec := b.pol.Models[name]
+		rule, exec := b.pol.Models[name]
 		fields, unknown := catalogFields(meta)
 		entry := map[string]any{
 			"label": meta.Label, "provenance": meta.Provenance,
@@ -1338,6 +1361,7 @@ func (b *Broker) catalogEntry(name string) (map[string]any, bool) {
 		if len(unknown) > 0 {
 			entry["unknown_provenance"] = unknown
 		}
+		catalogPermissions(entry, rule, exec)
 		return entry, true
 	}
 	if rule, ok := b.pol.Models[name]; ok {
@@ -1350,11 +1374,13 @@ func (b *Broker) catalogEntry(name string) (map[string]any, bool) {
 			}
 			unknown = append(unknown, fname)
 		}
-		return map[string]any{
+		entry := map[string]any{
 			"label": name, "provenance": snapshot.ProvUnknown,
 			"executable": true, "fields": fields,
 			"unknown_provenance": unknown,
-		}, true
+		}
+		catalogPermissions(entry, rule, true)
+		return entry, true
 	}
 	return nil, false
 }
@@ -1748,7 +1774,7 @@ func (b *Broker) handleWorkspaceList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(entries) > reserved {
-		b.writeError(w, r, http.StatusTooManyRequests, ErrSessionBudget.Error())
+		b.writeError(w, r, http.StatusTooManyRequests, err.Error())
 		return
 	}
 	b.settleRows(tok, reserved, len(entries))

@@ -242,6 +242,7 @@ func Tools() []Tool {
 	boolean := map[string]any{"type": "boolean"}
 	domain := map[string]any{}
 	return []Tool{
+		{Name: "evidence", Description: "Read chatter, tracked changes or attachments linked to a visible approved parent; download binaries up to 2 MiB into the workspace. Tracking: offset pages messages; tracking_offset pages changes within those messages; response carries paging hints.", InputSchema: obj(map[string]any{"model": str, "id": num, "kind": str, "limit": num, "offset": num, "tracking_offset": num, "attachment_id": num, "path": str}, "model", "id", "kind")},
 		{Name: "search", Description: "Scoped search_read over an allowlisted model.",
 			InputSchema: obj(map[string]any{"model": str, "domain": domain, "fields": strs, "order": str, "limit": num, "offset": num}, "model", "fields")},
 		{Name: "read", Description: "Scoped by-id read (converted to search_read server-side).",
@@ -692,6 +693,8 @@ func endpoint(name string) (method, path string, ok bool) {
 		return http.MethodPost, "/rpc/count", true
 	case "aggregate":
 		return http.MethodPost, "/rpc/aggregate", true
+	case "evidence":
+		return http.MethodPost, "/rpc/evidence", true
 	case "meta":
 		return http.MethodGet, "/rpc/meta", true
 	case "companies":
@@ -718,6 +721,7 @@ func endpoint(name string) (method, path string, ok bool) {
 // domain). GET tools take no body, so companies/catalog accept no arguments
 // at all and meta accepts only its model query.
 var toolArgTypes = map[string]map[string]string{
+	"evidence":        {"model": "string", "id": "int", "kind": "string", "limit": "int", "offset": "int", "tracking_offset": "int", "attachment_id": "int", "path": "string"},
 	"search":          {"model": "string", "domain": "any", "fields": "strings", "order": "string", "limit": "int", "offset": "int"},
 	"read":            {"model": "string", "ids": "ints", "fields": "strings"},
 	"count":           {"model": "string", "domain": "any"},

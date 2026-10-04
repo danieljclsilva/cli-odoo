@@ -8,7 +8,7 @@
 // module copied to <tmp>/.omp/tools/odoo-broker.js via
 // discoverCustomToolPaths([], tmpCwd) with source
 // {provider:"native",providerName:"OMP",level:"project"}, and
-// loadCustomTools binds it to 11 tools with zero load errors. Each bound
+// loadCustomTools binds it to 12 tools with zero load errors. Each bound
 // tool's execute() is then invoked against the REAL in-process broker
 // (tools/omp/loader-e2e-broker.go: genuine deny-by-default policyGate,
 // real model-mux transport over loopback httptest, dispatch recorder for
@@ -134,7 +134,7 @@ test('real loader discovers, binds, and drives factory tools vs real broker', as
       throw new Error('unexpected tool source: ' + JSON.stringify(paths[0]));
     const { tools, errors } = await m.loadCustomTools(paths, cwd, []);
     if (errors.length) throw new Error('load errors: ' + JSON.stringify(errors));
-    if (tools.length !== 11) throw new Error('want 11 bound tools, got ' + tools.length);
+    if (tools.length !== 12) throw new Error('want 12 bound tools, got ' + tools.length);
     const byName = Object.fromEntries(tools.map((x) => [x.tool.name, x.tool]));
     const j = (v) => JSON.stringify(v).slice(0, 500);
     const results = {};

@@ -192,8 +192,8 @@ func TestToolsListTypedOnly(t *testing.T) {
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
 	result, _ := res["result"].(map[string]any)
 	tools, _ := result["tools"].([]any)
-	if len(tools) != 11 {
-		t.Fatalf("tools/list = %d tools, want 11", len(tools))
+	if len(tools) != 12 {
+		t.Fatalf("tools/list = %d tools, want 12", len(tools))
 	}
 }
 
@@ -238,8 +238,8 @@ func TestToolsListRequiresReady(t *testing.T) {
 	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":73,"method":"tools/list","params":{}}`)
 	result, _ := res["result"].(map[string]any)
 	tools, _ := result["tools"].([]any)
-	if len(tools) != 11 {
-		t.Fatalf("ready tools/list = %d tools, want 11", len(tools))
+	if len(tools) != 12 {
+		t.Fatalf("ready tools/list = %d tools, want 12", len(tools))
 	}
 }
 

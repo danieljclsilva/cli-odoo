@@ -26,6 +26,7 @@ var (
 	ErrSessionExpired = errors.New("broker: session token expired")
 	// ErrSessionBudget is returned when a session exhausted its budgets.
 	ErrSessionBudget = errors.New("broker: session budget exhausted")
+	ErrRPCBudget     = fmt.Errorf("%w: upstream pacing/concurrency reached; retry with backoff", ErrSessionBudget)
 )
 
 // maxLiveSessions caps the session table. Grant evicts the
@@ -51,6 +52,9 @@ const defaultRPCTimeout = 30 * time.Second
 // cannot reach here — New rejects them via pol.Validate — so there is no
 // second budget-validation path to drift.
 func inflightLimit(p *policy.Policy) int {
+	if p != nil && p.Budgets.MaxConcurrentRPC > 0 {
+		return p.Budgets.MaxConcurrentRPC
+	}
 	if p != nil && p.Budgets.MaxCallsPerSession > 0 && p.Budgets.MaxCallsPerSession < defaultInflightLimit {
 		return int(p.Budgets.MaxCallsPerSession)
 	}
@@ -80,13 +84,22 @@ func (b *Broker) setInflightForTest(n int) {
 // reservation (no RPC ran, nothing billed beyond the rollback).
 func (b *Broker) tryAcquireInflight() bool {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	ch := b.inflight
-	b.mu.Unlock()
 	if ch == nil {
 		return true
 	}
 	select {
 	case ch <- struct{}{}:
+		interval := time.Duration(0)
+		if b.pol != nil {
+			interval = time.Duration(b.pol.Budgets.MinRPCIntervalMillis) * time.Millisecond
+		}
+		if interval > 0 && time.Now().Before(b.nextRPC) {
+			<-ch
+			return false
+		}
+		b.nextRPC = time.Now().Add(interval)
 		return true
 	default:
 		return false
@@ -194,7 +207,7 @@ func (b *Broker) dispatchExec(r *http.Request, model, method string, args []any,
 		// Cancellation aborts the upstream call inside ExecuteContext:
 		// no late goroutine can outlive the return.
 		if !b.tryAcquireInflight() {
-			return nil, ErrSessionBudget
+			return nil, ErrRPCBudget
 		}
 		defer b.releaseInflight()
 		return b.callExec(ctx, exec, model, method, args, kwargs)
@@ -205,7 +218,7 @@ func (b *Broker) dispatchExec(r *http.Request, model, method string, args []any,
 	// freed by the reaper when Execute finally returns (fast path
 	// releases synchronously before returning).
 	if !b.tryAcquireInflight() {
-		return nil, ErrSessionBudget
+		return nil, ErrRPCBudget
 	}
 	done := make(chan execResult, 1)
 	finished := make(chan struct{})
@@ -308,6 +321,7 @@ type Broker struct {
 	// actual Execute returns (see dispatchExec). An HTTP WriteTimeout alone
 	// is insufficient: it bounds the response write, not the upstream call.
 	rpcTimeout time.Duration
+	nextRPC    time.Time
 
 	authz     authorizer
 	exec      executor
