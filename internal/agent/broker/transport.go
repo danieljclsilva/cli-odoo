@@ -134,29 +134,20 @@ func (b *Broker) effectiveAdminSocket(addr string) string {
 // malformed or over-cap input denies before secrets are touched).
 const maxServingFileBytes = 4 << 20
 
-// checkServeFile bounds one serve-boundary file load: it must be a regular
-// file, fit maxServingFileBytes, and read back at that bound. The caller
-// (Serve) runs this BEFORE credential resolution on every loading path.
+// checkServeFile bounds one serve-boundary file load through its held open
+// descriptor (snapshot.ReadBoundedFile: Lstat pre-check without following,
+// nonblocking open, held-handle fstat + SameFile, cap+1 bounded read): no
+// Stat-then-ReadFile window, symlinks and non-regular files (including
+// FIFOs) are refused without blocking, and a file that grows past
+// maxServingFileBytes denies over-cap. The caller (Serve) runs this BEFORE
+// credential resolution on every loading path.
 func checkServeFile(path string) ([]byte, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("broker: empty serving file path")
 	}
-	st, err := os.Stat(path)
+	raw, err := snapshot.ReadBoundedFile(path, maxServingFileBytes, "serving file")
 	if err != nil {
 		return nil, fmt.Errorf("broker: serving file %q: %w", path, err)
-	}
-	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("broker: serving file %q is not a regular file", path)
-	}
-	if st.Size() > maxServingFileBytes {
-		return nil, fmt.Errorf("broker: serving file %q is %d bytes, over cap %d", path, st.Size(), maxServingFileBytes)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("broker: reading serving file %q: %w", path, err)
-	}
-	if int64(len(raw)) > maxServingFileBytes {
-		return nil, fmt.Errorf("broker: serving file %q is %d bytes, over cap %d", path, len(raw), maxServingFileBytes)
 	}
 	return raw, nil
 }
@@ -793,10 +784,11 @@ func (b *Broker) handleSearch(w http.ResponseWriter, r *http.Request) {
 	// smaller min); on success settleRows refunds the unused headroom, on
 	// RPC or output failure the attempt keeps its reservation (billed).
 	// dispatchExec takes one in-flight slot (429 when saturated, rolled
-	// back via releaseReserve since no RPC ran) and runs the RPC under the
-	// timeout/abandonment wrapper (HTTP WriteTimeout alone cannot bound the
-	// upstream call; the running Execute is abandoned, not cancelled);
-	// dispatched failures keep the reservation.
+	// back via releaseReserve since no RPC ran). Context-aware executors
+	// abort the upstream call on timeout/cancel; legacy executors keep
+	// the slot until the actual Execute returns, so saturation keeps
+	// denying until real work drains (HTTP WriteTimeout alone cannot
+	// bound the upstream call); dispatched failures keep the reservation.
 	reserved, err := b.reserveForLimit(tok, limit)
 	if b.checkError(w, r, err) {
 		b.release(tok)

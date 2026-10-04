@@ -60,30 +60,23 @@ func agentParent() *cobra.Command {
 // 4 MiB, the same cap the lock package enforces on payloads and ciphertext.
 const agentMaxProfileBytes = 4 << 20
 
-// agentLoadProfileEnvelope reads profilePath with a strict decoder: the
-// file must be a regular file of at most agentMaxProfileBytes, hold
-// exactly one JSON object (unknown fields rejected, trailing data after
-// the document denied), and decode as a lock.Profile envelope. Every
-// serving-stack loading path funnels here so a swapped/ragged profile
-// fails closed before crypto runs.
+// agentLoadProfileEnvelope reads profilePath through its held open
+// descriptor (snapshot.ReadBoundedFile: Lstat pre-check without following,
+// nonblocking open, held-handle fstat + SameFile, cap+1 bounded read): no
+// Stat-then-ReadFile window, symlinks and non-regular files (including
+// FIFOs) are refused without blocking, and a file that grows past
+// agentMaxProfileBytes denies over-cap. The bytes must hold exactly one
+// JSON object (unknown fields rejected, trailing data after the document
+// denied) decoding as a lock.Profile envelope. Every serving-stack
+// loading path funnels here so a swapped/ragged profile fails closed
+// before crypto runs.
 func agentLoadProfileEnvelope(profilePath string) (lock.Profile, error) {
 	var prof lock.Profile
-	st, err := os.Stat(profilePath)
+	b, err := snapshot.ReadBoundedFile(profilePath, agentMaxProfileBytes, "profile")
 	if err != nil {
 		return prof, fmt.Errorf("reading profile: %w", err)
 	}
-	if !st.Mode().IsRegular() {
-		return prof, fmt.Errorf("reading profile %q: not a regular file", profilePath)
-	}
-	if st.Size() > agentMaxProfileBytes {
-		return prof, fmt.Errorf("reading profile %q: %d bytes exceeds cap %d", profilePath, st.Size(), agentMaxProfileBytes)
-	}
-	f, err := os.Open(profilePath)
-	if err != nil {
-		return prof, fmt.Errorf("reading profile: %w", err)
-	}
-	defer f.Close()
-	dec := json.NewDecoder(io.LimitReader(f, agentMaxProfileBytes+1))
+	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&prof); err != nil {
 		return prof, fmt.Errorf("decoding profile: %w", err)

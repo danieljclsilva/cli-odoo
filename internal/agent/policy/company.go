@@ -63,7 +63,7 @@ func CompanyFilterFragment(rule ModelRule, scope CompanyScope) (frag []any, enfo
 		return nil, true
 	}
 	field, ok := NormalizeName(rule.CompanyField)
-	if !ok {
+	if !ok || field != rule.CompanyField {
 		return nil, true
 	}
 	ids := make([]any, 0, len(scope.Enabled))
@@ -123,7 +123,7 @@ func (p *Policy) CompanyFieldValid(schema SchemaView, model string) error {
 		return nil
 	}
 	field, ok := NormalizeName(rule.CompanyField)
-	if !ok || field == "" {
+	if !ok || field == "" || field != rule.CompanyField {
 		return fmt.Errorf("policy: model %q has no usable company field", model)
 	}
 	if schema == nil {

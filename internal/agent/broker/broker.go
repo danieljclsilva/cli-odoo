@@ -39,9 +39,9 @@ const maxLiveSessions = 64
 // connection, so unbounded fan-out would let one session exhaust both.
 const defaultInflightLimit = 8
 
-// defaultRPCTimeout bounds one admitted Execute call. The underlying
-// executor has no context parameter, so callExec enforces this with a
-// wrapper goroutine (see below).
+// defaultRPCTimeout bounds one admitted Execute call. Context-aware
+// executors (see ctxExecutor) enforce it by cancelling the upstream call;
+// legacy executors run under a timeout wrapper in callExec (see below).
 const defaultRPCTimeout = 30 * time.Second
 
 // inflightLimit derives the dispatch semaphore capacity from validated
@@ -117,30 +117,47 @@ func (b *Broker) rpcTimeoutOf() time.Duration {
 	return b.rpcTimeout
 }
 
-// execResult carries one Execute outcome across the timeout wrapper.
+// execResult carries one Execute outcome across the legacy timeout wrapper.
 type execResult struct {
 	res any
 	err error
 }
 
-// callExec bounds exec.Execute with a timeout/abandonment wrapper: the RPC
-// runs in a child goroutine while the caller waits on ctx (the request
-// context) and an internal timer. On expiry/cancel it returns a ctx.Err()-class
-// failure and the admitted reservation stays billed (the dispatch was
-// admitted). The running Execute is NOT cancelled — the wrapper abandons the
-// child goroutine (executor takes no context; internal/odoo is frozen for
-// this slice), so a hung backend leaks one goroutine until it returns. Slot
-// freed via defer; repeated timeouts accumulate leaks (no reaper).
+// ctxExecutor is the context-aware execution seam. *odoo.Client implements
+// it via ExecuteContext (cancellation aborts the upstream HTTP call); fakes
+// and future executors that only implement Execute run under the legacy
+// wrapper in callExec with the dispatch slot retained until the actual
+// Execute returns.
+type ctxExecutor interface {
+	ExecuteContext(ctx context.Context, model, method string, args []any, kwargs map[string]any) (any, error)
+}
+
+// callExec runs one admitted Execute under the request context plus the
+// per-RPC timeout. Context-aware executors receive the derived ctx
+// directly, so expiry/cancel aborts the upstream call — no orphan
+// goroutine, no accumulation beyond the inflight bound. Legacy executors
+// (Execute only) run in a child goroutine; the caller in dispatchExec
+// retains the dispatch slot until that goroutine actually returns, so a
+// timed-out call still occupies its slot instead of admitting unbounded
+// replacement work. Either way the admitted reservation stays billed (the
+// dispatch was admitted). A nil executor, nil request context, or an
+// already-cancelled context fails closed before any dispatch.
 func (b *Broker) callExec(ctx context.Context, exec executor, model, method string, args []any, kwargs map[string]any) (any, error) {
 	if exec == nil {
-		return nil, errors.New("broker not serving")
+		return nil, errBrokerNotServing
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	timeout := b.rpcTimeoutOf()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if ce, ok := exec.(ctxExecutor); ok {
+		return ce.ExecuteContext(ctx, model, method, args, kwargs)
+	}
 	done := make(chan execResult, 1)
 	go func() {
 		res, err := exec.Execute(model, method, args, kwargs)
@@ -162,24 +179,75 @@ var errBrokerNotServing = errors.New("broker not serving")
 
 // dispatchExec is the single admitted-dispatch path for RPC handlers: it
 // takes one in-flight slot (deny 429 when saturated), runs callExec with
-// the request context, and frees the slot. Reserved rows are owned by the
-// caller: on semaphore denial the caller rolls back via releaseReserve
-// (no RPC ran); on dispatch (success or failure) the reservation stays
-// billed and the slot frees.
+// the request context, and frees the slot only when no actual Execute is
+// outstanding. Context-aware executors return with the upstream call
+// already aborted, so the deferred release is exact. Legacy executors may
+// still be running after callExec reports a timeout: then the release is
+// transferred to the late goroutine, which frees the slot on actual
+// completion — saturated requests keep denying 429 until real work
+// drains, so repeated cancel/block attempts cannot accumulate outstanding
+// goroutines beyond the bound. Reserved rows are owned by the caller: on
+// semaphore denial the caller rolls back via releaseReserve (no RPC ran);
+// on dispatch (success or failure) the reservation stays billed and the
+// slot frees only after actual completion.
 func (b *Broker) dispatchExec(r *http.Request, model, method string, args []any, kwargs map[string]any) (any, error) {
 	exec := b.execOf()
 	if exec == nil {
 		return nil, errBrokerNotServing
 	}
-	if !b.tryAcquireInflight() {
-		return nil, ErrSessionBudget
-	}
-	defer b.releaseInflight()
 	var ctx context.Context
 	if r != nil {
 		ctx = r.Context()
 	}
-	return b.callExec(ctx, exec, model, method, args, kwargs)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, ok := exec.(ctxExecutor); ok {
+		// Cancellation aborts the upstream call inside ExecuteContext:
+		// no late goroutine can outlive the return.
+		if !b.tryAcquireInflight() {
+			return nil, ErrSessionBudget
+		}
+		defer b.releaseInflight()
+		return b.callExec(ctx, exec, model, method, args, kwargs)
+	}
+	// Legacy executor: retain semaphore ownership until the actual
+	// Execute returns. The select below reports the timeout to the
+	// caller while the worker goroutine is still running; the slot is
+	// freed by the reaper when Execute finally returns (fast path
+	// releases synchronously before returning).
+	if !b.tryAcquireInflight() {
+		return nil, ErrSessionBudget
+	}
+	done := make(chan execResult, 1)
+	finished := make(chan struct{})
+	timeout := b.rpcTimeoutOf()
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	go func() {
+		defer close(finished)
+		res, err := exec.Execute(model, method, args, kwargs)
+		select {
+		case done <- execResult{res, err}:
+		case <-callCtx.Done():
+		}
+	}()
+	select {
+	case out := <-done:
+		<-finished
+		b.releaseInflight()
+		return out.res, out.err
+	case <-callCtx.Done():
+		err := callCtx.Err()
+		go func() {
+			<-finished
+			b.releaseInflight()
+		}()
+		return nil, err
+	}
 }
 
 // Session is a minted model credential. The token is returned once at
@@ -248,12 +316,12 @@ type Broker struct {
 	// deny with 429 instead of queueing unboundedly. Tests may replace
 	// the channel via setInflightForTest.
 	inflight chan struct{}
-	// rpcTimeout bounds one admitted Execute call. exec.Execute has no
-	// context parameter (internal/odoo is frozen for this slice), so the
-	// broker enforces the bound with a context-aware wrapper inside this
-	// package (callExec): the RPC runs in a child goroutine and the
-	// wrapper returns ctx.Err() on expiry. An HTTP WriteTimeout alone is
-	// insufficient: it bounds the response write, not the upstream call.
+	// rpcTimeout bounds one admitted Execute call. Context-aware executors
+	// (*odoo.Client via ExecuteContext) enforce it by cancelling the
+	// upstream HTTP call; legacy executors run under a timeout wrapper in
+	// this package (callExec) with the dispatch slot retained until the
+	// actual Execute returns (see dispatchExec). An HTTP WriteTimeout alone
+	// is insufficient: it bounds the response write, not the upstream call.
 	rpcTimeout time.Duration
 
 	authz     authorizer

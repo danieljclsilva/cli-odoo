@@ -50,6 +50,11 @@ type Client struct {
 	object   *xmlrpc.Client
 	http     *http.Client
 	jsonBase string // json2 endpoint root: {url}/api/v2
+	// objectURL is the XML-RPC object endpoint for the context-aware
+	// ExecuteContext path (raw POST via c.http with the request context,
+	// so cancellation aborts the upstream call). Legacy Execute keeps
+	// using c.object (kolo/xmlrpc, no context).
+	objectURL string
 }
 
 // UID returns the authenticated user id.
@@ -301,6 +306,7 @@ func New(inst *config.Instance) (*Client, error) {
 	c.uid = uid
 	c.common = common
 	c.object = object
+	c.objectURL = base + "/xmlrpc/2/object"
 	return c, nil
 }
 
@@ -309,7 +315,19 @@ func New(inst *config.Instance) (*Client, error) {
 // as context.lang. Credentials are never included in returned errors.
 // The client is read-only: only allowlisted read methods execute; any other
 // method is refused before any RPC is sent. There is no write path.
+// Execute uses context.Background: broker dispatches SHOULD prefer
+// ExecuteContext so request cancellation aborts the upstream HTTP call.
 func (c *Client) Execute(model, method string, args []any, kwargs map[string]any) (any, error) {
+	return c.ExecuteContext(context.Background(), model, method, args, kwargs)
+}
+
+// ExecuteContext is the context-aware Execute: model/method validation,
+// read-only gating, Lang injection, and response bounds are identical to
+// Execute, but the upstream HTTP call carries ctx so cancellation and the
+// broker RPC timeout abort the in-flight request instead of abandoning a
+// goroutine. XML-RPC posts raw execute_kw via c.http (kolo/xmlrpc has no
+// context API); json2 posts via c.http with the request attached to ctx.
+func (c *Client) ExecuteContext(ctx context.Context, model, method string, args []any, kwargs map[string]any) (any, error) {
 	model = strings.TrimSpace(model)
 	method = strings.TrimSpace(method)
 	if !isValidModelName(model) {
@@ -317,6 +335,12 @@ func (c *Client) Execute(model, method string, args []any, kwargs map[string]any
 	}
 	if !IsReadOnlyMethod(method) {
 		return nil, fmt.Errorf("odoo: refusing %s.%s: CLI is read-only (no write request is ever sent)", model, method)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if args == nil {
 		args = []any{}
@@ -326,12 +350,12 @@ func (c *Client) Execute(model, method string, args []any, kwargs map[string]any
 		kw[k] = v
 	}
 	if c.Lang != "" {
-		ctx, ok := kw["context"].(map[string]any)
+		oc, ok := kw["context"].(map[string]any)
 		if !ok {
-			ctx = map[string]any{}
+			oc = map[string]any{}
 		}
 		cp := map[string]any{}
-		for k, v := range ctx {
+		for k, v := range oc {
 			cp[k] = v
 		}
 		cp["lang"] = c.Lang
@@ -339,14 +363,10 @@ func (c *Client) Execute(model, method string, args []any, kwargs map[string]any
 	}
 
 	if c.Transport == "json2" {
-		return c.jsonCall("/"+url.PathEscape(model)+"/"+url.PathEscape(method), map[string]any{"args": args, "kwargs": kw})
+		return c.jsonCallContext(ctx, "/"+url.PathEscape(model)+"/"+url.PathEscape(method), map[string]any{"args": args, "kwargs": kw})
 	}
-	var out any
 	params := []any{c.DB, c.uid, c.secret, model, method, args, kw}
-	if err := c.object.Call("execute_kw", params, &out); err != nil {
-		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s.%s: %w", model, method, err))
-	}
-	return out, nil
+	return c.xmlExecuteContext(ctx, "execute_kw", params, model, method)
 }
 
 // ServerVersion returns the server version info (common.version on xmlrpc).
@@ -463,11 +483,24 @@ func truncateServerError(v any) string {
 }
 
 func (c *Client) jsonCall(path string, payload any) (any, error) {
+	return c.jsonCallContext(context.Background(), path, payload)
+}
+
+// jsonCallContext is jsonCall with the request bound to ctx: broker RPC
+// timeouts and client cancellations abort the in-flight POST (no orphan
+// accumulation), and the response body stays capped by decodeJSONCapped.
+func (c *Client) jsonCallContext(ctx context.Context, path string, payload any) (any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, c.sanitizeErr(fmt.Errorf("odoo: encode payload: %w", err))
 	}
-	req, err := http.NewRequest("POST", c.jsonBase+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.jsonBase+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, c.sanitizeErr(err)
 	}
@@ -498,6 +531,61 @@ func (c *Client) jsonCall(path string, payload any) (any, error) {
 		if r, ok := m["result"]; ok {
 			return r, nil
 		}
+	}
+	return out, nil
+}
+
+// xmlExecuteContext posts one XML-RPC method call with the request bound to
+// ctx and decodes the response bounded by maxXMLResponseBytes. It mirrors
+// kolo/xmlrpc execute_kw wire format (EncodeMethodCall) but bypasses the
+// rpc.Client codec, which has no context API: cancellation aborts the HTTP
+// round trip and the response read, so no goroutine outlives ctx. The
+// origin guard still applies (c.http Transport wraps redirectGuard; the
+// default client redirect policy is same-origin-only-safe because any
+// cross-origin redirect would re-enter the guard on the next hop).
+func (c *Client) xmlExecuteContext(ctx context.Context, rpcMethod string, params []any, model, method string) (any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	endpoint := c.objectURL
+	if endpoint == "" {
+		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s.%s: xmlrpc object endpoint unavailable", model, method))
+	}
+	encoded, err := xmlrpc.EncodeMethodCall(rpcMethod, params...)
+	if err != nil {
+		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s.%s: %w", model, method, err))
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(encoded))
+	if err != nil {
+		return nil, c.sanitizeErr(err)
+	}
+	req.Header.Set("Content-Type", "text/xml")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s.%s: %w", model, method, err))
+	}
+	defer resp.Body.Close()
+	lr := &io.LimitedReader{R: resp.Body, N: maxXMLResponseBytes + 1}
+	raw, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s.%s: %w", model, method, err))
+	}
+	if lr.N <= 0 {
+		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s.%s: response exceeds %d bytes", model, method, maxXMLResponseBytes))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s.%s: request error: bad status code - %d", model, method, resp.StatusCode))
+	}
+	xmlResp := xmlrpc.Response(raw)
+	if err := xmlResp.Err(); err != nil {
+		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s.%s: %w", model, method, err))
+	}
+	var out any
+	if err := xmlResp.Unmarshal(&out); err != nil {
+		return nil, c.sanitizeErr(fmt.Errorf("odoo: %s.%s: %w", model, method, err))
 	}
 	return out, nil
 }

@@ -203,8 +203,12 @@ func (s Snapshot) Model(name string) (policy.ModelView, bool) {
 	return modelView{fields: m.Fields}, true
 }
 
-// Load reads, strictly decodes, and validates a snapshot file: the file is
-// size-capped (MaxFileBytes) and must be a regular file; unknown JSON fields
+// Load reads, strictly decodes, and validates a snapshot file through its
+// held open descriptor (ReadBoundedFile: Lstat pre-check without following,
+// nonblocking open, held-handle fstat + SameFile, cap+1 bounded read): no
+// Stat-then-ReadFile window, symlinks and non-regular files (including
+// FIFOs) are refused without blocking, and a file that grows past
+// MaxFileBytes between open and read denies over-cap. Unknown JSON fields
 // are rejected and any version other than FormatVersion denies with no legacy
 // fallback. A malformed file fails closed before any policy decision can
 // consult it. A missing Executable defaults to false (display-only; the
@@ -212,22 +216,9 @@ func (s Snapshot) Model(name string) (policy.ModelView, bool) {
 // accepted for files written before it existed; an empty model provenance is
 // always rejected.
 func Load(path string) (Snapshot, error) {
-	st, err := os.Stat(path)
+	b, err := ReadBoundedFile(path, MaxFileBytes, "snapshot")
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("snapshot: reading %q: %w", path, err)
-	}
-	if !st.Mode().IsRegular() {
-		return Snapshot{}, fmt.Errorf("snapshot: %q is not a regular file", path)
-	}
-	if st.Size() > MaxFileBytes {
-		return Snapshot{}, fmt.Errorf("snapshot: %q is %d bytes, over cap %d", path, st.Size(), MaxFileBytes)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("snapshot: reading %q: %w", path, err)
-	}
-	if int64(len(b)) > MaxFileBytes {
-		return Snapshot{}, fmt.Errorf("snapshot: %q is %d bytes, over cap %d", path, len(b), MaxFileBytes)
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
@@ -360,6 +351,26 @@ func WriteBytes(path string, b []byte) error {
 	}
 	if err := s.validate(); err != nil {
 		return fmt.Errorf("snapshot: refusing to write invalid staged snapshot: %w", err)
+	}
+	if err := secureReplaceFile(path, b); err != nil {
+		return fmt.Errorf("snapshot: writing %q: %w", path, err)
+	}
+	return nil
+}
+
+// RestoreBytes rewrites exact prior bytes captured by ReadBoundedFile
+// without re-validation: it is the commit-rollback path for a prior file
+// that was readable (and therefore valid) before this commit started. The
+// bytes are still cap-checked, and the write uses the same atomic
+// O_EXCL-temp + fsync + rename secure-replace as Write (no symlink sink:
+// rename replaces a final-component symlink itself, and breaks — not
+// follows — preexisting hardlinks). Unlike WriteBytes it never refuses a
+// legacy payload: validation belongs to staging, and rollback must restore
+// the prior working pair byte-identically even if the binary's rules moved
+// on since that pair was written.
+func RestoreBytes(path string, b []byte) error {
+	if int64(len(b)) > MaxFileBytes {
+		return fmt.Errorf("snapshot: staged snapshot %d bytes exceeds cap %d", len(b), MaxFileBytes)
 	}
 	if err := secureReplaceFile(path, b); err != nil {
 		return fmt.Errorf("snapshot: writing %q: %w", path, err)

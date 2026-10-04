@@ -99,6 +99,11 @@ var errRedirectRefused = errors.New("mcpadapter: refusing redirect (redirects ar
 // errFrameTooLarge marks an over-cap stdio frame.
 var errFrameTooLarge = errors.New("mcpadapter: frame exceeds 1 MiB")
 
+// errFrameDesync marks input that stayed mid-line past maxDiscardBytes:
+// recovery cannot resynchronize within bounds, so Serve aborts instead of
+// emitting repeat ParseErrors over a stuck desync.
+var errFrameDesync = errors.New("mcpadapter: frame exceeds recovery bound")
+
 // Resolve fills BaseURL/Token from the environment when unset:
 // ODOO_BROKER_URL (default http://127.0.0.1:8471) and ODOO_BROKER_TOKEN.
 func (c Config) Resolve() Config {
@@ -237,55 +242,86 @@ func New(cfg Config) *Server {
 }
 
 // readFrame reads one newline-terminated frame, bounded by maxFrameBytes.
-// It returns io.EOF only when no bytes remain. An over-cap frame is fully
-// consumed (remainder discarded, bounded by maxDiscardBytes) and reported
-// once as errFrameTooLarge, so the caller emits one ParseError and
-// resynchronizes on the next frame instead of looping on a stuck decoder.
+// Framing is incremental: fragments are pulled with ReadSlice and appended
+// only while the total stays within maxFrameBytes+1, so an unbounded line
+// never materializes before the cap check. It returns io.EOF only when no
+// bytes remain. An over-cap frame is consumed exactly through its newline
+// (the remainder is discarded with ReadSlice, which never consumes past the
+// newline, so the next valid frame is preserved) and reported once as
+// errFrameTooLarge, so the caller emits one ParseError and resynchronizes
+// on the next frame instead of looping on a stuck decoder. A transport
+// error is terminal and returned as-is; recovery that finds no newline
+// within maxDiscardBytes reports errFrameDesync.
 func readFrame(r *bufio.Reader) ([]byte, error) {
 	var buf []byte
 	for {
-		chunk, err := r.ReadBytes('\n')
-		buf = append(buf, chunk...)
-		if len(buf) > maxFrameBytes+1 {
-			if err == nil || err == io.EOF {
-				// Line already ended (or stream ended): the whole
-				// over-cap frame is consumed; report once.
+		frag, err := r.ReadSlice('\n')
+		if len(frag) > 0 {
+			if len(buf)+len(frag) > maxFrameBytes+1 {
+				// Over cap: a newline-terminated fragment means the
+				// whole over-cap frame is already consumed exactly;
+				// otherwise drop the remainder up to (and including)
+				// the newline without touching the frame after it.
+				if err == nil {
+					return nil, errFrameTooLarge
+				}
+				if derr := discardRestOfLine(r); derr != nil {
+					return nil, derr
+				}
 				return nil, errFrameTooLarge
 			}
-			// Mid-line and over cap: drop the rest of the line so the
-			// next frame starts clean, then report once.
-			discardRestOfLine(r)
-			return nil, errFrameTooLarge
+			// Copy: frag aliases the reader buffer and is invalidated
+			// by the next read.
+			buf = append(buf, frag...)
 		}
 		if err == nil {
 			return buf, nil
 		}
-		if err == io.EOF {
-			if len(buf) == 0 {
-				return nil, io.EOF
+		if err == bufio.ErrBufferFull {
+			if len(frag) == 0 {
+				// No progress possible: treat as terminal rather than
+				// spin on an unreadable buffer.
+				return nil, err
 			}
-			return buf, nil
+			// Buffer filled without a newline: keep framing within cap.
+			continue
+		}
+		if err == io.EOF {
+			if len(buf) > 0 {
+				return buf, nil
+			}
+			return nil, io.EOF
 		}
 		return nil, err
 	}
 }
 
-// discardRestOfLine drops bytes until the next newline, EOF, a read error,
-// or maxDiscardBytes — bounding recovery from an over-cap frame.
-func discardRestOfLine(r *bufio.Reader) {
-	scratch := make([]byte, 4096)
-	for dropped := 0; dropped < maxDiscardBytes; {
-		n, err := r.Read(scratch)
-		dropped += n
-		if err != nil {
-			return
+// discardRestOfLine drops bytes up to and including the next newline, EOF,
+// a read error, or maxDiscardBytes — bounding recovery from an over-cap
+// frame. It consumes exactly through the newline (ReadSlice never reads
+// past it), so the next frame starts clean. It returns nil once resync is
+// complete (newline or EOF), the transport error when input fails, or
+// errFrameDesync when no newline appears within maxDiscardBytes.
+func discardRestOfLine(r *bufio.Reader) error {
+	dropped := 0
+	for dropped < maxDiscardBytes {
+		frag, err := r.ReadSlice('\n')
+		dropped += len(frag)
+		if err == nil {
+			return nil
 		}
-		for _, b := range scratch[:n] {
-			if b == '\n' {
-				return
+		if err == bufio.ErrBufferFull {
+			if len(frag) == 0 {
+				return errFrameDesync
 			}
+			continue
 		}
+		if err == io.EOF {
+			return nil
+		}
+		return err
 	}
+	return errFrameDesync
 }
 
 // Serve reads newline-framed JSON-RPC 2.0 requests from In and writes
@@ -294,23 +330,86 @@ func discardRestOfLine(r *bufio.Reader) {
 // loop continues on the next frame. Notifications get no reply. An output
 // (encoder) failure aborts Serve with an error so the host process exits
 // non-zero instead of silently dropping responses.
+//
+// Transport errors are terminal: a failing input reader aborts Serve with
+// the error instead of emitting repeat ParseErrors in a tight loop. Only
+// over-cap frames (errFrameTooLarge) and malformed JSON recover with one
+// ParseError each; input that never resynchronizes (errFrameDesync) aborts.
+//
+// Cancellation preempts even an idle blocked read: one reader goroutine
+// owned by this Serve call feeds whole frames over a rendezvous channel
+// while the loop selects on ctx.Done. On abort the input is closed when it
+// is an io.Closer (os.Stdin, pipes) so the parked read unblocks and the
+// single reader exits — no per-read goroutines, no unbounded leak. The
+// initial ctx check fails fast without starting the reader at all.
 func (s *Server) Serve(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r := bufio.NewReader(s.In)
 	enc := json.NewEncoder(s.Out)
 	respond := func(v rpcResponse) error { return enc.Encode(v) }
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
+	// unblock releases a reader parked in input Read on abort paths. It
+	// is a no-op for non-closable inputs, where at most the single owned
+	// reader stays parked until input arrives or the process exits.
+	var unblock func()
+	if closer, ok := s.In.(io.Closer); ok {
+		unblock = func() { _ = closer.Close() }
+	} else {
+		unblock = func() {}
+	}
+	type frameRes struct {
+		frame []byte
+		err   error
+	}
+	done := make(chan struct{})
+	defer close(done)
+	frames := make(chan frameRes)
+	go func() {
+		for {
+			frame, err := readFrame(r)
+			select {
+			case frames <- frameRes{frame: frame, err: err}:
+			case <-done:
+				return
+			}
+			// EOF and terminal transport/desync errors end input: Serve
+			// is returning, so no further reads are issued. Successful
+			// and over-cap frames recover, so keep framing.
+			if err != nil && err != errFrameTooLarge {
+				return
+			}
 		}
-		frame, err := readFrame(r)
+	}()
+	fail := func(err error) error {
+		unblock()
+		return err
+	}
+	for {
+		var fr frameRes
+		select {
+		case <-ctx.Done():
+			return fail(ctx.Err())
+		case res := <-frames:
+			fr = res
+		}
+		frame, err := fr.frame, fr.err
 		if err != nil {
 			if err == io.EOF {
 				return nil
 			}
-			if werr := respond(rpcResponse{JSONRPC: "2.0", Error: &rpcErr{Code: -32700, Message: "parse error"}}); werr != nil {
-				return werr
+			if err == errFrameTooLarge || err == errFrameDesync {
+				if werr := respond(rpcResponse{JSONRPC: "2.0", Error: &rpcErr{Code: -32700, Message: "parse error"}}); werr != nil {
+					return fail(werr)
+				}
+				if err == errFrameDesync {
+					return err
+				}
+				continue
 			}
-			continue
+			// Terminal transport error: return it, never a
+			// repeat-ParseError loop on an always-error reader.
+			return err
 		}
 		if len(bytes.TrimSpace(frame)) == 0 {
 			continue
@@ -318,7 +417,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		var req rpcRequest
 		if err := json.Unmarshal(frame, &req); err != nil || req.JSONRPC != "2.0" || req.Method == "" {
 			if werr := respond(rpcResponse{JSONRPC: "2.0", Error: &rpcErr{Code: -32700, Message: "parse error"}}); werr != nil {
-				return werr
+				return fail(werr)
 			}
 			continue
 		}
@@ -331,12 +430,12 @@ func (s *Server) Serve(ctx context.Context) error {
 		res, rerr := s.handle(ctx, req.Method, req.Params)
 		if rerr != nil {
 			if werr := respond(rpcResponse{JSONRPC: "2.0", ID: id, Error: rerr}); werr != nil {
-				return werr
+				return fail(werr)
 			}
 			continue
 		}
 		if werr := respond(rpcResponse{JSONRPC: "2.0", ID: id, Result: res}); werr != nil {
-			return werr
+			return fail(werr)
 		}
 	}
 }

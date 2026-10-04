@@ -877,3 +877,116 @@ func TestDisabledCompanyNoBypass(t *testing.T) {
 		t.Fatalf("disabled company select = %+v, want deny company-select-denied", d)
 	}
 }
+
+func TestSequence9UnknownOperationKeysRejected(t *testing.T) {
+	schema := testSchemaView()
+	// 1. Unknown operation key fails Validate centrally.
+	p := validPolicy()
+	p.Operations["write"] = true
+	if err := p.Validate(); err == nil || !strings.Contains(err.Error(), "unknown operation") {
+		t.Fatalf("unknown op key Validate = %v, want unknown-operation error", err)
+	}
+	if d := p.Authorize(schema, validSearch()); d.Allow {
+		t.Fatalf("unknown-keyed policy allowed: %+v", d)
+	}
+	// 2. Unknown Request.Operation denies with operation-denied on a
+	// fully valid policy ...
+	if d := validPolicy().Authorize(schema, Request{
+		Operation: "write", Model: "res.partner",
+		Fields: []string{"name"}, Domain: []any{[]any{"name", "=", "x"}}, Limit: 10,
+	}); d.Allow || d.Reason != ReasonOperationDenied {
+		t.Fatalf("unknown request op (valid policy) = %+v, want deny operation-denied", d)
+	}
+	// ... and independently on a malformed allowlist carrying that key,
+	// where the request must still hit operation-denied rather than the
+	// count/meta default paging path.
+	malformed := validPolicy()
+	malformed.Operations["export"] = true
+	req := Request{Operation: "export", Model: "res.partner"}
+	if d := malformed.Authorize(schema, req); d.Allow || d.Reason != ReasonOperationDenied {
+		t.Fatalf("unknown request op (unknown-keyed allowlist) = %+v, want deny operation-denied", d)
+	}
+	// 3. Legitimate allowlisted operations still pass on a valid policy.
+	for _, tc := range []Request{
+		validSearch(),
+		{Operation: OpRead, Model: "res.partner", Fields: []string{"name"}, Domain: []any{[]any{"name", "=", "x"}}, Limit: 5},
+		{Operation: OpCount, Model: "res.partner", Domain: []any{[]any{"name", "=", "x"}}},
+	} {
+		if d := validPolicy().Authorize(schema, tc); !d.Allow {
+			t.Fatalf("%s legitimate request denied: %+v", tc.Operation, d)
+		}
+	}
+}
+
+func TestSequence9NonCanonicalNamesRejected(t *testing.T) {
+	schema := testSchemaView()
+	// Stored text must equal its own normalization exactly: padded
+	// aliases never seal. (Case is preserved by NormalizeName, so a
+	// differently-cased key is a distinct canonical key, not a silent
+	// alias — covered below.)
+	for _, tc := range []struct {
+		name   string
+		mutate func(p *Policy)
+	}{
+		{"padded-model", func(p *Policy) {
+			p.Models[" res.partner "] = p.Models["res.partner"]
+			delete(p.Models, "res.partner")
+		}},
+		{"padded-field", func(p *Policy) {
+			r := p.Models["res.partner"]
+			r.Fields = []string{"company_id", "id", " name ", "partner_id"}
+			p.Models["res.partner"] = r
+		}},
+		{"padded-company-field", func(p *Policy) {
+			r := p.Models["res.partner"]
+			r.CompanyField = " company_id "
+			p.Models["res.partner"] = r
+		}},
+	} {
+		p := validPolicy()
+		tc.mutate(p)
+		if err := p.Validate(); err == nil {
+			t.Fatalf("%s: non-canonical stored name passed Validate", tc.name)
+		}
+		if d := p.Authorize(schema, validSearch()); d.Allow {
+			t.Fatalf("%s: non-canonical policy allowed: %+v", tc.name, d)
+		}
+	}
+	// Differently-cased stored keys are distinct canonical keys (no case
+	// folding): the sealed policy validates, but the canonical request
+	// misses it — genuine policy denial, no silent aliasing.
+	aliased := validPolicy()
+	aliased.Models["Res.Partner"] = aliased.Models["res.partner"]
+	delete(aliased.Models, "res.partner")
+	if err := aliased.Validate(); err != nil {
+		t.Fatalf("case-distinct stored key Validate: %v", err)
+	}
+	if d := aliased.Authorize(schema, validSearch()); d.Allow || d.Reason != ReasonUnknownModel {
+		t.Fatalf("case-distinct stored key request = %+v, want deny unknown-model", d)
+	}
+	// Request-side boundary (genuine policy denial, no fakeGate): the
+	// request normalizes, then exact-matches the canonical stored key. A
+	// case-variant request normalizes case-preserved and misses the
+	// canonical rule, denying unknown-model.
+	r := validSearch()
+	r.Model = "Res.Partner"
+	if d := validPolicy().Authorize(schema, r); d.Allow || d.Reason != ReasonUnknownModel {
+		t.Fatalf("case-variant request model = %+v, want deny unknown-model", d)
+	}
+	// Trim is the documented request-side forgiveness (see
+	// TestFieldSubset): a padded request still resolves to the canonical
+	// stored rule. The canonical-match rule governs sealed storage, not
+	// request trimming.
+	r = validSearch()
+	r.Model = " res.partner "
+	if d := validPolicy().Authorize(schema, r); !d.Allow {
+		t.Fatalf("padded request model denied: %+v", d)
+	}
+	// Legitimate exact canonical names still validate and authorize.
+	if err := validPolicy().Validate(); err != nil {
+		t.Fatalf("canonical policy Validate: %v", err)
+	}
+	if d := validPolicy().Authorize(schema, validSearch()); !d.Allow {
+		t.Fatalf("canonical request denied: %+v", d)
+	}
+}

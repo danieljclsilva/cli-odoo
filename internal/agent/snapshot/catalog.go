@@ -29,7 +29,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"time"
 
@@ -155,22 +154,9 @@ func normalizeProvenance(where, v string) (string, error) {
 // into a Snapshot. The result still requires review and must be persisted
 // with Write; nothing here authorizes execution.
 func ImportCatalog(path string) (Snapshot, error) {
-	st, err := os.Stat(path)
+	b, err := ReadBoundedFile(path, MaxFileBytes, "catalog")
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("snapshot: reading catalog %q: %w", path, err)
-	}
-	if !st.Mode().IsRegular() {
-		return Snapshot{}, fmt.Errorf("snapshot: catalog %q is not a regular file", path)
-	}
-	if st.Size() > MaxFileBytes {
-		return Snapshot{}, fmt.Errorf("snapshot: catalog %q is %d bytes, over cap %d", path, st.Size(), MaxFileBytes)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("snapshot: reading catalog %q: %w", path, err)
-	}
-	if int64(len(b)) > MaxFileBytes {
-		return Snapshot{}, fmt.Errorf("snapshot: catalog %q is %d bytes, over cap %d", path, len(b), MaxFileBytes)
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
@@ -283,22 +269,9 @@ func ImportCatalog(path string) (Snapshot, error) {
 // may take a name from it. The file shape is {"methods": [...]}; decoding
 // is strict and the entry count is capped at MaxCatalogMethods.
 func ImportManifest(path string) ([]string, error) {
-	st, err := os.Stat(path)
+	b, err := ReadBoundedFile(path, MaxFileBytes, "manifest")
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: reading manifest %q: %w", path, err)
-	}
-	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("snapshot: manifest %q is not a regular file", path)
-	}
-	if st.Size() > MaxFileBytes {
-		return nil, fmt.Errorf("snapshot: manifest %q is %d bytes, over cap %d", path, st.Size(), MaxFileBytes)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot: reading manifest %q: %w", path, err)
-	}
-	if int64(len(b)) > MaxFileBytes {
-		return nil, fmt.Errorf("snapshot: manifest %q is %d bytes, over cap %d", path, len(b), MaxFileBytes)
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()

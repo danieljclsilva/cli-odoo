@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -539,18 +540,18 @@ func agentSetupSecureReplace(path string, data []byte) error {
 // agentSetupProfileLocked reports whether path holds a parseable locked
 // (sealed) profile envelope. Unparseable or missing files report false so
 // the first-setup path stays open; a parseable envelope triggers the
-// overwrite guard.
+// overwrite guard. The read goes through the held open descriptor
+// (snapshot.ReadBoundedFile: Lstat pre-check without following,
+// nonblocking open, held-handle fstat + SameFile, cap+1 bounded read), so
+// symlinks and non-regular files (including FIFOs) are refused without
+// blocking and growth past the cap denies over-cap instead of allocating
+// unboundedly. Any read refusal other than NotExist reports true to force
+// the guard path, which then fails closed in CheckPassword/OpenPolicy;
+// only a missing file reports false.
 func agentSetupProfileLocked(path string) bool {
-	st, err := os.Stat(path)
-	if err != nil || !st.Mode().IsRegular() || st.Size() == 0 {
-		return false
-	}
-	if st.Size() > agentSetupMaxProfileBytes {
-		return true // over-cap input is still "existing": force the guard path
-	}
-	b, err := os.ReadFile(path)
-	if err != nil || int64(len(b)) > agentSetupMaxProfileBytes {
-		return true
+	b, err := snapshot.ReadBoundedFile(path, agentSetupMaxProfileBytes, "profile")
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist)
 	}
 	var prof lock.Profile
 	if err := json.Unmarshal(b, &prof); err != nil {
@@ -591,19 +592,13 @@ func agentSetupRequireCurrentPassword(profilePath string, reset bool, readPasswo
 
 // agentSetupCheckPassword opens the existing profile once: success proves
 // the human holds the current password. The plaintext is discarded; only
-// the open verdict matters.
+// the open verdict matters. The profile is read through its held open
+// descriptor (snapshot.ReadBoundedFile: Lstat pre-check without following,
+// nonblocking open, held-handle fstat + SameFile, cap+1 bounded read), so
+// symlinks and non-regular files (including FIFOs) are refused without
+// blocking and growth past the cap denies over-cap.
 func agentSetupCheckPassword(profilePath, adminPassword string) error {
-	st, err := os.Stat(profilePath)
-	if err != nil {
-		return err
-	}
-	if !st.Mode().IsRegular() {
-		return fmt.Errorf("not a regular file")
-	}
-	if st.Size() > agentSetupMaxProfileBytes {
-		return fmt.Errorf("profile %d bytes exceeds cap %d", st.Size(), agentSetupMaxProfileBytes)
-	}
-	b, err := os.ReadFile(profilePath)
+	b, err := snapshot.ReadBoundedFile(profilePath, agentSetupMaxProfileBytes, "profile")
 	if err != nil {
 		return err
 	}
@@ -621,20 +616,15 @@ func agentSetupCheckPassword(profilePath, adminPassword string) error {
 // The profile file is size-capped (agentSetupMaxProfileBytes) and must be
 // a regular file holding exactly one JSON object (unknown fields rejected,
 // trailing data denied); the sealed policy decodes strictly the same way.
-// Anything over cap or off-shape fails closed before decode or crypto runs.
+// The read goes through the held open descriptor
+// (snapshot.ReadBoundedFile: Lstat pre-check without following,
+// nonblocking open, held-handle fstat + SameFile, cap+1 bounded read), so
+// symlinks and non-regular files (including FIFOs) are refused without
+// blocking and growth past the cap denies over-cap. Anything over cap or
+// off-shape fails closed before decode or crypto runs.
 func agentSetupOpenPolicy(profilePath, adminPassword string) (policy.Policy, error) {
 	var pol policy.Policy
-	st, err := os.Stat(profilePath)
-	if err != nil {
-		return pol, fmt.Errorf("reading profile %q: %w (run: odoo agent setup)", profilePath, err)
-	}
-	if !st.Mode().IsRegular() {
-		return pol, fmt.Errorf("reading profile %q: not a regular file", profilePath)
-	}
-	if st.Size() > agentSetupMaxProfileBytes {
-		return pol, fmt.Errorf("reading profile %q: %d bytes exceeds cap %d", profilePath, st.Size(), agentSetupMaxProfileBytes)
-	}
-	b, err := os.ReadFile(profilePath)
+	b, err := snapshot.ReadBoundedFile(profilePath, agentSetupMaxProfileBytes, "profile")
 	if err != nil {
 		return pol, fmt.Errorf("reading profile %q: %w (run: odoo agent setup)", profilePath, err)
 	}
@@ -1035,6 +1025,34 @@ type agentSetupSealedBundle struct {
 	profilePath  string
 }
 
+// agentSetupVerifyBundlePaths denies a commit whose two file paths overlap
+// each other or the sealed workspace: profile and snapshot sharing one file
+// (or one containing the other) would let one write clobber the other and
+// corrupt the prior-pair backup/restore below, and a workspace overlapping
+// either file would mix model-writable content with the sealed pair. The
+// comparison is canonical (symlink-resolving, fail-closed when unresolvable)
+// via workspace.Overlaps. Every human-locked mutation path (setup, snapshot
+// refresh, import-catalog) funnels through agentSetupStageSealedBundle +
+// agentSetupCommitBundle, so enforcing here covers every production caller;
+// both entry points enforce it so a hand-built bundle cannot bypass it.
+func agentSetupVerifyBundlePaths(profilePath, snapshotPath, workspaceDir string) error {
+	if strings.TrimSpace(profilePath) == "" || strings.TrimSpace(snapshotPath) == "" {
+		return fmt.Errorf("empty profile or snapshot path")
+	}
+	if workspace.Overlaps(profilePath, snapshotPath) {
+		return fmt.Errorf("profile %q and snapshot %q overlap: refusing to commit a pair that shares a file", profilePath, snapshotPath)
+	}
+	if strings.TrimSpace(workspaceDir) != "" {
+		if workspace.Overlaps(workspaceDir, profilePath) {
+			return fmt.Errorf("workspace %q overlaps profile %q: refusing", workspaceDir, profilePath)
+		}
+		if workspace.Overlaps(workspaceDir, snapshotPath) {
+			return fmt.Errorf("workspace %q overlaps snapshot %q: refusing", workspaceDir, snapshotPath)
+		}
+	}
+	return nil
+}
+
 // agentSetupStageSealedBundle builds and validates the full candidate bundle
 // in memory BEFORE any snapshot/profile mutation: the snapshot must be
 // internally valid (scope, company metadata, approval hygiene), the digest
@@ -1051,7 +1069,11 @@ func agentSetupStageSealedBundle(profilePath, snapshotPath, adminPassword string
 	if adminPassword == "" {
 		return out, fmt.Errorf("empty admin password")
 	}
-	pol.SnapshotPath = snapshotPath
+	// Path overlap + workspace separation BEFORE Seal and before any file
+	// mutation, so an overlapping bundle can never commit.
+	if err := agentSetupVerifyBundlePaths(profilePath, snapshotPath, pol.WorkspaceDir); err != nil {
+		return out, err
+	}
 	// Serve-time parity (broker Serve order, pre-credential subset): the
 	// snapshot scope must match the sealed scope exactly (ordered enabled
 	// set plus default, instance kept distinct from discovery), and every
@@ -1124,29 +1146,58 @@ func agentSetupStageSealedBundle(profilePath, snapshotPath, adminPassword string
 }
 
 // agentSetupCommitBundle writes the staged bundle while preserving the prior
-// working pair: both existing files are read first (missing = first setup,
-// nothing to restore), parents are ensured, then the snapshot and the
-// profile are each replaced via the O_EXCL-temp + fsync + rename path (no
-// WriteFile symlink sink). If the profile commit fails after the snapshot
-// was replaced, the prior snapshot bytes are restored before returning, so
-// cancel/error never leaves a half-committed pair (new snapshot bound to an
-// old profile, or vice versa). The seal (validation + new-password Seal)
-// already happened in agentSetupStageSealedBundle.
+// working pair. Staging already verified path overlap + workspace
+// separation, but commit re-verifies (fail closed on unresolvable
+// comparison) so a hand-built bundle cannot bypass it. Both existing files
+// are read first through their held open descriptors
+// (snapshot.ReadBoundedFile: Lstat pre-check without following,
+// nonblocking open, held-handle fstat + SameFile, cap+1 bounded read), so
+// symlinks and non-regular files (including FIFOs) are refused without
+// blocking and growth past the cap denies over-cap. A missing file means
+// first setup (nothing to restore); any other backup error ABORTS before
+// any mutation, because treating a permission/decryption-hostile read as
+// missing would erase the prior pair on rollback. Parents are ensured,
+// then the snapshot and the profile are each replaced via the O_EXCL-temp
+// + fsync + rename path (no WriteFile symlink sink; rename replaces a
+// final-component symlink itself rather than following it, and breaks —
+// not follows — preexisting hardlinks, so rollback never touches unrelated
+// protected files outside these two recorded paths). If the profile commit
+// fails after the snapshot was replaced, the recorded prior bytes (or
+// removal of a staged file that had no prior) are restored before
+// returning, so cancel/error never leaves a half-committed pair (new
+// snapshot bound to an old profile, or vice versa). The seal (validation +
+// new-password Seal) already happened in agentSetupStageSealedBundle.
 func agentSetupCommitBundle(b agentSetupSealedBundle) error {
+	if err := agentSetupVerifyBundlePaths(b.profilePath, b.snapshotPath, b.pol.WorkspaceDir); err != nil {
+		return err
+	}
 	var priorSnap, priorProf []byte
 	var haveSnap, haveProf bool
-	if cur, err := os.ReadFile(b.snapshotPath); err == nil {
+	if cur, err := snapshot.ReadBoundedFile(b.snapshotPath, agentSetupMaxSnapshotBytes, "snapshot"); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("backing up snapshot %q: %w (aborting before mutation)", b.snapshotPath, err)
+		}
+	} else {
 		priorSnap = append([]byte(nil), cur...)
 		haveSnap = true
 	}
-	if cur, err := os.ReadFile(b.profilePath); err == nil {
+	if cur, err := snapshot.ReadBoundedFile(b.profilePath, agentSetupMaxProfileBytes, "profile"); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("backing up profile %q: %w (aborting before mutation)", b.profilePath, err)
+		}
+	} else {
 		priorProf = append([]byte(nil), cur...)
 		haveProf = true
 	}
+	// Prior bytes restore byte-identically (WriteBytes re-validates the
+	// staged envelope before writing; SecureReplace rewrites the exact
+	// profile bytes). Restore touches ONLY these two recorded paths: a
+	// previously-symlinked target is replaced (rename semantics), never
+	// followed, and no other protected file is ever written or removed.
 	restore := func() error {
 		var errs []string
 		if haveSnap {
-			if err := snapshot.WriteBytes(b.snapshotPath, priorSnap); err != nil {
+			if err := snapshot.RestoreBytes(b.snapshotPath, priorSnap); err != nil {
 				errs = append(errs, "restore snapshot: "+err.Error())
 			}
 		} else {
@@ -1241,8 +1292,14 @@ func agentSnapshotReseal(profilePath, adminPassword string, pol policy.Policy, s
 	if strings.TrimSpace(snapPath) == "" {
 		snapPath = DefaultAgentSnapshotPath()
 	}
+	if err := agentSetupVerifyBundlePaths(profilePath, snapPath, pol.WorkspaceDir); err != nil {
+		return err
+	}
 	bundle, err := agentSetupStageSealedBundle(profilePath, snapPath, adminPassword, pol, snap)
 	if err != nil {
+		return err
+	}
+	if err := agentSetupVerifyBundlePaths(bundle.profilePath, bundle.snapshotPath, bundle.pol.WorkspaceDir); err != nil {
 		return err
 	}
 	if err := agentSetupEnsureParent(profilePath); err != nil {

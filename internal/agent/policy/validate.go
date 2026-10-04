@@ -55,24 +55,41 @@ const (
 	ReasonCompanyDenied = "company-denied"
 )
 
+// isKnownOperation reports whether op belongs to the closed model-surface
+// operation set. Validate rejects any Operations key outside it, and
+// Authorize rejects any Request.Operation outside it without consulting
+// the allowlist, so an unknown operation can never inherit the
+// count/meta default path.
+func isKnownOperation(op Operation) bool {
+	switch op {
+	case OpSearch, OpRead, OpCount, OpAggregate, OpMeta:
+		return true
+	default:
+		return false
+	}
+}
+
 // Validate rejects a contradictory or malformed policy centrally so the
 // broker (New and Serve) and Authorize share one seal check: unknown
 // version (exactly PolicyVersion is accepted, no legacy fallback — old
 // profiles must be re-sealed via setup), empty instance, missing or
 // malformed snapshot binding (SnapshotSHA256 must be the 64-char hex
 // CanonicalDigest of the sealed snapshot; empty denies so pre-binding
-// profiles must be re-sealed), empty operations/models, unknown
-// SharedRecords (only deny|allow-classified), invalid CompanyScope,
-// non-positive MaxLimit/MaxRowsPerCall/MaxResponseBytes, negative
-// MaxOffset, negative session budgets (MaxCallsPerSession/MaxRowsPerSession
-// — zero means unbounded, negative is malformed), and any per-model defect
-// — empty Fields, a field name failing NormalizeName, a CompanyField
-// failing NormalizeName when set, CompanyIndependent combined with a
-// CompanyField, IncludeCompanyless on a CompanyIndependent model
-// (meaningless there), or a negative per-model MaxLimit. A scoped model
-// without a CompanyField is NOT a Validate error: the policy is
-// well-formed but Authorize denies every request for that model with
-// company-denied until a human supplies an enforcing field.
+// profiles must be re-sealed), empty operations or any unknown operation
+// key (only search/read/count/aggregate/meta may appear), empty models,
+// unknown SharedRecords (only deny|allow-classified), invalid
+// CompanyScope, non-positive MaxLimit/MaxRowsPerCall/MaxResponseBytes,
+// negative MaxOffset, negative session budgets
+// (MaxCallsPerSession/MaxRowsPerSession — zero means unbounded, negative
+// is malformed), and any per-model defect — empty Fields, a model, field,
+// or CompanyField name that is not exactly canonical (stored text must
+// equal its NormalizeName output, so padded aliases never seal),
+// CompanyIndependent combined with a CompanyField, IncludeCompanyless on
+// a CompanyIndependent model (meaningless there), or a negative
+// per-model MaxLimit. A scoped model without a CompanyField is NOT a
+// Validate error: the policy is well-formed but Authorize denies every
+// request for that model with company-denied until a human supplies an
+// enforcing field.
 func (p *Policy) Validate() error {
 	if p == nil {
 		return fmt.Errorf("policy: nil policy")
@@ -91,6 +108,11 @@ func (p *Policy) Validate() error {
 	}
 	if len(p.Operations) == 0 {
 		return fmt.Errorf("policy: no operations allowlisted")
+	}
+	for op := range p.Operations {
+		if !isKnownOperation(op) {
+			return fmt.Errorf("policy: unknown operation %q", string(op))
+		}
 	}
 	if len(p.Models) == 0 {
 		return fmt.Errorf("policy: no models allowlisted")
@@ -120,19 +142,22 @@ func (p *Policy) Validate() error {
 		return err
 	}
 	for name, rule := range p.Models {
-		if _, ok := NormalizeName(name); !ok {
+		norm, ok := NormalizeName(name)
+		if !ok || norm != name {
 			return fmt.Errorf("policy: bad model name %q", name)
 		}
 		if len(rule.Fields) == 0 {
 			return fmt.Errorf("policy: model %q has no fields", name)
 		}
 		for _, f := range rule.Fields {
-			if _, ok := NormalizeName(f); !ok {
+			nf, ok := NormalizeName(f)
+			if !ok || nf != f {
 				return fmt.Errorf("policy: model %q bad field %q", name, f)
 			}
 		}
 		if rule.CompanyField != "" {
-			if _, ok := NormalizeName(rule.CompanyField); !ok {
+			cf, ok := NormalizeName(rule.CompanyField)
+			if !ok || cf != rule.CompanyField {
 				return fmt.Errorf("policy: model %q bad company field %q", name, rule.CompanyField)
 			}
 		}
@@ -152,16 +177,23 @@ func (p *Policy) Validate() error {
 // Authorize is the deny-by-default gate. It is pure: no network, keychain,
 // or filesystem access. Denial precedes everything, enforced in order:
 //
-//  1. The sealed policy must Validate (nil receiver, bad
-//     version/instance, empty operations/models, unknown SharedRecords,
+//  1. The request operation must belong to the closed known set
+//     (search/read/count/aggregate/meta). Anything else denies with
+//     operation-denied without consulting the allowlist, so an unknown
+//     operation can never inherit the count/meta default path — even on
+//     a malformed allowlist carrying that key.
+//  2. The sealed policy must Validate (nil receiver, bad
+//     version/instance, empty or unknown-keyed operations, empty models,
+//     non-canonical stored names, unknown SharedRecords,
 //     non-positive budgets, invalid CompanyScope, contradictory model
 //     rules). Scope failures report invalid-scope; all other seal
 //     failures report invalid-policy.
-//  2. The operation must be allowlisted in Policy.Operations.
-//  3. The model name must normalize (NormalizeName) and be present in
-//     Policy.Models. Aggregate additionally requires
-//     ModelRule.AllowAggregate.
-//  4. Field projection: search/read require a non-empty explicit
+//  3. The operation must be allowlisted in Policy.Operations.
+//  4. The model name must normalize (NormalizeName) and be present in
+//     Policy.Models (stored keys are canonical, so the normalized request
+//     resolves to exactly one sealed rule). Aggregate additionally
+//     requires ModelRule.AllowAggregate.
+//  5. Field projection: search/read require a non-empty explicit
 //     projection (omitted, nil, or empty Fields deny — there is no
 //     default-all-fields). Every entry must normalize, must not contain
 //     a wildcard, and must be single-segment: any dotted entry denies
@@ -170,12 +202,12 @@ func (p *Policy) Validate() error {
 //     always permitted; a projection lacking `id` is a legitimate exact
 //     projection — the broker appends `id` (see EnsureID) because Odoo
 //     implicitly returns it on search_read.
-//  5. Every field referenced in Domain, Order, and GroupBy must be
+//  6. Every field referenced in Domain, Order, and GroupBy must be
 //     single-segment and allowlisted (dotted references deny as above).
 //     Malformed domain/order shapes — including unknown operators,
 //     hierarchy operators (child_of, parent_of), and unbounded operands —
 //     deny.
-//  6. Limit/Offset must sit within budgets. Over-max DENIES — it never
+//  7. Limit/Offset must sit within budgets. Over-max DENIES — it never
 //     clamps, because clamping would silently return a narrower slice
 //     than the caller asked for and mask budget bypasses. Row-returning
 //     operations (search/read/aggregate) require Limit in [1, effective
@@ -183,15 +215,15 @@ func (p *Policy) Validate() error {
 //     Budgets.MaxLimit, ModelRule.MaxLimit, and Budgets.MaxRowsPerCall,
 //     and Offset in [0, Budgets.MaxOffset]. Count/meta never page, so any
 //     nonzero Limit/Offset on them denies.
-//  7. Non-empty CompanyIDs denies: the model cannot select companies; the
+//  8. Non-empty CompanyIDs denies: the model cannot select companies; the
 //     broker injects the enforced scope after authorization.
-//  8. Company rule: a human-reviewed CompanyIndependent model under
+//  9. Company rule: a human-reviewed CompanyIndependent model under
 //     SharedRecords allow-classified with no CompanyField passes without
 //     a fragment; an independent model with a CompanyField set denies
 //     (contradictory — already rejected by Validate, failed closed here
-//     too); otherwise a usable CompanyField passes (the broker ANDs the
-//     CompanyDomain fragment after the caller domain); anything else
-//     denies. Scoped models NEVER pass without a fragment.
+//     too); otherwise a usable canonical CompanyField passes (the broker
+//     ANDs the CompanyDomain fragment after the caller domain); anything
+//     else denies. Scoped models NEVER pass without a fragment.
 //
 // A nil SchemaView only constrains dotted paths: single-segment fields
 // resolve against the rule alone, while any dot-path traversal without a
@@ -200,6 +232,9 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 	deny := func(reason string) Decision { return Decision{Allow: false, Reason: reason} }
 	if p == nil {
 		return deny(ReasonInvalidPolicy)
+	}
+	if !isKnownOperation(r.Operation) {
+		return deny(ReasonOperationDenied)
 	}
 	if err := p.Validate(); err != nil {
 		if serr := ValidateScope(p.Scope); serr != nil {
@@ -301,13 +336,15 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 		if r.Offset < 0 || r.Offset > p.Budgets.MaxOffset {
 			return deny(ReasonOffsetDenied)
 		}
-	default: // count, meta: row paging is unused, so it must be zero.
+	case OpCount, OpMeta: // count, meta: row paging is unused, so it must be zero.
 		if r.Limit != 0 {
 			return deny(ReasonLimitDenied)
 		}
 		if r.Offset != 0 {
 			return deny(ReasonOffsetDenied)
 		}
+	default: // Unreachable: unknown operations deny above. Fail closed.
+		return deny(ReasonOperationDenied)
 	}
 	if len(r.CompanyIDs) != 0 {
 		return deny(ReasonCompanySelectDenied)
@@ -318,7 +355,7 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 		}
 		return deny(ReasonCompanyDenied)
 	}
-	if _, ok := NormalizeName(rule.CompanyField); ok {
+	if cf, ok := NormalizeName(rule.CompanyField); ok && cf == rule.CompanyField {
 		return Decision{Allow: true, Reason: ReasonAllow}
 	}
 	return deny(ReasonCompanyDenied)
