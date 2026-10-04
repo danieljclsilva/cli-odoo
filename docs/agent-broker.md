@@ -71,12 +71,16 @@ config-nested path is rejected with a migration note). Sealed with the admin
 password (TTY prompt or `--admin-password-stdin`, never args/env).
 
 Company scope: the broker ANDs the sealed company fragment into every
-domain **after** caller conditions and **overwrites** `allowed_company_ids`
-/ `company_id`. The model cannot select companies. `read` by ID is converted
+domain **after** caller conditions (domain order: caller conditions then
+enforcing fragment) and **overwrites** `allowed_company_ids` /
+`company_id`: `allowed_company_ids` is default-first (`[default,
+...rest-in-sealed-order]`), `company_id` is the sealed default. The model
+cannot select companies. `read` by ID is converted
 to a scoped `search_read` so company scoping always applies. Only direct
-many2one company fields (e.g. `company_id` → `res.company`) are enforceable:
-many2many links (e.g. `company_ids`) fail closed at setup/serve time with a
-clear error — multi-company overlap has no safe fragment in this release.
+many2one company fields whose relation is `res.company` (e.g. `company_id`
+→ `res.company`) are enforceable: many2many links (e.g. `company_ids`) fail
+closed at setup/serve time with a clear error — multi-company overlap has
+no safe fragment in this release.
 Models without a usable company field deny unless a human classified them
 company-independent *and* the policy allows classified shared records.
 Per-model `IncludeCompanyless` (default deny, human-reviewed) additionally
@@ -114,21 +118,28 @@ to `unknown` on import):
 ```json
 {
   "instance": "prod", "captured_by": "operator:name", "server_version": "17.0",
-  "available_companies": [{"id": 1, "name": "Acme"}],
-  "enabled_companies": [1], "default_company": 1,
+  "available_companies": [{"id": 1, "name": "Acme"}, {"id": 2, "name": "Beta"}],
+  "enabled_companies": [1, 2], "default_company": 2,
   "models": {
     "res.partner": {
       "label": "Partner", "provenance": "manifest", "executable": false,
       "company_field": "company_id", "company_independent": false,
       "include_companyless": false,
       "fields": {
-        "name": {"type": "char", "relation": "", "label": "Name", "provenance": "manifest"}
+        "name": {"type": "char", "relation": "", "label": "Name", "provenance": "manifest"},
+        "company_id": {"type": "many2one", "relation": "res.company", "label": "Company", "provenance": "manifest"}
       }
     }
   },
   "method_manifest": ["search_read", "read"]
 }
 ```
+
+The literal above loads through `snapshot.ImportCatalog` as-is (strict
+decode, scope parity: two enabled companies with the default inside the
+enabled set) and keeps executable flags consistent with the import rule:
+catalog-only models transcribe `executable: false` and stay
+discoverable-only, never auto-enabled.
 
 Operator steps: transcribe offline → `import-catalog --catalog <file>`
 (+ admin password) → review the sealed result → `serve`. Use
@@ -162,13 +173,14 @@ outputs). Denial happens before any RPC; attempted admitted calls stay billed
 even on RPC/output failure. Sessions clamp TTL to [1m, 24h], cap 64 live
 sessions, and the HTTP server enforces read/write/idle timeouts.
 ## Wiring a runtime to the broker
-
-Shipped in-tree (implemented, not prose):
-
 - MCP stdio adapter: `odoo agent mcp [--url URL]` — JSON-RPC 2.0 over
   stdio with `initialize` / `tools/list` / `tools/call` for the 11 typed
   broker tools only (search, read, count, aggregate, meta, companies,
-  catalog, workspace.list/read/write/mkdir). The session token comes from
+  catalog, workspace.list/read/write/mkdir). `initialize` strictly rejects
+  malformed params with invalid-params and no state transition (non-object
+  payload; missing/empty/non-string `protocolVersion`; wrong-typed
+  `clientInfo`/`capabilities` when present); an unsupported but well-typed
+  version string negotiates the server default. The session token comes from
   `ODOO_BROKER_TOKEN` (env only, never logged or echoed). Codex stdio
   example: `codex mcp add odoo-broker -- odoo agent mcp
   --url http://127.0.0.1:8471` with the token env var set.

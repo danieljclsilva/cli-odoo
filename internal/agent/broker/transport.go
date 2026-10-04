@@ -647,8 +647,19 @@ type aggregateBody struct {
 // already be gate-authorized (arity-complete), so the appended fragment
 // always narrows via implicit AND. Unenforceable scope (enforce required
 // but no fragment) fails closed here as defense in depth behind the gate.
+//
+// allowed_company_ids carries Scope.Default FIRST, then the remaining sealed
+// Enabled IDs in sealed order (no membership expansion: exactly the sealed
+// set, reordered); company_id is Scope.Default. The enabled list is a fresh
+// copy, so it cannot alias sealed state. Callers run after gate/enforceable
+// checks without holding the mutex; the lock below mirrors handleCompanies.
 func (b *Broker) scopedArgs(rule policy.ModelRule, domain any) ([]any, map[string]any, error) {
-	frag, enforce := b.frag(rule, b.pol.Scope)
+	b.mu.Lock()
+	enabledIDs := append([]int(nil), b.pol.Scope.Enabled...)
+	def := b.pol.Scope.Default
+	b.mu.Unlock()
+	scope := policy.CompanyScope{Enabled: enabledIDs, Default: def}
+	frag, enforce := b.frag(rule, scope)
 	if enforce && len(frag) == 0 {
 		return nil, nil, errors.New("company scope unenforceable for this model")
 	}
@@ -659,14 +670,21 @@ func (b *Broker) scopedArgs(rule policy.ModelRule, domain any) ([]any, map[strin
 		return nil, nil, errors.New("invalid domain: want JSON array")
 	}
 	full = append(full, frag...)
-	enabled := make([]any, 0, len(b.pol.Scope.Enabled))
-	for _, id := range b.pol.Scope.Enabled {
-		enabled = append(enabled, id)
+	enabled := make([]any, 0, len(scope.Enabled))
+	for _, id := range scope.Enabled {
+		if id == scope.Default {
+			enabled = append(enabled, id)
+		}
+	}
+	for _, id := range scope.Enabled {
+		if id != scope.Default {
+			enabled = append(enabled, id)
+		}
 	}
 	kwargs := map[string]any{
 		"context": map[string]any{
 			"allowed_company_ids": enabled,
-			"company_id":          b.pol.Scope.Default,
+			"company_id":          scope.Default,
 		},
 	}
 	return full, kwargs, nil

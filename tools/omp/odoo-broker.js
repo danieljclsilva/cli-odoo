@@ -44,10 +44,14 @@
 // written to disk. No child_process, no shell fallback, no secrets in
 // output. Redirects are never followed (redirect:'error'): a 3xx from the
 // broker surfaces a tool error instead of moving the Bearer token.
-// Broker URLs are loopback-only (127.0.0.0/8, ::1, localhost, exact match);
-// the joined base+path URL is re-validated BEFORE fetch, failing closed.
-// Responses stream at most MAX_BODY_BYTES+1 bytes (exactly 4 MiB cap)
-// BEFORE JSON decode; overflow is denied whole with no body bytes echoed.
+// Broker base URLs pass a strict raw gate BEFORE WHATWG parsing: http(s)
+// scheme, no userinfo, root-only (no basepath/query/fragment), canonical
+// loopback literal (127.x dotted-quad, localhost, ::1); the joined
+// base+path origin is re-gated BEFORE fetch, failing closed.
+// Responses stream through the ONE bounded reader: at most
+// MAX_BODY_BYTES+1 bytes (exactly 4 MiB cap) BEFORE JSON decode; overflow
+// is denied whole with no body bytes echoed; non-streaming bodies fail
+// closed and never allocate unbounded.
 // Every request races a DEFAULT_TIMEOUT_MS (exactly 30s) AbortController
 // bound combined with the caller signal (headers AND body covered);
 // streams cancel and timers/listeners clear on every path.
@@ -69,25 +73,77 @@ function brokerURL() {
   return raw;
 }
 
-// isLoopbackURL: loopback-only gate for the bearer-token endpoint.
-// http(s) only, loopback literal (127/8 incl. IPv4-in-IPv6, ::1) or exact
-// "localhost" (127.evil.com is NOT loopback). Anything else fails closed.
+// isLoopbackURL: strict loopback-only gate for the bearer-token endpoint.
+// Validates the RAW string BEFORE WHATWG normalization: trim; require an
+// http(s) scheme; split authority at the first '/' '?' '#'; authority must
+// carry no userinfo ('@') and no query/fragment; the path after authority
+// must be empty or '/' (root-only base, no basepath). The host (port and
+// IPv6 brackets stripped) must be a canonical literal: exact 'localhost',
+// a dotted-quad with first octet 127, or '::1' (plus its full form
+// 0:0:0:0:0:0:0:1) lowercased. Only then is new URL() + net.isIP used as
+// defense in depth. Subdomains, numeric shorthand, hex, IPv4-mapped IPv6,
+// userinfo, basepaths, and query/fragment all fail closed.
 function isLoopbackURL(raw) {
+  if (typeof raw !== 'string') return false;
+  const s = raw.trim();
+  const lower = s.toLowerCase();
+  if (!lower.startsWith('http://') && !lower.startsWith('https://')) return false;
+  const schemeEnd = s.indexOf('://');
+  if (schemeEnd === -1) return false;
+  const afterScheme = s.slice(schemeEnd + 3);
+  let end = afterScheme.length;
+  for (let i = 0; i < afterScheme.length; i += 1) {
+    const c = afterScheme[i];
+    if (c === '/' || c === '?' || c === '#') { end = i; break; }
+  }
+  const authority = afterScheme.slice(0, end);
+  const rest = afterScheme.slice(end);
+  if (!authority) return false;
+  if (authority.includes('@') || authority.includes('?') || authority.includes('#')) return false;
+  if (rest !== '' && rest !== '/') return false;
+  let host;
+  if (authority.startsWith('[')) {
+    const close = authority.indexOf(']');
+    if (close === -1) return false;
+    host = authority.slice(1, close);
+    const tail = authority.slice(close + 1);
+    if (tail !== '' && !/^:\d*$/.test(tail)) return false;
+  } else {
+    const colon = authority.indexOf(':');
+    if (colon === -1) {
+      host = authority;
+    } else {
+      if (authority.indexOf(':', colon + 1) !== -1) return false;
+      host = authority.slice(0, colon);
+      if (!/^\d*$/.test(authority.slice(colon + 1))) return false;
+    }
+  }
+  if (!host) return false;
+  const hl = host.toLowerCase();
+  if (hl === 'localhost') {
+    // Exact literal only: subdomains fall through to reject below.
+  } else if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    if (host.split('.')[0] !== '127') return false;
+  } else if (hl === '::1' || hl === '0:0:0:0:0:0:0:1') {
+    // Canonical loopback only: no shorthand tricks, no mapped addresses.
+  } else {
+    return false;
+  }
   let u;
   try {
-    u = new URL(String(raw));
+    u = new URL(s);
   } catch {
     return false;
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-  const host = (u.hostname || '').replace(/^\[|\]$/g, '');
-  if (!host) return false;
-  if (host.toLowerCase() === 'localhost') return true;
-  if (net.isIP(host)) {
-    if (net.isIPv4(host)) return host.split('.')[0] === '127';
-    const norm = host.toLowerCase().replace(/^0(:0){0,6}:ffff:/, '');
-    if (norm.split('.')[0] === '127') return true;
-    return norm === '::1' || norm === '0:0:0:0:0:0:0:1';
+  if (u.username !== '' || u.password !== '') return false;
+  const ph = (u.hostname || '').replace(/^\[|\]$/g, '');
+  if (!ph) return false;
+  if (ph.toLowerCase() === 'localhost') return hl === 'localhost';
+  if (net.isIP(ph)) {
+    if (net.isIPv4(ph)) return ph.split('.')[0] === '127';
+    const n = ph.toLowerCase();
+    return n === '::1' || n === '0:0:0:0:0:0:0:1';
   }
   return false;
 }
@@ -159,104 +215,70 @@ function resolveTimeoutMs() {
   return DEFAULT_TIMEOUT_MS;
 }
 
-// readBoundedJSON streams at most MAX_BODY_BYTES+1 bytes BEFORE JSON
-// decode: overflow (including a valid prefix padded with whitespace plus
-// one more byte) denies the whole response with no body bytes echoed.
-// The stream is cancelled on overflow, read error, and abort.
+// readBoundedJSON is the ONE bounded reader: streaming only. It consumes at
+// most MAX_BODY_BYTES+1 bytes BEFORE JSON decode: overflow (including a
+// valid prefix padded with whitespace plus one more byte) denies the whole
+// response with no body bytes echoed. The stream is cancelled on overflow,
+// read error, and abort. A missing/non-streaming body (no getReader) fails
+// closed with {nonJSON:true} and never allocates unbounded.
 async function readBoundedJSON(res, signal) {
   const body = res ? res.body : null;
-  if (body && typeof body.getReader === 'function') {
-    const reader = body.getReader();
-    const chunks = [];
-    let total = 0;
-    try {
-      for (;;) {
-        if (signal && signal.aborted) {
-          const aborted = new Error('The operation was aborted.');
-          aborted.name = 'AbortError';
-          throw aborted;
-        }
-        const next = await reader.read();
-        if (next.done) break;
-        const value = next.value;
-        const len = value ? (value.byteLength != null ? value.byteLength : (value.length || 0)) : 0;
-        total += len;
-        if (total > MAX_BODY_BYTES) {
-          try { await reader.cancel(); } catch {}
-          return { overflow: true };
-        }
-        if (value) chunks.push(value);
+  if (!body || typeof body.getReader !== 'function') return { nonJSON: true };
+  const reader = body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      if (signal && signal.aborted) {
+        const aborted = new Error('The operation was aborted.');
+        aborted.name = 'AbortError';
+        throw aborted;
       }
-    } catch (e) {
-      try { await reader.cancel(); } catch {}
-      throw e;
-    } finally {
-      try { reader.releaseLock(); } catch {}
+      const next = await reader.read();
+      if (next.done) break;
+      const value = next.value;
+      const len = value ? (value.byteLength != null ? value.byteLength : (value.length || 0)) : 0;
+      total += len;
+      if (total > MAX_BODY_BYTES) {
+        try { await reader.cancel(); } catch {}
+        return { overflow: true };
+      }
+      if (value) chunks.push(value);
     }
-    const buf = new Uint8Array(total);
-    let off = 0;
-    for (const c of chunks) {
-      const u8 = c instanceof Uint8Array ? c : Uint8Array.from(c);
-      buf.set(u8, off);
-      off += u8.byteLength;
-    }
-    try {
-      return { env: JSON.parse(new TextDecoder('utf-8').decode(buf)) };
-    } catch {
-      return { nonJSON: true };
-    }
+  } catch (e) {
+    try { await reader.cancel(); } catch {}
+    throw e;
+  } finally {
+    try { reader.releaseLock(); } catch {}
   }
-  // Non-streaming fetch shapes below are TEST-ONLY fallbacks: production
-  // fetch (undici/WHATWG) always exposes a getReader() body, handled above
-  // with byte counting BEFORE allocation completes. These branches exist
-  // only so the in-process unit tests can stub fetch without a stream;
-  // they still deny over-cap envelopes (fail closed) but cannot bound
-  // allocation the way the streaming branch does.
-  if (res && typeof res.text === 'function') {
-    const text = await res.text();
-    if (Buffer.byteLength(text, 'utf8') > MAX_BODY_BYTES) {
-      try {
-        if (res.body && typeof res.body.cancel === 'function') await res.body.cancel();
-      } catch {}
-      return { overflow: true };
-    }
-    try {
-      return { env: JSON.parse(text) };
-    } catch {
-      return { nonJSON: true };
-    }
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    const u8 = c instanceof Uint8Array ? c : Uint8Array.from(c);
+    buf.set(u8, off);
+    off += u8.byteLength;
   }
-  // Legacy stub shape ({ json } only, no streamable body): no raw bytes
-  // to bound, so the re-encoded envelope length stands in for the wire
-  // bytes and over-cap envelopes deny the same way (fail closed).
-  if (res && typeof res.json === 'function') {
-    let env;
-    try {
-      env = await res.json();
-    } catch {
-      return { nonJSON: true };
-    }
-    try {
-      if (Buffer.byteLength(JSON.stringify(env), 'utf8') > MAX_BODY_BYTES) return { overflow: true };
-    } catch {
-      return { nonJSON: true };
-    }
-    return { env };
+  try {
+    return { env: JSON.parse(new TextDecoder('utf-8').decode(buf)) };
+  } catch {
+    return { nonJSON: true };
   }
-  return { nonJSON: true };
 }
 
 // requestJSON is the ONE bounded request helper shared by postJSON and
-// getJSON. It validates the joined base+path URL against the loopback gate
-// BEFORE fetch (failing closed on parse failure), sends with
-// redirect:'error', and races every request against a DEFAULT_TIMEOUT_MS
-// AbortController combined with the caller signal, so headers AND body are
-// covered. The timer and the caller-abort listener clear on every path.
+// getJSON. It gates the joined base origin (base before path join) against
+// the loopback rule BEFORE fetch (failing closed on any violation), sends
+// with redirect:'error', and races every request against a
+// DEFAULT_TIMEOUT_MS AbortController combined with the caller signal, so
+// headers AND body are covered. The timer and the caller-abort listener
+// clear on every path.
 async function requestJSON(urlInput, init, path) {
   const url = String(urlInput);
+  const originEnd = url.startsWith(path) ? -1 : url.length - path.length;
+  const baseOnly = originEnd > 0 ? url.slice(0, originEnd) : url;
   let loopback = false;
   try {
-    loopback = isLoopbackURL(url);
+    loopback = isLoopbackURL(baseOnly);
   } catch {
     loopback = false;
   }

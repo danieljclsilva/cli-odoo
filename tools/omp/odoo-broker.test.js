@@ -5,9 +5,10 @@
 // none of it, but the call proves the factory binds without the host.
 // Run: node --test tools/omp/odoo-broker.test.js
 //
-// HTTP is stubbed per-test: legitimate routing and denial surfacing are
-// proven against a fake fetch, so no model/backend/Odoo credentials exist
-// anywhere in this file.
+// HTTP is stubbed per-test with streaming ReadableStream-like bodies
+// (getReader): the production single streaming bounded reader is the only
+// path exercised, so no model/backend/Odoo credentials exist anywhere in
+// this file.
 //
 // PROVEN (2026-10-04): factory shape (11 typed tools, 5-arg execute);
 // legitimate routing to typed broker paths; denials surface as isError;
@@ -81,12 +82,35 @@ test('no shell fallback, token via env only, factory ignores pi', () => {
   assert.ok(src.includes('MAX_TIMEOUT_MS'), 'timeout override must have a ceiling');
 });
 
+const TEST_CAP = 4 * 1024 * 1024;
+
+function streamedResponse(chunks, onCancel) {
+  let i = 0;
+  return {
+    body: {
+      getReader() {
+        return {
+          read: async () => (i < chunks.length
+            ? { done: false, value: chunks[i++] }
+            : { done: true, value: undefined }),
+          cancel: async () => { if (onCancel) onCancel(); },
+          releaseLock() {},
+        };
+      },
+    },
+  };
+}
+
+function streamedEnvelope(env) {
+  return streamedResponse([Buffer.from(JSON.stringify(env), 'utf8')]);
+}
+
 test('legitimate call routes to the broker path', async () => {
   const seen = [];
   const realFetch = global.fetch;
   global.fetch = async (url, opts) => {
     seen.push({ url: String(url), opts });
-    return { json: async () => ({ success: true, result: { rows: [] } }) };
+    return streamedEnvelope({ success: true, result: { rows: [] } });
   };
   process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
   process.env.ODOO_BROKER_TOKEN = 'tok';
@@ -109,7 +133,7 @@ test('legitimate call routes to the broker path', async () => {
 
 test('denied call surfaces isError without throwing', async () => {
   const realFetch = global.fetch;
-  global.fetch = async () => ({ json: async () => ({ success: false, error: 'denied: unknown-model' }) });
+  global.fetch = async () => streamedEnvelope({ success: false, error: 'denied: unknown-model' });
   process.env.ODOO_BROKER_TOKEN = 'tok';
   try {
     const tools = toolsOf();
@@ -128,7 +152,7 @@ test('workspace.mkdir routes to /rpc/workspace/mkdir', async () => {
   const realFetch = global.fetch;
   global.fetch = async (url) => {
     seen.push(String(url));
-    return { json: async () => ({ success: true, result: { path: 'reports', written: true } }) };
+    return streamedEnvelope({ success: true, result: { path: 'reports', written: true } });
   };
   process.env.ODOO_BROKER_TOKEN = 'tok';
   try {
@@ -144,12 +168,13 @@ test('workspace.mkdir routes to /rpc/workspace/mkdir', async () => {
   }
 });
 
+
 test('unknown args rejected with no fetch', async () => {
   const realFetch = global.fetch;
   let calls = 0;
   global.fetch = async () => {
     calls += 1;
-    return { json: async () => ({ success: true, result: {} }) };
+    return streamedEnvelope({ success: true, result: {} });
   };
   process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
   process.env.ODOO_BROKER_TOKEN = 'tok';
@@ -173,7 +198,7 @@ test('non-loopback broker URL refused', async () => {
   let calls = 0;
   global.fetch = async () => {
     calls += 1;
-    return { json: async () => ({ success: true, result: {} }) };
+    return streamedEnvelope({ success: true, result: {} });
   };
   process.env.ODOO_BROKER_URL = 'http://192.168.1.10:8471';
   process.env.ODOO_BROKER_TOKEN = 'tok';
@@ -192,7 +217,7 @@ test('non-loopback broker URL refused', async () => {
 
 test('token redacted from error strings', async () => {
   const realFetch = global.fetch;
-  global.fetch = async () => ({ json: async () => ({ success: false, error: 'denied for token-SECRET-abc token' }) });
+  global.fetch = async () => streamedEnvelope({ success: false, error: 'denied for token-SECRET-abc token' });
   process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
   process.env.ODOO_BROKER_TOKEN = 'token-SECRET-abc';
   try {
@@ -244,7 +269,7 @@ test('malformed broker URL fails closed before fetch', async () => {
   let calls = 0;
   global.fetch = async () => {
     calls += 1;
-    return { json: async () => ({ success: true, result: {} }) };
+    return streamedEnvelope({ success: true, result: {} });
   };
   process.env.ODOO_BROKER_URL = '::::not a url::::';
   process.env.ODOO_BROKER_TOKEN = 'tok';
@@ -268,7 +293,7 @@ test('userinfo-smuggled loopback refused before fetch', async () => {
   let calls = 0;
   global.fetch = async () => {
     calls += 1;
-    return { json: async () => ({ success: true, result: {} }) };
+    return streamedEnvelope({ success: true, result: {} });
   };
   process.env.ODOO_BROKER_URL = 'http://127.0.0.1@evil.example/';
   process.env.ODOO_BROKER_TOKEN = 'tok';
@@ -285,24 +310,60 @@ test('userinfo-smuggled loopback refused before fetch', async () => {
   }
 });
 
-const TEST_CAP = 4 * 1024 * 1024;
-
-function streamedResponse(chunks, onCancel) {
-  let i = 0;
-  return {
-    body: {
-      getReader() {
-        return {
-          read: async () => (i < chunks.length
-            ? { done: false, value: chunks[i++] }
-            : { done: true, value: undefined }),
-          cancel: async () => { if (onCancel) onCancel(); },
-          releaseLock() {},
-        };
-      },
-    },
+test('strict raw gate accepts canonical loopback, rejects evasions', async () => {
+  const realFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return streamedEnvelope({ success: true, result: { rows: [] } });
   };
-}
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  const good = ['http://127.0.0.1:8471', 'http://localhost:8471', 'http://[::1]:8471'];
+  const bad = [
+    'http://0x7f.0.0.1/', 'http://2130706433/', 'http://user@127.0.0.1/',
+    'http://127.0.0.1/x', 'http://127.0.0.1?q=1', 'http://127.0.0.1#x',
+    'http://127.evil.com/',
+  ];
+  try {
+    const search = byName('odoo.search');
+    for (const u of good) {
+      calls = 0;
+      process.env.ODOO_BROKER_URL = u;
+      const res = await search.execute('id-good', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+      assert.strictEqual(res.isError, undefined, `${u} must route (got ${res.content[0].text})`);
+      assert.strictEqual(calls, 1, `${u} must reach fetch exactly once`);
+    }
+    for (const u of bad) {
+      calls = 0;
+      process.env.ODOO_BROKER_URL = u;
+      const res = await search.execute('id-bad', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+      assert.strictEqual(res.isError, true, `${u} must be isError`);
+      assert.ok(res.content[0].text.includes('loopback'), `${u} got ${res.content[0].text}`);
+      assert.strictEqual(calls, 0, `${u} must never reach fetch`);
+    }
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+test('non-streaming body fails closed without unbounded allocation', async () => {
+  const realFetch = global.fetch;
+  global.fetch = async () => ({ json: async () => ({ success: true, result: {} }) });
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  try {
+    const search = byName('odoo.search');
+    const res = await search.execute('id-nostream', { model: 'res.partner', fields: ['name'] }, undefined, {}, undefined);
+    assert.strictEqual(res.isError, true, 'non-streaming body must fail closed');
+    assert.ok(res.content[0].text.includes('non-JSON'), `got ${res.content[0].text}`);
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
 
 test('over-cap body denied whole with no bytes echoed', async () => {
   const realFetch = global.fetch;

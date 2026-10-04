@@ -318,8 +318,8 @@ func TestContextOverwrite(t *testing.T) {
 		t.Fatalf("company_id = %v, want 1 (Default)", ctx["company_id"])
 	}
 	ids, ok := ctx["allowed_company_ids"].([]any)
-	if !ok || len(ids) != 2 {
-		t.Fatalf("allowed_company_ids = %v, want [1 2]", ctx["company_id"])
+	if !ok || len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+		t.Fatalf("allowed_company_ids = %v, want [1 2] (Default 1 first)", ctx["allowed_company_ids"])
 	}
 	dom, _ := kw["domain"].([]any)
 	found := false
@@ -1234,5 +1234,161 @@ func TestDispatchPreCancelledContextDenied(t *testing.T) {
 	}
 	if got := inflightOutstanding(b); got != before {
 		t.Fatalf("outstanding = %d, want %d (cancelled dispatch must not leak a slot)", got, before)
+	}
+}
+
+// Default-first scoped context through the real policy gate: the dispatch
+// recorder proves routing only (canned rows, never Odoo semantics) for both
+// scope orders — Enabled=[1,2] Default=2 sends allowed [2,1] + company_id 2,
+// and Enabled=[2,1] Default=1 sends [1,2] + company_id 1 — across
+// search/read/count/aggregate, with the caller domain fragment appended
+// after the caller conditions (domain AND order unchanged).
+func TestRealGateDefaultFirstScope(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled []int
+		def     int
+		want    []any
+	}{
+		{"default 2 of [1,2] orders [2,1]", []int{1, 2}, 2, []any{2, 1}},
+		{"default 1 of [2,1] orders [1,2]", []int{2, 1}, 1, []any{1, 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &fakeExec{rows: []any{map[string]any{"id": 1, "name": "a"}}}
+			p := testPolicy()
+			rule := p.Models["res.partner"]
+			rule.AllowAggregate = true
+			p.Models["res.partner"] = rule
+			p.Scope = policy.CompanyScope{Enabled: append([]int(nil), tc.enabled...), Default: tc.def}
+			snap := testSnapshot()
+			snap.EnabledCompanies = append([]int(nil), tc.enabled...)
+			snap.DefaultCompany = tc.def
+			digest, err := snapshot.CanonicalDigest(snap)
+			if err != nil {
+				t.Fatalf("digest: %v", err)
+			}
+			p.SnapshotSHA256 = digest
+			b, err := NewForTest(p, &config.Instance{Name: "test"}, snap, nil, exec)
+			if err != nil {
+				t.Fatalf("NewForTest: %v", err)
+			}
+			// The sealed policy/snapshot must survive dispatch unchanged:
+			// scopedArgs reorders a copy, never the sealed scope.
+			sealedEnabled := append([]int(nil), p.Scope.Enabled...)
+			tok, err := b.Grant(time.Hour)
+			if err != nil {
+				t.Fatalf("Grant: %v", err)
+			}
+			calls := []struct {
+				path string
+				body string
+			}{
+				{"/rpc/search", `{"model":"res.partner","fields":["name"],"limit":5,"domain":[["name","=","acme"]]}`},
+				{"/rpc/read", `{"model":"res.partner","ids":[7],"fields":["name"]}`},
+				{"/rpc/count", `{"model":"res.partner","domain":[["name","=","acme"]]}`},
+				{"/rpc/aggregate", `{"model":"res.partner","groupby":["name"],"count":true,"limit":5,"domain":[["name","=","acme"]]}`},
+			}
+			for _, c := range calls {
+				exec.calls = nil
+				rec := post(t, b, c.path, tok, c.body)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("%s code = %d: %s", c.path, rec.Code, rec.Body.String())
+				}
+				if len(exec.calls) != 1 {
+					t.Fatalf("%s dispatches = %d, want 1", c.path, len(exec.calls))
+				}
+				kw := exec.calls[0].kwargs
+				ctx, ok := kw["context"].(map[string]any)
+				if !ok {
+					t.Fatalf("%s: no injected context: %#v", c.path, kw)
+				}
+				if ctx["company_id"] != tc.def {
+					t.Fatalf("%s: company_id = %v, want %d (Default)", c.path, ctx["company_id"], tc.def)
+				}
+				var dom []any
+				if c.path == "/rpc/count" || c.path == "/rpc/aggregate" {
+					args := exec.calls[0].args
+					if len(args) == 0 {
+						t.Fatalf("%s: no dispatch args, want domain first", c.path)
+					}
+					dom, _ = args[0].([]any)
+				} else {
+					dom, _ = kw["domain"].([]any)
+				}
+				if len(dom) == 0 {
+					t.Fatalf("%s: empty domain, want caller conditions then fragment", c.path)
+				}
+				first, _ := dom[0].([]any)
+				if c.path == "/rpc/read" {
+					if len(first) != 3 || first[0] != "id" {
+						t.Fatalf("%s: read domain must start with the caller id leaf: %v", c.path, dom)
+					}
+				} else if len(first) != 3 || first[0] != "name" {
+					t.Fatalf("%s: domain must start with caller conditions (fragment appended after): %v", c.path, dom)
+				}
+				last, _ := dom[len(dom)-1].([]any)
+				if len(last) != 3 || last[0] != "company_id" {
+					t.Fatalf("%s: domain must end with the company fragment: %v", c.path, dom)
+				}
+			}
+			for i, id := range p.Scope.Enabled {
+				if id != sealedEnabled[i] {
+					t.Fatalf("sealed scope mutated: %v, want %v", p.Scope.Enabled, sealedEnabled)
+				}
+			}
+		})
+	}
+}
+
+// Server-boundary negative control: a scoped model whose company field is a
+// res.company many2many (company_ids) denies through the real
+// pre-credential/serve verification path (verifyCompanyFields, Serve step 4,
+// before any credential resolves or any Execute can run) with zero
+// dispatches, while the legitimate two-company many2one scoped control
+// dispatches once through the real gate.
+func TestRealGateMany2ManyDeniedBeforeDispatch(t *testing.T) {
+	m2mSnap := testSnapshot()
+	partner := m2mSnap.Models["res.partner"]
+	partner.CompanyField = "company_ids"
+	fields := partner.Fields
+	fields["company_ids"] = snapshot.SFieldMeta{Name: "company_ids", Type: "many2many", Relation: "res.company", Label: "Companies"}
+	partner.Fields = fields
+	m2mSnap.Models["res.partner"] = partner
+	m2mPol := testPolicy()
+	m2mRule := m2mPol.Models["res.partner"]
+	m2mRule.CompanyField = "company_ids"
+	m2mRule.Fields = []string{"name", "company_ids"}
+	m2mPol.Models["res.partner"] = m2mRule
+	digest, err := snapshot.CanonicalDigest(m2mSnap)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	m2mPol.SnapshotSHA256 = digest
+	exec := &fakeExec{rows: []any{map[string]any{"id": 1, "name": "a"}}}
+	if _, err := NewForTest(m2mPol, &config.Instance{Name: "test"}, m2mSnap, nil, exec); err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	// The real pre-credential/serve verification path denies the many2many
+	// link before any credential resolves — so no Execute could have run.
+	if err := verifyCompanyFields(m2mPol, m2mSnap); err == nil {
+		t.Fatal("many2many company_ids passed verifyCompanyFields, want deny")
+	} else if !strings.Contains(err.Error(), "many2many") {
+		t.Fatalf("many2many denial should name the release limitation, got: %v", err)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("serve-verification denial dispatched %d RPCs, want 0 (deny before Execute)", len(exec.calls))
+	}
+	legit := &fakeExec{rows: []any{map[string]any{"id": 1, "name": "a"}}}
+	lb := realGateBroker(t, legit)
+	ltok, err := lb.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	lrec := post(t, lb, "/rpc/search", ltok, `{"model":"res.partner","fields":["name"],"limit":5}`)
+	if lrec.Code != http.StatusOK {
+		t.Fatalf("legitimate many2one search = %d: %s", lrec.Code, lrec.Body.String())
+	}
+	if len(legit.calls) != 1 {
+		t.Fatalf("legitimate many2one dispatches = %d, want 1", len(legit.calls))
 	}
 }

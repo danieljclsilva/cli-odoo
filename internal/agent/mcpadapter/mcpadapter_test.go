@@ -141,10 +141,13 @@ func initServer(t *testing.T, srv *Server) {
 
 // readyServer drives initialize + notifications/initialized over one Serve
 // invocation (the Serve loop owns both transitions), then asserts ready.
+// The initialize carries the full valid MCP shape (protocolVersion plus
+// object-typed clientInfo/capabilities) so the suite exercises the valid
+// path; malformed shapes are covered by the strict-init tests below.
 func readyServer(t *testing.T, srv *Server) {
 	t.Helper()
 	got, err := serveInput(t, srv,
-		`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`+"\n"+
+		`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test-client","version":"1.0"},"capabilities":{}}}`+"\n"+
 			`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`+"\n",
 		5*time.Second)
 	if err != nil {
@@ -210,7 +213,7 @@ func TestToolsListRequiresReady(t *testing.T) {
 		t.Fatalf("uninitialized list dispatched: %v", exec.calls)
 	}
 	// Initialize RESPONSE alone still gates: awaiting-initialized is not ready.
-	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":71,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`)
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":71,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test-client","version":"1.0"},"capabilities":{}}}`)
 	if res["result"] == nil {
 		t.Fatalf("initialize: %+v", res)
 	}
@@ -348,7 +351,7 @@ func (errFailWriter) Write([]byte) (int, error) { return 0, errors.New("boom") }
 func TestMalformedInputRecovers(t *testing.T) {
 	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
 	got, err := serveInput(t, srv,
-		"this is not json\n"+`{"jsonrpc":"2.0","id":11,"method":"initialize","params":{}}`+"\n",
+		"this is not json\n"+`{"jsonrpc":"2.0","id":11,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test-client","version":"1.0"},"capabilities":{}}}`+"\n",
 		5*time.Second)
 	if err != nil {
 		t.Fatalf("Serve: %v", err)
@@ -616,37 +619,57 @@ func TestTokenRedactedFromErrors(t *testing.T) {
 }
 
 // initialize negotiates deterministically: a supported client version echoes
-// back, anything else (unknown, empty, missing, wrong-typed, non-object
-// params) falls back to the default without error. ping answers anytime.
+// back, an unsupported but well-typed version falls back to the default
+// without error, and malformed params (absent/empty/non-object payload,
+// missing/empty/non-string version, wrong-typed clientInfo/capabilities)
+// reject with invalid-params and no state transition. ping answers anytime.
 func TestInitializeNegotiationAndPing(t *testing.T) {
+	full := func(v string) string {
+		return `{"jsonrpc":"2.0","id":40,"method":"initialize","params":{"protocolVersion":"` + v + `","clientInfo":{"name":"test-client","version":"1.0"},"capabilities":{}}}`
+	}
 	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
-	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":40,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`)
+	res := roundTrip(t, srv, full("2025-03-26"))
 	result, _ := res["result"].(map[string]any)
 	if result["protocolVersion"] != "2025-03-26" {
 		t.Fatalf("negotiation = %+v, want 2025-03-26", result)
 	}
 	srv2 := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
-	res = roundTrip(t, srv2, `{"jsonrpc":"2.0","id":41,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}`)
+	res = roundTrip(t, srv2, full("2099-01-01"))
 	result, _ = res["result"].(map[string]any)
 	if result["protocolVersion"] != defaultProtocolVersion {
 		t.Fatalf("unknown version should fall back to %q: %+v", defaultProtocolVersion, result)
 	}
-	// Malformed init params are deterministic: missing, empty, wrong-typed,
-	// and non-object params all answer with the default version, never an
-	// error and never an echo of attacker-chosen text.
+	// Malformed init params reject with invalid-params and never advance:
+	// the session stays uninitialized, so a follow-up tools/list is still
+	// gated and ping still answers. Missing params, empty params, and
+	// non-object payloads all deny here — never a default-version answer.
 	for i, p := range []string{
 		`{"jsonrpc":"2.0","id":44,"method":"initialize"}`,
 		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":{}}`,
+		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":null}`,
 		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":{"protocolVersion":""}}`,
 		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":{"protocolVersion":42}}`,
 		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":[1,2]}`,
 		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":"2025-03-26"}`,
+		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":"x","capabilities":{}}}`,
+		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"c","version":"1"},"capabilities":[1]}}`,
+		`{"jsonrpc":"2.0","id":44,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":7,"version":"1"},"capabilities":{}}}`,
 	} {
 		srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
 		res := roundTrip(t, srv, p)
-		result, _ := res["result"].(map[string]any)
-		if res["error"] != nil || result["protocolVersion"] != defaultProtocolVersion {
-			t.Fatalf("case %d params %s = %+v, want default %q", i, p, res, defaultProtocolVersion)
+		errObj, _ := res["error"].(map[string]any)
+		if errObj == nil {
+			t.Fatalf("case %d params %s should be invalid-params, got %+v", i, p, res)
+		}
+		if code, _ := errObj["code"].(float64); code != -32602 {
+			t.Fatalf("case %d params %s code = %v, want -32602", i, p, errObj["code"])
+		}
+		if srv.ready() || srv.state.Load() != sessionUninitialized {
+			t.Fatalf("case %d params %s advanced state, want uninitialized", i, p)
+		}
+		res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":45,"method":"tools/list","params":{}}`)
+		if res["error"] == nil {
+			t.Fatalf("case %d: tools/list after malformed init should stay gated", i)
 		}
 	}
 	srv3 := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
@@ -687,7 +710,7 @@ func TestToolsCallRequiresInitialize(t *testing.T) {
 	if len(exec.calls) != 0 {
 		t.Fatalf("uninitialized call dispatched: %v", exec.calls)
 	}
-	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":54,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`)
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":54,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test-client","version":"1.0"},"capabilities":{}}}`)
 	if res["result"] == nil {
 		t.Fatalf("initialize: %+v", res)
 	}
@@ -881,4 +904,97 @@ func TestBrokerResponseOverflowDeniedWithoutInitialize(t *testing.T) {
 func jsonString(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// Strict init lifecycle: malformed initialize params reject with
+// invalid-params and advance nothing (tools/list and tools/call stay gated
+// with zero dispatch), while a full valid initialize plus
+// notifications/initialized reaches ready and allows tools.
+func TestStrictInitDeniesWithoutTransition(t *testing.T) {
+	exec := &stubExec{rows: []any{map[string]any{"id": 1, "name": "a"}}}
+	srvURL, tok := testBrokerServer(t, &stubGate{allow: true}, exec)
+	srv := New(Config{BaseURL: srvURL.URL, Token: tok})
+	malformed := `{"jsonrpc":"2.0","id":91,"method":"initialize","params":{"clientInfo":{"name":"c","version":"1"},"capabilities":{}}}`
+	res := roundTrip(t, srv, malformed)
+	errObj, _ := res["error"].(map[string]any)
+	if errObj == nil {
+		t.Fatalf("malformed init should be invalid-params: %+v", res)
+	}
+	if code, _ := errObj["code"].(float64); code != -32602 {
+		t.Fatalf("malformed init code = %v, want -32602", errObj["code"])
+	}
+	if srv.ready() || srv.state.Load() != sessionUninitialized {
+		t.Fatal("malformed init advanced state, want uninitialized")
+	}
+	for _, req := range []string{
+		`{"jsonrpc":"2.0","id":92,"method":"tools/list","params":{}}`,
+		`{"jsonrpc":"2.0","id":93,"method":"tools/call","params":{"name":"search","arguments":{"model":"res.partner","fields":["name"]}}}`,
+	} {
+		res = roundTrip(t, srv, req)
+		if res["error"] == nil {
+			t.Fatalf("gated tool after malformed init should be an error: %+v", res)
+		}
+		if got := res["error"].(map[string]any)["message"].(string); got != errNotInitialized.Error() {
+			t.Fatalf("gated message = %q, want %q", got, errNotInitialized.Error())
+		}
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("malformed-init session dispatched: %v", exec.calls)
+	}
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":94,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test-client","version":"1.0"},"capabilities":{}}}`)
+	if res["result"] == nil {
+		t.Fatalf("valid init: %+v", res)
+	}
+	got, err := serveInput(t, srv, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`+"\n", 5*time.Second)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if strings.TrimSpace(got) != "" {
+		t.Fatalf("notification should get no reply, got %q", got)
+	}
+	if !srv.ready() {
+		t.Fatal("session should be ready after valid init + notification")
+	}
+	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":95,"method":"tools/list","params":{}}`)
+	if res["result"] == nil {
+		t.Fatalf("ready tools/list: %+v", res)
+	}
+}
+
+// Raw URL pre-parse checks: userinfo, query/fragment, and non-root paths
+// fail closed before the parse+loopback check, alongside the existing
+// non-loopback denials. Well-formed loopback roots (with and without a
+// trailing slash) still pass.
+func TestLoopbackRawPrechecks(t *testing.T) {
+	for _, raw := range []string{
+		"http://127.0.0.1:8471",
+		"http://127.0.0.1:8471/",
+		"http://localhost:8471",
+		"http://localhost:8471/",
+		"http://[::1]:8471",
+		"http://127.0.0.2:9/",
+	} {
+		if !isLoopbackURL(raw) {
+			t.Fatalf("isLoopbackURL(%q) = false, want true", raw)
+		}
+		if err := validateBaseURL(raw); err != nil {
+			t.Fatalf("validateBaseURL(%q) = %v, want nil", raw, err)
+		}
+	}
+	for _, raw := range []string{
+		"http://user@127.0.0.1:8471",
+		"http://user:pass@127.0.0.1:8471/",
+		"http://127.0.0.1:8471?model=x",
+		"http://127.0.0.1:8471/#frag",
+		"http://127.0.0.1:8471/rpc/search",
+		"http://127.0.0.1:8471//",
+		"http://localhost:8471/rpc/meta?model=res.partner",
+	} {
+		if isLoopbackURL(raw) {
+			t.Fatalf("isLoopbackURL(%q) = true, want false (raw precheck)", raw)
+		}
+		if err := validateBaseURL(raw); err == nil {
+			t.Fatalf("validateBaseURL(%q) = nil, want deny", raw)
+		}
+	}
 }

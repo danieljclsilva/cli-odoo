@@ -141,11 +141,48 @@ func (c Config) Resolve() Config {
 	return out
 }
 
+// rawLoopbackPrechecks rejects smuggled URL structure on the RAW text
+// before url.Parse normalizes it away: userinfo ('@' in the authority can
+// steer the effective host), query ('?') or fragment ('#') anywhere (they
+// can smuggle filter state past a prefix check), and any non-root path
+// (only empty or "/" is a bare broker endpoint). Anything else fails
+// closed here, before the parse+loopback check below.
+func rawLoopbackPrechecks(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return false
+	}
+	i := strings.Index(t, "://")
+	if i < 0 {
+		return false
+	}
+	rest := t[i+3:]
+	auth := rest
+	path := ""
+	if j := strings.Index(rest, "/"); j >= 0 {
+		auth, path = rest[:j], rest[j:]
+	}
+	if strings.Contains(auth, "@") {
+		return false
+	}
+	if strings.Contains(t, "?") || strings.Contains(t, "#") {
+		return false
+	}
+	if path != "" && path != "/" {
+		return false
+	}
+	return true
+}
+
 // isLoopbackURL reports whether raw is an http(s) URL whose host is a
 // loopback literal (127.0.0.0/8, ::1 incl. IPv4-in-IPv6) or localhost
 // (exact match only: 127.evil.com is NOT loopback). Anything else —
-// unparsable, wrong scheme, missing host, non-loopback — fails closed.
+// unparsable, wrong scheme, missing host, non-loopback, userinfo,
+// query/fragment, or a non-root path — fails closed.
 func isLoopbackURL(raw string) bool {
+	if !rawLoopbackPrechecks(raw) {
+		return false
+	}
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u == nil {
 		return false
@@ -168,7 +205,12 @@ func isLoopbackURL(raw string) bool {
 
 // validateBaseURL rejects non-loopback broker endpoints before any request
 // is built: the session token must never travel beyond the local broker.
+// Raw pre-parse checks (userinfo, query/fragment, non-root path) run first;
+// the existing parse+loopback check follows.
 func validateBaseURL(raw string) error {
+	if !rawLoopbackPrechecks(raw) {
+		return errors.New("broker URL must be a loopback http(s) URL")
+	}
 	if !isLoopbackURL(raw) {
 		return errors.New("broker URL must be a loopback http(s) URL")
 	}
@@ -504,48 +546,85 @@ func (s *Server) handleNotification(method string, _ json.RawMessage) {
 	}
 }
 
-// negotiateVersion resolves the client's protocolVersion deterministically.
-// Params must be a JSON object; protocolVersion must be a non-empty string.
-// A non-object payload, a missing/empty/non-string version, or an unknown
-// version all negotiate the default — never an error, never a widening
-// echo of attacker-chosen text.
-func negotiateVersion(params json.RawMessage) string {
+// negotiateVersion validates strict MCP initialize params and resolves the
+// protocol version deterministically. Params must be a JSON object;
+// protocolVersion must be a present non-empty string. clientInfo and
+// capabilities, when present, must be JSON objects per the MCP contract
+// (clientInfo carries string name/version when those keys appear). Any
+// malformed shape — empty/absent params, a non-object payload, a
+// missing/empty/non-string version, or a wrong-typed clientInfo/
+// capabilities — rejects with invalid-params and advances nothing (the
+// Serve loop only transitions on a sent success response). An unsupported
+// but well-typed version string still negotiates the server default —
+// never an error, never a widening echo of attacker-chosen text.
+func negotiateVersion(params json.RawMessage) (string, *rpcErr) {
+	invalid := func() (string, *rpcErr) { return "", &rpcErr{Code: -32602, Message: "invalid params"} }
 	if len(bytes.TrimSpace(params)) == 0 {
-		return defaultProtocolVersion
+		return invalid()
 	}
 	var raw map[string]json.RawMessage
 	dec := json.NewDecoder(bytes.NewReader(params))
 	if err := dec.Decode(&raw); err != nil || raw == nil {
-		return defaultProtocolVersion
+		return invalid()
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return invalid()
 	}
 	vraw, ok := raw["protocolVersion"]
 	if !ok {
-		return defaultProtocolVersion
+		return invalid()
 	}
 	var v string
 	if err := json.Unmarshal(vraw, &v); err != nil || v == "" {
-		return defaultProtocolVersion
+		return invalid()
+	}
+	if craw, ok := raw["clientInfo"]; ok {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(craw, &obj); err != nil || obj == nil {
+			return invalid()
+		}
+		for _, key := range []string{"name", "version"} {
+			if fraw, ok := obj[key]; ok {
+				var fs string
+				if err := json.Unmarshal(fraw, &fs); err != nil {
+					return invalid()
+				}
+			}
+		}
+	}
+	if craw, ok := raw["capabilities"]; ok {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(craw, &obj); err != nil || obj == nil {
+			return invalid()
+		}
 	}
 	for _, s := range supportedVersions {
 		if v == s {
-			return v
+			return v, nil
 		}
 	}
-	return defaultProtocolVersion
+	return defaultProtocolVersion, nil
 }
 func (s *Server) handle(ctx context.Context, method string, params json.RawMessage) (any, *rpcErr) {
 	switch method {
 	case "initialize":
-		// Idempotent: every initialize request answers deterministically.
-		// The lifecycle advance happens only in Serve after the RESPONSE
-		// is sent, so a failed encode never advances the session; a
-		// repeat while ready stays ready (the Serve transition only
-		// moves uninitialized -> awaiting-initialized). Malformed params
-		// never error: negotiation falls back to the default version.
-		// Notifications named "notifications/initialized" carry no ID
-		// and never reach here.
+		// Idempotent: every VALID initialize request answers
+		// deterministically. The lifecycle advance happens only in Serve
+		// after the RESPONSE is sent, so a failed encode never advances
+		// the session; a repeat while ready stays ready (the Serve
+		// transition only moves uninitialized -> awaiting-initialized).
+		// Malformed params reject with invalid-params and advance
+		// nothing: the error return skips the Serve transition, so the
+		// session stays uninitialized and tools stay gated with zero
+		// dispatch. Notifications named "notifications/initialized"
+		// carry no ID and never reach here.
+		ver, rerr := negotiateVersion(params)
+		if rerr != nil {
+			return nil, rerr
+		}
 		return map[string]any{
-			"protocolVersion": negotiateVersion(params),
+			"protocolVersion": ver,
 			"serverInfo":      map[string]any{"name": "odoo-broker", "version": Version},
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 		}, nil
