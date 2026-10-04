@@ -1,6 +1,9 @@
 package policy
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestBoundedDomainAdmission(t *testing.T) {
 	leaf := func(field, op string, v any) []any { return []any{field, op, v} }
@@ -22,6 +25,71 @@ func TestBoundedDomainAdmission(t *testing.T) {
 		if BoundedDomain(domain) {
 			t.Fatalf("unbounded filter admitted: %v", domain)
 		}
+	}
+}
+
+func TestBoundedDomainPerModelAnchors(t *testing.T) {
+	leaf := func(field, op string, v any) []any { return []any{field, op, v} }
+	// Reviewed anchor: stock.rule route_id only. helpdesk.ticket team_id
+	// is NOT a standalone anchor: team-wide historical scans stay bounded
+	// (mandate correction 2026-10-04) — ticket queries need an accepted
+	// anchor or a <=31-day date window.
+	for _, tc := range []struct {
+		model  string
+		domain []any
+	}{
+		{"stock.rule", []any{leaf("route_id", "in", []any{float64(66), float64(27)})}},
+		{"stock.rule", []any{leaf("route_id", "=", 66)}},
+	} {
+		if !BoundedDomainFor(tc.model, tc.domain) {
+			t.Fatalf("reviewed anchor refused for %s: %v", tc.model, tc.domain)
+		}
+	}
+	// Cross-model leakage denied: route_id is not an anchor elsewhere,
+	// and the unscoped form keeps exact prior behavior.
+	if BoundedDomainFor("res.partner", []any{leaf("route_id", "in", []any{float64(66)})}) {
+		t.Fatal("per-model anchor leaked to another model")
+	}
+	if BoundedDomain([]any{leaf("route_id", "in", []any{float64(66)})}) {
+		t.Fatal("unscoped BoundedDomain behavior changed")
+	}
+	// team_id-only ticket queries stay denied (negative control); team_id
+	// PLUS a <=31-day window on the same date field admits (positive
+	// control) via the existing date-window path.
+	if BoundedDomainFor("helpdesk.ticket", []any{leaf("team_id", "=", 1891)}) {
+		t.Fatal("team_id-only ticket query admitted (must stay bounded)")
+	}
+	if !BoundedDomainFor("helpdesk.ticket", []any{
+		leaf("team_id", "=", 1891),
+		leaf("create_date", ">=", "2026-09-03"), leaf("create_date", "<", "2026-10-04"),
+	}) {
+		t.Fatal("team_id plus 31-day window refused")
+	}
+	many := make([]any, 101)
+	for i := range many {
+		many[i] = float64(i + 1)
+	}
+	for _, tc := range []struct {
+		model  string
+		domain []any
+	}{
+		{"stock.rule", []any{leaf("route_id", "in", many)}},
+		{"stock.rule", []any{"|", leaf("route_id", "=", 1), leaf("id", "=", 2)}},
+		{"helpdesk.ticket", []any{leaf("team_id", "=", "1891")}},
+		{"helpdesk.ticket", []any{leaf("other_rel", "=", 1)}},
+	} {
+		if BoundedDomainFor(tc.model, tc.domain) {
+			t.Fatalf("unbounded per-model filter admitted for %s: %v", tc.model, tc.domain)
+		}
+	}
+	if h := BoundedHint("stock.rule"); !strings.Contains(h, "route_id") {
+		t.Fatalf("hint missing anchor field: %q", h)
+	}
+	if h := BoundedHint("res.partner"); strings.Contains(h, "route_id") {
+		t.Fatalf("hint leaked anchor field: %q", h)
+	}
+	if h := BoundedHint("helpdesk.ticket"); strings.Contains(h, "team_id") {
+		t.Fatalf("hint leaked removed team_id anchor: %q", h)
 	}
 }
 

@@ -277,7 +277,7 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 	if rule.LinkedEvidence {
 		return deny(ReasonCompanyDenied)
 	}
-	if p.RequireBoundedQueries && r.Operation != OpMeta && !rule.CompanyIndependent && !BoundedDomain(r.Domain) {
+	if p.RequireBoundedQueries && r.Operation != OpMeta && !rule.CompanyIndependent && !BoundedDomainFor(model, r.Domain) {
 		return deny(ReasonDomainDenied)
 	}
 	if p.RequireBoundedQueries && (len(r.Fields) > 64 || len(r.GroupBy) > 3) {

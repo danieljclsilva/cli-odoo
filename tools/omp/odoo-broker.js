@@ -170,12 +170,23 @@ function ok(text) {
   return { content: [{ type: 'text', text: String(text) }] };
 }
 
+// okMeta appends the broker envelope count/paging metadata as a second
+// content block: block 0 stays the result JSON (unchanged shape), block 1
+// carries {count, paging/completeness where supplied} parsed from the
+// envelope instead of discarded.
+function okMeta(resultText, meta) {
+  return { content: [{ type: 'text', text: String(resultText) }, { type: 'text', text: JSON.stringify(meta) }] };
+}
 function err(text) {
   return { content: [{ type: 'text', text: redactToken(text) }], isError: true };
 }
 
 // strictParams rejects unknown or wrong-typed arguments before dispatch.
-// Kinds: string | strings | int | ints | bool | any.
+// Kinds: string | strings | int | posint | nonnegint | ints | bool | any.
+// posint (positive integer, e.g. evidence id/attachment_id) and nonnegint
+// (nonnegative integer, e.g. evidence limit/offset/tracking_offset) mirror
+// broker enforcement minimums; dynamic policy caps (MaxLimit/MaxOffset)
+// stay authoritative server-side and are described, never fixed, in text.
 function strictParams(tool, spec, params) {
   const p = params == null ? {} : params;
   if (typeof p !== 'object' || Array.isArray(p)) return `${tool}: params must be an object`;
@@ -192,6 +203,8 @@ function checkKind(kind, v) {
     case 'string': return typeof v === 'string';
     case 'bool': return typeof v === 'boolean';
     case 'int': return Number.isInteger(v);
+    case 'posint': return Number.isInteger(v) && v > 0;
+    case 'nonnegint': return Number.isInteger(v) && v >= 0;
     case 'strings': return Array.isArray(v) && v.every((e) => typeof e === 'string');
     case 'ints': return Array.isArray(v) && v.every((e) => Number.isInteger(e));
     default: return false;
@@ -320,8 +333,20 @@ async function requestJSON(urlInput, init, path) {
     if (out.overflow) return err('broker response exceeded 4 MiB limit at ' + path);
     if (out.nonJSON || !out.env) return err('broker returned non-JSON at ' + path);
     const env = out.env;
-    if (!env.success) return err(env.error || ('broker denied ' + path));
-    return ok(JSON.stringify(env.result));
+    if (!env.success) {
+      const bad = err(env.error || ('broker denied ' + path));
+      if (env.error_meta && typeof env.error_meta === 'object') {
+        bad.content.push({ type: 'text', text: JSON.stringify({ error_meta: env.error_meta }) });
+      }
+      return bad;
+    }
+    const meta = { count: env.count === undefined ? null : env.count };
+    if (env.result && typeof env.result === 'object' && !Array.isArray(env.result)) {
+      for (const k of ['may_have_more_messages', 'may_have_more_tracking', 'message_offset', 'tracking_offset', 'limit', 'source_message_ids']) {
+        if (env.result[k] !== undefined) meta[k] = env.result[k];
+      }
+    }
+    return okMeta(JSON.stringify(env.result === undefined ? null : env.result), meta);
   } finally {
     clearTimeout(timer);
     if (caller) caller.removeEventListener('abort', onCallerAbort);
@@ -399,21 +424,31 @@ const META_ARGS = { model: 'string' };
 const WS_LIST_ARGS = { path: 'string', max_entries: 'int' };
 const WS_PATH_ARGS = { path: 'string' };
 const WS_WRITE_ARGS = { path: 'string', content: 'string' };
+const EVIDENCE_ARGS = { model: 'string', id: 'posint', kind: 'string', limit: 'nonnegint', offset: 'nonnegint', tracking_offset: 'nonnegint', attachment_id: 'posint', path: 'string' };
+const EVIDENCE_KINDS = ['chatter', 'tracking', 'attachments', 'download'];
+const CATALOG_ARGS = { model: 'string' };
 
-const EVIDENCE_ARGS = { model: 'string', id: 'int', kind: 'string', limit: 'int', offset: 'int', tracking_offset:'int', attachment_id: 'int', path: 'string' };
-
+function execEvidence(tool, path, spec, getArgs) {
+  return async (_toolCallId, params, _onUpdate, _ctx, signal) => {
+    const bad = strictParams(tool, spec, params);
+    if (bad) return { content: [{ type: 'text', text: redactToken(bad) }], isError: true };
+    const kind = params && params.kind;
+    if (!EVIDENCE_KINDS.includes(kind)) return { content: [{ type: 'text', text: `${tool}: argument "kind" must be one of ${EVIDENCE_KINDS.join(', ')}` }], isError: true };
+    return postJSON(path, getArgs(params || {}), signal);
+  };
+}
 function buildTools() {
   return [
     {
       name: 'odoo.evidence', label: 'Odoo linked evidence',
-      description: 'Read chatter/tracking/attachments for a visible approved parent. Download linked binary attachments up to 2 MiB into the workspace. Tracking: offset pages messages; tracking_offset pages changes within those messages; response carries paging hints.',
-      parameters: { type: 'object', properties: { model: str('Approved parent model'), id: {type:'integer'}, kind: str('chatter, tracking, attachments or download'), limit:{type:'integer'}, offset:{type:'integer'}, tracking_offset:{type:'integer'}, attachment_id:{type:'integer'}, path:str('Download destination relative to workspace') }, required:['model','id','kind'] },
-      execute: exec('odoo.evidence', '/rpc/evidence', EVIDENCE_ARGS, (p) => ({ model:p.model, id:p.id, kind:p.kind, limit:p.limit, offset:p.offset, tracking_offset:p.tracking_offset, attachment_id:p.attachment_id, path:p.path })),
+      description: 'Read chatter/tracking/attachments for a visible approved parent (id: positive parent ID). limit: page size, default 50, policy-capped (over-max denies); offset: message page; tracking_offset: change page within those messages; download requires attachment_id (positive attachment ID) + path and caps binary content at 2 MiB. Content block 0 is the result JSON; block 1 carries {count, paging/completeness} metadata.',
+      parameters: { type: 'object', properties: { model: str('Approved parent model'), id: {type:'integer', minimum: 1, description:'Positive parent record ID'}, kind: { type: 'string', enum: EVIDENCE_KINDS, description: 'chatter, tracking, attachments or download' }, limit:{type:'integer', minimum: 0, description:'Page size; default 50; must sit within sealed policy MaxLimit (over-max denies)'}, offset:{type:'integer', minimum: 0, description:'Message page offset; within sealed MaxOffset'}, tracking_offset:{type:'integer', minimum: 0, description:'Change page within the message page; within sealed MaxOffset'}, attachment_id:{type:'integer', minimum: 1, description:'Positive attachment ID (download only)'}, path:str('Download destination relative to workspace') }, required:['model','id','kind'] },
+      execute: execEvidence('odoo.evidence', '/rpc/evidence', EVIDENCE_ARGS, (p) => ({ model:p.model, id:p.id, kind:p.kind, limit:p.limit, offset:p.offset, tracking_offset:p.tracking_offset, attachment_id:p.attachment_id, path:p.path })),
     },
     {
       name: 'odoo.search',
       label: 'Odoo search',
-      description: 'Scoped search_read over an allowlisted Odoo model.',
+      description: 'Scoped search_read over an allowlisted Odoo model. Flat AND domain: positive-ID anchor (= single ID or in <=100 IDs), exact non-empty name/code/default_code/origin/client_order_ref/partner_ref (<=128 chars), or lower+upper bounds on the same date field spanning <=31 days; stock.rule also accepts route_id. team_id-only ticket queries stay denied — add an accepted anchor or a <=31-day window. Denials name the accepted shapes — retry the focused shape, never broaden permissions.',
       parameters: {
         type: 'object',
         properties: {
@@ -451,7 +486,7 @@ function buildTools() {
     {
       name: 'odoo.count',
       label: 'Odoo count',
-      description: 'Scoped record count.',
+      description: 'Scoped record count. Same accepted flat-AND domain shapes as odoo.search; team_id-only historical counts stay bounded (use explicit IDs or a <=31-day window).',
       parameters: {
         type: 'object',
         properties: {
@@ -467,7 +502,7 @@ function buildTools() {
     {
       name: 'odoo.aggregate',
       label: 'Odoo aggregate',
-      description: 'Scoped read_group aggregation.',
+      description: 'Scoped read_group aggregation. Same accepted flat-AND domain shapes as odoo.search.',
       parameters: {
         type: 'object',
         properties: {
@@ -515,12 +550,13 @@ function buildTools() {
     {
       name: 'odoo.catalog',
       label: 'Odoo catalog',
-      description: 'Per-model catalog with MethodManifest and provenance (read-only pass-through, no record data).',
-      parameters: { type: 'object', properties: {} },
+      description: 'Per-model catalog with MethodManifest and provenance (read-only pass-through, no record data). Optional model returns only that model; empty returns the full catalog.',
+      parameters: { type: 'object', properties: { model: str('Optional exact model name.') } },
       execute: async (_id, p, _u, _c, signal) => {
-        const bad = strictParams('odoo.catalog', {}, p);
+        const bad = strictParams('odoo.catalog', CATALOG_ARGS, p);
         if (bad) return err(bad);
-        return getJSON('/rpc/catalog', signal);
+        const q = p && p.model ? '?model=' + encodeURIComponent(p.model) : '';
+        return getJSON('/rpc/catalog' + q, signal);
       },
     },
     {

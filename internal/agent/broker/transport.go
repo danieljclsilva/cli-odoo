@@ -729,7 +729,15 @@ func (b *Broker) gateMeta(w http.ResponseWriter, r *http.Request) bool {
 func (b *Broker) gate(w http.ResponseWriter, r *http.Request, req policy.Request) (policy.ModelRule, bool) {
 	dec := b.gateAuth(req)
 	if !dec.Allow {
-		b.writeError(w, r, http.StatusForbidden, "denied: "+dec.Reason)
+		// Surface the safe model-specific accepted-shape hint on domain
+		// denials (no user domain values echoed — BoundedHint names
+		// fields only) so callers can retry the focused shape instead of
+		// guessing. All other denials keep the bare reason.
+		msg := "denied: " + dec.Reason
+		if dec.Reason == policy.ReasonDomainDenied {
+			msg += "; " + policy.BoundedHint(req.Model)
+		}
+		b.writeError(w, r, http.StatusForbidden, msg)
 		return policy.ModelRule{}, false
 	}
 	name, _ := policy.NormalizeName(req.Model)
@@ -1134,6 +1142,7 @@ func (b *Broker) handleMeta(w http.ResponseWriter, r *http.Request) {
 		b.writeEnvelope(w, r, tok, map[string]any{
 			"model": model, "fields": rule.Fields,
 			"max_limit": rule.MaxLimit, "allow_aggregate": rule.AllowAggregate,
+			"bounded_domain_hint": policy.BoundedHint(model),
 		}, len(rule.Fields))
 		return
 	}
@@ -1160,12 +1169,17 @@ func (b *Broker) handleMeta(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	b.record(tok, 0)
+	guidance := "For scoped models use flat AND conditions: positive ID/reference IDs (up to 100), exact name/code/default_code/origin/client_order_ref/partner_ref, or lower and upper bounds on the same date field spanning at most 31 days. Maximum 64 projected fields and 3 group-by fields. Follow RPC pacing and back off on 429."
+	perModel := map[string]any{}
+	for name := range b.pol.Models {
+		perModel[name] = policy.BoundedHint(name)
+	}
 	b.writeEnvelope(w, r, tok, map[string]any{
 		"instance": b.pol.Instance, "operations": ops, "models": models,
 		"default_company": b.pol.Scope.Default, "workspace": b.pol.AllowWorkspace,
 		"budgets": b.pol.Budgets, "require_bounded_queries": b.pol.RequireBoundedQueries,
 		"include_archived": b.pol.IncludeArchived, "allow_linked_evidence": b.pol.AllowLinkedEvidence,
-		"bounded_domain_guidance": "For scoped models use flat AND conditions: positive ID/reference IDs (up to 100), exact name/code/default_code/origin/client_order_ref/partner_ref, or lower and upper bounds on the same date field spanning at most 31 days. Maximum 64 projected fields and 3 group-by fields. Follow RPC pacing and back off on 429.",
+		"bounded_domain_guidance": guidance, "bounded_domain_hints": perModel,
 	}, len(models))
 }
 
@@ -1416,6 +1430,11 @@ func toSlice(v any) ([]any, bool) {
 // Any output that cannot fit the envelope denies instead of sending partial
 // data; the admitted reservation stays billed on every post-RPC denial.
 func (b *Broker) writeRows(w http.ResponseWriter, r *http.Request, tok string, res any, reserved int) {
+	// Central success-payload redaction: recognized bearer/password/
+	// API-secret URL parameter values become RedactionMarker before the
+	// envelope marshals. Business IDs, types, and structure survive;
+	// binary policy is documented on SanitizePayload (text only).
+	res = SanitizePayload(res)
 	rows, ok := toSlice(res)
 	if !ok {
 		b.writeError(w, r, http.StatusBadGateway, "unexpected result shape")
@@ -1468,6 +1487,15 @@ func (b *Broker) writeError(w http.ResponseWriter, r *http.Request, code int, ms
 	b.writeEnvelopeRaw(w, code, map[string]any{"success": false, "error": msg})
 }
 
+// writeErrorMeta is writeError with a structured metadata object (e.g.
+// evidence error_meta: phase/model/request_id/category/retryable/status).
+// The meta map carries fixed safe keys only — never upstream text, values,
+// or tokens — and is capped by the same envelope budget.
+func (b *Broker) writeErrorMeta(w http.ResponseWriter, r *http.Request, code int, msg string, meta map[string]any) {
+	_ = r
+	b.writeEnvelopeRaw(w, code, map[string]any{"success": false, "error": msg, "error_meta": meta})
+}
+
 // writeEnvelopeRaw marshals one success response and enforces the single
 // total serialized envelope cap (Budgets.MaxResponseBytes) for every
 // endpoint, including meta/companies/catalog/workspace/count. Over-cap
@@ -1503,6 +1531,15 @@ func (b *Broker) writeEnvelopeRaw(w http.ResponseWriter, code int, body map[stri
 		if errMsg == "" {
 			errMsg = "request denied"
 		}
+		// Preserve the safe error_meta object when the full envelope
+		// already fits the cap (the common case): re-marshaling without
+		// it would silently drop structured classification the adapters
+		// forward. Fail closed to the meta-less denial when meta pushes
+		// the envelope over cap.
+		if meta, ok := body["error_meta"].(map[string]any); ok && meta != nil {
+			b.writeCappedErrorMeta(w, code, errMsg, meta, maxBytes)
+			return
+		}
 		b.writeCappedError(w, code, errMsg, maxBytes)
 		return
 	}
@@ -1528,6 +1565,22 @@ func (b *Broker) writeCappedError(w http.ResponseWriter, code int, msg string, m
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
 		_, _ = w.Write(short)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_, _ = w.Write(n)
+}
+
+// writeCappedErrorMeta writes one error envelope carrying the safe
+// error_meta object (fixed keys only: phase/model/request_id/category/
+// retryable/status) when it fits maxBytes, else falls back to the
+// meta-less denial. Status, cap, and minimum-denial behavior match
+// writeCappedError exactly.
+func (b *Broker) writeCappedErrorMeta(w http.ResponseWriter, code int, msg string, meta map[string]any, maxBytes int) {
+	n, err := json.Marshal(map[string]any{"success": false, "error": msg, "error_meta": meta})
+	if err != nil || (maxBytes > 0 && len(n) > maxBytes) {
+		b.writeCappedError(w, code, msg, maxBytes)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

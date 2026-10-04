@@ -335,3 +335,87 @@ unit tests (`internal/agent/...`). Genuine Odoo company/search/aggregate
 semantics were **not** verified against a live server in this change (no
 disposable server was available); live ORM/addon/ACL behavior remains
 unverified — see the handoff.
+<!-- VAS-GUIDANCE-APPEND-START 2026-10-04: guidance/evidence only; changes no transport/auth/loopback/redirects/budgets/allowlist/scoping/confinement behavior -->
+
+## VAS workflow checklist (ticket → product → variants → BoM → routes)
+
+Follow in order. Prefer readable-first fields; escalate to a human rather than guessing when blocked.
+
+1. **Ticket intake.** Capture ticket identifiers and requested change in the operator's own words. Do not infer product identity from description alone.
+2. **Product + base fields.** Resolve the stored product record first, then read base fields: `parent_code`, `base_attrib`, `attribute_set_id`, `configuration`. These are stored-record facts; do not substitute inferred conventions.
+3. **Attribute / variant relations.** Consult `product.template.attribute.value` and template attribute lines before declaring anything unavailable. Read the relation rows; then read variant records. Never declare unavailable without this focused meta/catalog consult.
+4. **BoM applicability.** Check BoM applicability against the stored product/variant identity from steps 2–3. Record which BoM was evaluated and why it applies or does not.
+5. **Route rules with readable-first fields.** Evaluate `stock.rule` / route-rule rows using readable-first fields before joining internals. If a route lookup is policy-denied, report `denied` (broker policy), never an Odoo failure.
+6. **Human escalation.** Escalate when: identity is ambiguous, a required read is denied or fails with unclear recovery, BoM/route evidence conflicts, or any step would require guessing, a custom model, or a new method. State what was read, what was denied/failed/not-investigated, and what grant or clarification is needed.
+
+## Focused meta/catalog consult (precise statuses)
+
+- Use exactly these statuses: `enabled` (exposure/policy check passed) /
+  `not-enabled` (absent from sealed exposure — change requires a new human
+  `agent setup`, never a session grant) / `denied` (attempt refused by
+  broker policy) / `failed` (attempt returned an error) /
+  `not-investigated` (never attempted). `denied` and `failed` alone never
+  establish underlying model absence — a transient failure or a policy
+  denial is not server absence. Never report `not-investigated` as
+  unavailable.
+- Before any availability claim, consult STORED readable field metadata
+  first (focused meta/catalog for that exact object, then — only if
+  enabled — a narrow read). Do not assume custom fields, relations, or
+  addon behavior from naming guesses; inferred conventions stay labeled
+  inference (see below).
+- Record the evidence kind per claim: `enabled` / `not-enabled` / `denied` /
+  `failed` / `not-investigated` (see docs/audits/vas-correction-note-2026-10-04.md).
+
+## Metadata never authorizes
+
+- Metadata (exposure lists, catalog entries, field lists) never authorizes methods or custom models. An `enabled` meta fact permits attempting only what policy already allows; it grants nothing.
+- A method or custom model/addon not in policy is out of scope even if similarly named metadata exists. Escalate to a human; do not improvise a call path.
+
+## Stored-record vs inferred-convention vs custom-addon separation
+
+- **Stored-record:** values read from an authorized record/relation. Cite the model + read that returned them.
+- **Inferred-convention:** naming/structural patterns guessed from prior reads (e.g., code prefixes, attribute naming habits). Label as inference; never present as stored fact.
+- **Custom-addon:** any custom model/method/addon-specific relation. Out of scope unless policy explicitly exposes it. Never bridge the gap with an inferred convention.
+- Mixing these categories is a defect. When in doubt, label the weaker category.
+
+## Paging and completeness
+
+- **Narrow-projection-first:** list with a narrow projection (ids + readable-first fields), then detail-read only the rows needed. Never bulk-expand full records to prove completeness.
+- **Tracking paging cursors:** the `tracking` evidence result carries `may_have_more_messages` / `may_have_more_tracking` plus `message_offset` / `tracking_offset` / `limit` / `source_message_ids`; both adapters forward them in a second metadata block. Follow them to exhaustion before claiming completeness.
+- **Chatter/attachments:** returned as bounded row lists with `count`; they carry NO `may_have_more_*` flags — absence of a flag is not a completeness proof.
+- Never certify completeness without evidence: state counts read, cursor state, and what remains unexamined.
+
+## Reproducible evidence bundle recipe (optional, existing workspace tools only)
+
+Reuse only existing workspace tools. No new tooling, no live RPC beyond authorized reads, no network.
+
+1. Save the redacted model-facing outputs (recognized credential URL-query values replaced with `[REDACTED:credential]`; see scope below). Raw files, downloaded binaries, and workspace reads are NOT redacted — treat them as unexamined.
+2. Record for each command: exact args, wall-clock timestamps (start/end), policy/snapshot identity (policy file + snapshot id as reported by the tool), returned counts, tracking paging state (`may_have_more_messages`/`may_have_more_tracking` where the transport provides them), and errors (verbatim redacted error + evidence kind).
+3. Include `sha256` digests for every saved output file where the tool returns one; otherwise compute none (do not introduce new hashing steps into the pipeline — record digests only where returned).
+4. Bundle: redacted outputs + args + timestamps + policy/snapshot identity + counts/paging/errors + returned sha256 values. Re-running the same commands later may observe DIFFERENT live data (records change between reads); reproducibility means the same redaction rules and the same recorded request/response pairs, never a promise of identical future outputs.
+
+## Redaction scope (recognized query secrets only)
+
+The broker redacts recognized credential URL-query values (`access_token`, `auth_token`, `token`, `api_key`/`apikey`, `password`/`passwd`, `secret`, `client_secret`), replacing the VALUE with `[REDACTED:credential]`. Tested forms: raw names/separators; single-pass `%XX`-encoded names, separators, and delimiters-before-names; numeric (`&#NNN;`/`&#xHH;`, full Unicode scalars incl. astral, overlong/out-of-range fail closed inside the value) and small-named (`amp lt gt quot apos sol`) entities in names, separators, delimiters, and values; decoded quote/markup entities inside `href`/`src`/`action`/`longdesc`/`cite`/`data`/`poster` attribute values stay inside the value (outer markup + true `&amp;`-family next parameters survive regardless of ordinary-name length/encoding (1000+ ASCII chars, raw Unicode, mixed `%XX`/`\uXXXX`/numeric-entity name characters); only a real name/value separator (`=`, `%3D`, `\u003D`, `&#61;`-family) after the ordinary name ends the value), while the same quote/markup entities in body text likewise stay inside the value (removed with it) — only actual query-separator entities (`&amp;`-family) before a true next parameter end the value; unquoted attribute values record no span (credential inside redacts as body text, raw `>` ends the value so markup survives); `=`-at-EOF is a no-op (byte-preserved, no panic); JSON `\uXXXX` separators; whole-string JSON with targeted literal edits (duplicates/order/whitespace preserved; changed literal re-encoded). It does NOT strip general PII (names, emails, free text), does NOT inspect binary attachment bytes or downloaded files, and does NOT redact workspace file reads — those stay raw and unexamined. Unsupported: named `=` separators (e.g. `&equals;`), double-encoding beyond one pass, >1 MiB / depth>3 nesting, binary secret-freedom.
+
+## Explicitly unsupported guarantees
+
+The broker does NOT guarantee any of the following, even when reads succeed:
+
+1. No cross-read atomicity: successive reads may observe different states; never present multi-read joins as a single snapshot.
+2. Attachment unexamined unless downloaded + read: a listing or presence flag never certifies attachment content; only a download + read examines it.
+3. Pricelist rows are not effective pricing: rows are stored facts; effective price depends on rules/dates/currency outside any single row read.
+4. Text sanitizer cannot prove binary secret-free: redaction applies to text outputs; it proves nothing about binary payloads.
+
+## Readiness and renewal
+
+| Symptom | Likely cause | Recovery (human owns grants) |
+| Model/method absent from exposure | missing-exposure: sealed policy never allowed it | Human runs a NEW `agent setup` to change sealed exposure, or re-scope the task; worker never self-grants. |
+| Broker unreachable / transport error | unreachable-broker: connectivity or broker down | Human checks broker status/endpoint; retry only after status is healthy. |
+| Auth/token rejected, session stale | expired-session: TTL elapsed or revoked | Human mints a fresh session via `agent grant` (issues a session token only — it never changes sealed model exposure); worker reports `status`, never mints credentials. |
+
+- **Recovery verbs:** human `grant` (session token), `status` (broker/session health), `revoke` (compromised/stale credentials), `setup` (change sealed policy exposure). Workers request; humans execute.
+- **TTL bounds:** sessions expire; never assume a session outlives its stated TTL. On expiry, stop and report `expired-session`; do not retry with stale credentials.
+- **No auto model grant:** no read, meta consult, or denial ever auto-grants a model, method, or custom addon. Every grant is an explicit human act.
+
+<!-- VAS-GUIDANCE-APPEND-END -->

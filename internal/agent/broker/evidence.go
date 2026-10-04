@@ -2,7 +2,10 @@ package broker
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -23,6 +26,19 @@ type evidenceBody struct {
 	AttachmentID   int    `json:"attachment_id"`
 	Path           string `json:"path"`
 }
+
+// Evidence phases for classified linked-evidence errors. Each upstream
+// dispatch maps to exactly one phase so a tracking failure names the
+// stage that failed (parent vs messages vs tracking-values) instead of
+// collapsing to one generic message.
+const (
+	evidencePhaseParent         = "parent"
+	evidencePhaseMessages       = "messages"
+	evidencePhaseTrackingValues = "tracking-values"
+	evidencePhaseAttachmentMeta = "attachment-meta"
+	evidencePhaseAttachmentBody = "attachment-content"
+	evidencePhaseWorkspaceWrite = "workspace-write"
+)
 
 // Compound reads respect the same global RPC cadence as standalone reads.
 // This wait is bounded by request cancellation and the existing RPC timeout.
@@ -67,6 +83,10 @@ func (b *Broker) handleEvidence(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), b.rpcTimeoutOf())
 	defer cancel()
 	r = r.WithContext(ctx)
+	// reqID scopes one linked-evidence call for classified errors: a short
+	// random hex, never a credential, echoed in safe error text so the
+	// human can correlate the failed phase without seeing upstream detail.
+	reqID := evidenceReqID()
 	var in evidenceBody
 	if !b.decodeBody(w, r, &in) {
 		b.release(tok)
@@ -145,7 +165,7 @@ func (b *Broker) handleEvidence(w http.ResponseWriter, r *http.Request) {
 	kwargs["limit"] = 1
 	parent, err := b.dispatchExec(r, in.Model, "search_read", nil, kwargs)
 	if err != nil {
-		b.evidenceError(w, r, err)
+		b.evidenceError(w, r, evidencePhaseParent, in.Model, reqID, err)
 		if errors.Is(err, ErrSessionBudget) || errors.Is(err, errBrokerNotServing) {
 			b.releaseReserve(tok, reserved)
 		}
@@ -187,7 +207,7 @@ func (b *Broker) handleEvidence(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err := b.evidenceExec(r, tok, "mail.message", []string{"id"}, evidenceDomain, limit, in.Offset)
 		if err != nil {
-			b.evidenceError(w, r, err)
+			b.evidenceError(w, r, evidencePhaseMessages, "mail.message", reqID, err)
 			return
 		}
 		rows, ok := result.([]any)
@@ -223,7 +243,14 @@ func (b *Broker) handleEvidence(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := b.evidenceExec(r, tok, source, fields, evidenceDomain, limit, in.Offset)
 	if err != nil {
-		b.evidenceError(w, r, err)
+		phase := evidencePhaseAttachmentMeta
+		if in.Kind == "tracking" {
+			phase = evidencePhaseTrackingValues
+		}
+		if in.Kind == "chatter" {
+			phase = evidencePhaseMessages
+		}
+		b.evidenceError(w, r, phase, source, reqID, err)
 		return
 	}
 	rows, ok := result.([]any)
@@ -252,7 +279,7 @@ func (b *Broker) handleEvidence(w http.ResponseWriter, r *http.Request) {
 		}
 		content, err := b.evidenceExec(r, tok, source, []string{"id", "datas"}, evidenceDomain, 1, 0)
 		if err != nil {
-			b.evidenceError(w, r, err)
+			b.evidenceError(w, r, evidencePhaseAttachmentBody, source, reqID, err)
 			return
 		}
 		contentRows, ok := content.([]any)
@@ -279,15 +306,23 @@ func (b *Broker) handleEvidence(w http.ResponseWriter, r *http.Request) {
 		ws := b.ws
 		b.mu.Unlock()
 		if ws == nil {
-			b.writeError(w, r, http.StatusServiceUnavailable, "workspace unavailable")
+			b.evidenceError(w, r, evidencePhaseWorkspaceWrite, source, reqID, errWorkspaceUnavailable)
 			return
 		}
 		if err := ws.Write(in.Path, data); err != nil {
-			b.writeError(w, r, http.StatusBadRequest, "attachment destination refused")
+			b.evidenceError(w, r, evidencePhaseWorkspaceWrite, source, reqID, err)
 			return
 		}
 		b.settleRows(tok, reserved, 3)
-		b.writeEnvelope(w, r, tok, map[string]any{"path": in.Path, "bytes": len(data), "name": meta["name"], "mimetype": meta["mimetype"]}, 1)
+		sum := sha256.Sum256(data)
+		// The hash identifies the bytes for reproducible bundles; content
+		// itself is never inspected for secrets (text sanitizer scope).
+		// The whole text descriptor passes the common boundary: mimetype
+		// is stored record text and may carry a smuggled parameter, so it
+		// is sanitized like name. Binary bytes/hash/path semantics stay
+		// exact (never redacted, never rewritten).
+		clean := SanitizePayload(map[string]any{"name": meta["name"], "mimetype": meta["mimetype"]}).(map[string]any)
+		b.writeEnvelope(w, r, tok, map[string]any{"path": in.Path, "bytes": len(data), "sha256": hex.EncodeToString(sum[:]), "name": clean["name"], "mimetype": clean["mimetype"]}, 1)
 		return
 	}
 	if err := b.live(tok); err != nil {
@@ -295,11 +330,36 @@ func (b *Broker) handleEvidence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b.settleRows(tok, reserved, len(rows)+examined)
+	// Central success-payload redaction for linked evidence rows (HTML
+	// descriptions, chatter bodies, attachment metadata): same marker and
+	// scope as search/read via writeRows. Grant tokens never flow here.
+	rows = toSanitizedRows(rows)
 	if in.Kind == "tracking" {
 		b.writeEnvelope(w, r, tok, map[string]any{"rows": rows, "source_message_ids": messageIDs, "message_offset": messageOffset, "tracking_offset": in.TrackingOffset, "limit": limit, "may_have_more_messages": len(messageIDs) == limit, "may_have_more_tracking": len(rows) == limit}, len(rows))
 		return
 	}
 	b.writeEnvelope(w, r, tok, rows, len(rows))
+}
+
+// toSanitizedRows applies SanitizePayload row-wise, preserving the row
+// count and order the paging hints describe.
+func toSanitizedRows(rows []any) []any {
+	out := make([]any, len(rows))
+	for i, row := range rows {
+		out[i] = SanitizePayload(row)
+	}
+	return out
+}
+
+// evidenceReqID mints a short request-scoped correlation ID (8 hex chars
+// from crypto/rand, zero-padded fallback on the impossible read error).
+// It is never a credential and never derived from one.
+func evidenceReqID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "00000000"
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // Odoo's binary-field payload is base64 text; RPC codecs may carry that
@@ -351,22 +411,61 @@ func evidenceInt(v any) (int, bool) {
 	}
 	return 0, false
 }
-func (b *Broker) evidenceError(w http.ResponseWriter, r *http.Request, err error) {
+
+// evidenceError classifies a linked-evidence upstream failure into safe,
+// secret-free model text. Phase names the failed stage (parent, messages,
+// tracking-values, attachment-meta, attachment-content, workspace-write),
+// model the evidence source, and reqID the request correlation ID from
+// handleEvidence. The error envelope carries a structured error_meta
+// object (phase, model, request_id, category, retryable, status) alongside
+// the human-readable message; adapters forward both blocks. Upstream error
+// text is NEVER echoed: credentials and raw RPC faults stay out of model
+// output. Unknown upstream faults stay category "unknown" with
+// retryable:false — never guessed transient, never blanket-retried.
+func (b *Broker) evidenceError(w http.ResponseWriter, r *http.Request, phase, model, reqID string, err error) {
 	status := http.StatusBadGateway
-	message := "linked evidence read failed"
+	category := "unknown"
+	retryable := false
+	message := fmt.Sprintf("linked %s read failed for %s (req %s); retryable:false", phase, model, reqID)
 	if errors.Is(err, ErrSessionBudget) {
 		status = http.StatusTooManyRequests
-		message = "RPC pacing/concurrency budget reached; retry with backoff"
+		category = "pacing"
+		retryable = true
+		message = fmt.Sprintf("RPC pacing/concurrency budget reached during %s for %s (req %s); retry with backoff", phase, model, reqID)
 	}
 	if errors.Is(err, ErrSessionExpired) || errors.Is(err, ErrSessionUnknown) {
 		status = http.StatusUnauthorized
-		message = "session expired or revoked"
+		category = "session"
+		message = fmt.Sprintf("session expired or revoked during %s (req %s); renew via human `odoo agent grant`", phase, reqID)
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		status = http.StatusGatewayTimeout
+		category = "timeout"
+		retryable = true
+		message = fmt.Sprintf("linked %s read timed out for %s (req %s); retryable:true with backoff", phase, model, reqID)
 	}
-	if errors.Is(err, errBrokerNotServing) {
+	if errors.Is(err, errBrokerNotServing) && phase != evidencePhaseWorkspaceWrite {
 		status = http.StatusServiceUnavailable
+		category = "broker"
+		retryable = true
+		message = fmt.Sprintf("broker unavailable during %s (req %s); retryable:true with backoff", phase, reqID)
 	}
-	b.writeError(w, r, status, message)
+	if errors.Is(err, errWorkspaceUnavailable) {
+		status = http.StatusServiceUnavailable
+		category = "workspace"
+		message = fmt.Sprintf("workspace unavailable during %s (req %s); retryable:false", phase, reqID)
+	}
+	// Workspace-write failures (nil workspace, refused destination) are a
+	// local broker/filesystem class, not an upstream evidence fault: keep
+	// the phase correlation ID but report 400/503 instead of the generic
+	// 502 so callers do not retry a refused path as a transient RPC fault.
+	if phase == evidencePhaseWorkspaceWrite && status == http.StatusBadGateway {
+		status = http.StatusBadRequest
+		category = "workspace"
+		message = fmt.Sprintf("attachment destination refused during %s (req %s); retryable:false", phase, reqID)
+	}
+	b.writeErrorMeta(w, r, status, message, map[string]any{
+		"phase": phase, "model": model, "request_id": reqID,
+		"category": category, "retryable": retryable, "status": status,
+	})
 }

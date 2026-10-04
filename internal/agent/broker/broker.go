@@ -176,6 +176,10 @@ func (b *Broker) callExec(ctx context.Context, exec executor, model, method stri
 // errBrokerNotServing reports a missing executor (nil until Serve builds it).
 var errBrokerNotServing = errors.New("broker not serving")
 
+// errWorkspaceUnavailable marks a nil-workspace local failure so the
+// workspace-write error class stays distinct from upstream RPC faults.
+var errWorkspaceUnavailable = errors.New("broker: workspace unavailable")
+
 // dispatchExec is the single admitted-dispatch path for RPC handlers: it
 // takes one in-flight slot (deny 429 when saturated) and frees the slot only
 // when no actual Execute is outstanding. Context-aware executors run via
