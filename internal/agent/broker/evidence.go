@@ -794,6 +794,10 @@ func evidenceInt(v any) (int, bool) {
 //   - an unreachable/broken transport (net errors: refused, reset, DNS,
 //     timeout-kind) is a transport fault: 502/transport, retryable:false
 //     (never guessed transient);
+//   - an Odoo access denial (XML-RPC Fault code 4: the authenticated
+//     user may not read the model at all) is an access fault:
+//     403/access, retryable:false (retrying as the same user denies
+//     identically; escalate scope/grants to a human);
 //   - an undecodable 2xx body (capped JSON decode, XML syntax/unmarshal)
 //     is a malformed response: 502/malformed, retryable:false;
 //   - real RPC faults (server status codes, XML fault envelopes, json2
@@ -845,6 +849,17 @@ func (b *Broker) evidenceError(w http.ResponseWriter, r *http.Request, phase, mo
 		category = "transport"
 		retryable = false
 		message = fmt.Sprintf("linked %s read failed for %s (req %s); transport upstream; retryable:false", phase, model, reqID)
+	} else if evidenceIsAccessErr(err) {
+		// Odoo access denial (XML-RPC Fault(4) / AccessError: the
+		// authenticated user may not read this model at all —
+		// mail.tracking.value is Administration/Settings-only on the
+		// investigated server). Proven by fault CODE via errors.As,
+		// never message text. Not retryable: retrying the same read
+		// as the same user denies identically; escalate to a human
+		// for a scope or grants review.
+		status = http.StatusForbidden
+		category = "access"
+		message = fmt.Sprintf("linked %s read denied for %s (req %s); upstream access denied, retryable:false — escalate scope/grants to a human", phase, model, reqID)
 	} else if evidenceIsMalformedErr(err) {
 		// Undecodable 2xx bodies are distinguishable by error shape
 		// (capped JSON decode / XML syntax-unmarshal at the codec layer,
@@ -918,6 +933,9 @@ func evidenceUpstreamKind(err error) string {
 	if evidenceIsTransportErr(err) {
 		return "transport"
 	}
+	if evidenceIsAccessErr(err) {
+		return "access"
+	}
 	if evidenceIsMalformedErr(err) {
 		return "malformed"
 	}
@@ -961,6 +979,19 @@ func evidenceIsTransportErr(err error) bool {
 	}
 	var tlsErr *tls.CertificateVerificationError
 	if errors.As(err, &tlsErr) {
+		return true
+	}
+	return false
+}
+
+// evidenceIsAccessErr reports Odoo access denials by fault CODE
+// (xmlrpc.FaultError Code 4: AccessError / "not allowed to access"),
+// via errors.As through the sanitized client wrap — never message text.
+// A denied model stays denied for the same user, so callers must not
+// retry as a transient fault.
+func evidenceIsAccessErr(err error) bool {
+	var fault xmlrpc.FaultError
+	if errors.As(err, &fault) && fault.Code == 4 {
 		return true
 	}
 	return false

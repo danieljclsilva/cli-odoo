@@ -274,8 +274,25 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 	if !ok {
 		return deny(ReasonUnknownModel)
 	}
-	if rule.LinkedEvidence {
+	// Linked-evidence models expose records only through the parent-linked
+	// evidence path — except OpMeta, which discloses sealed field metadata
+	// only (no record data, no Execute), so investigators can discover
+	// what a tracking/chatter read would project before attempting it.
+	if rule.LinkedEvidence && r.Operation != OpMeta {
 		return deny(ReasonCompanyDenied)
+	}
+	if rule.LinkedEvidence && r.Operation == OpMeta {
+		// Focused metadata for an evidence model: sealed fields only,
+		// no records, no company scope to enforce. Zero paging and no
+		// caller company selection still required (checked with the
+		// OpCount/OpMeta limits below); anything else denies.
+		if r.Limit != 0 || r.Offset != 0 {
+			return deny(ReasonLimitDenied)
+		}
+		if len(r.CompanyIDs) != 0 {
+			return deny(ReasonCompanySelectDenied)
+		}
+		return Decision{Allow: true, Reason: ReasonAllow}
 	}
 	if p.RequireBoundedQueries && r.Operation != OpMeta && !rule.CompanyIndependent && !BoundedDomainFor(model, r.Domain) {
 		return deny(ReasonDomainDenied)

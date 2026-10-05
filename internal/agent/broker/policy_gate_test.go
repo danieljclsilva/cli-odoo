@@ -3,6 +3,7 @@ package broker
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/danieljclsilva/cli-odoo/internal/agent/policy"
+	"github.com/kolo/xmlrpc"
 	"github.com/danieljclsilva/cli-odoo/internal/agent/workspace"
 	"github.com/danieljclsilva/cli-odoo/internal/config"
 )
@@ -292,6 +294,75 @@ func (f *seqExec) Execute(model, method string, args []any, kwargs map[string]an
 	}
 	if f.failAfter > 0 && f.calls > f.failAfter {
 		return nil, f.failErr
+	}
+	out := make([]any, len(f.rows))
+	copy(out, f.rows)
+	return out, nil
+}
+
+func TestEvidenceAccessDeniedClassifies403(t *testing.T) {
+	// Live ticket-1932 finding: the restricted Odoo user gets Fault(4)
+	// on mail.tracking.value (Administration/Settings-only), which must
+	// classify access/403/retryable:false — never unknown, never retried.
+	// Proven by fault CODE via errors.As through a sanitized-style wrap.
+	p := testPolicy()
+	p.Budgets.MaxRowsPerCall = 1000
+	p.AllowLinkedEvidence = true
+	p.Models["mail.message"] = policy.ModelRule{Fields: []string{"id", "body"}, LinkedEvidence: true}
+	p.Models["mail.tracking.value"] = policy.ModelRule{Fields: []string{"id"}, LinkedEvidence: true}
+	denied := fmt.Errorf("odoo: mail.tracking.value.search_count: %w", xmlrpc.FaultError{Code: 4, String: "You are not allowed to access 'Mail Tracking Value' (mail.tracking.value) records."})
+	dexec := &denyAfterExec{n: 3, err: denied, rows: []any{map[string]any{"id": 1932}}, msgRows: []any{map[string]any{"id": 41}}}
+	b, err := NewForTest(p, &config.Instance{Name: "test"}, testSnapshot(), nil, dexec)
+	if err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	tok, err := b.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	rec := post(t, b, "/rpc/evidence", tok, `{"model":"res.partner","id":1932,"kind":"tracking","limit":2,"offset":0}`)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("want 403, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var env struct {
+		Success   bool           `json:"success"`
+		Error     string         `json:"error"`
+		ErrorMeta map[string]any `json:"error_meta"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("envelope decode: %v", err)
+	}
+	if env.ErrorMeta["phase"] != "tracking-values" || env.ErrorMeta["category"] != "access" || env.ErrorMeta["retryable"] != false {
+		t.Fatalf("want tracking-values/access/retryable:false: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "not allowed to access") {
+		t.Fatalf("upstream fault text leaked: %s", rec.Body.String())
+	}
+}
+
+// denyAfterExec serves canned rows for the first n dispatches, then the
+// canned error: a dispatch-shape stub for fault classification, never an
+// Odoo behavior proof.
+type denyAfterExec struct {
+	n       int
+	err     error
+	calls   int
+	rows    []any
+	msgRows []any
+}
+
+func (f *denyAfterExec) Execute(model, method string, args []any, kwargs map[string]any) (any, error) {
+	f.calls++
+	if method == "search_count" {
+		return 4, nil
+	}
+	if f.calls > f.n+1 {
+		return nil, f.err
+	}
+	if model == "mail.message" {
+		out := make([]any, len(f.msgRows))
+		copy(out, f.msgRows)
+		return out, nil
 	}
 	out := make([]any, len(f.rows))
 	copy(out, f.rows)

@@ -110,6 +110,27 @@ func TestZeroPolicyDenies(t *testing.T) {
 	}
 }
 
+func TestEvidenceModelMetaAllowedRecordsDenied(t *testing.T) {
+	// Focused meta on a linked-evidence model discloses sealed fields
+	// only (no records, no Execute): allowed. Record reads stay denied
+	// outside the parent-linked evidence path; paged meta denies.
+	p := validPolicy()
+	p.AllowLinkedEvidence = true
+	p.Models["mail.tracking.value"] = ModelRule{Fields: []string{"id"}, LinkedEvidence: true}
+	if d := p.Authorize(nil, Request{Operation: OpMeta, Model: "mail.tracking.value"}); !d.Allow {
+		t.Fatalf("evidence meta denied: %+v", d)
+	}
+	for _, op := range []Operation{OpSearch, OpRead, OpCount, OpAggregate} {
+		r := Request{Operation: op, Model: "mail.tracking.value", Fields: []string{"id"}}
+		if d := p.Authorize(nil, r); d.Allow {
+			t.Fatalf("%s on evidence model allowed", op)
+		}
+	}
+	if d := p.Authorize(nil, Request{Operation: OpMeta, Model: "mail.tracking.value", Limit: 5}); d.Allow {
+		t.Fatalf("paged evidence meta allowed: %+v", d)
+	}
+}
+
 func TestUnknownOpAndModel(t *testing.T) {
 	schema := testSchemaView()
 	p := validPolicy()
