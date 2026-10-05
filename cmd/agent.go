@@ -185,6 +185,10 @@ func newAgentServeCmd() *cobra.Command {
 			if err != nil {
 				output.Fail(tool, err)
 			}
+			// Wire the stamped binary revision into the broker's full
+			// meta listing. Broker cannot import cmd (cycle), so the
+			// serve path pushes Version in; unstamped builds stay "dev".
+			b.SetRevision(Version)
 			if socketPath != "" {
 				b.SetAdminSocket(socketPath)
 			}

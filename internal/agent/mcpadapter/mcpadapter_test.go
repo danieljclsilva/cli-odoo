@@ -1081,11 +1081,16 @@ func TestReadinessTextsDistinguishCauses(t *testing.T) {
 
 func TestSuccessCarriesCountMetadataBlock(t *testing.T) {
 	// One coherent output contract: block 0 is the result JSON (unchanged
-	// shape); block 1 carries {count + tracking paging} parsed from the
-	// envelope. Pure marshalMeta contract (no listener: sandbox denies
-	// loopback binds); the listener round-trip variant stays director-only
-	// outside the sandbox — see gates.log.
-	if got := marshalMeta(envelopeMeta{Count: 3, Paged: map[string]any{"may_have_more_tracking": true}}); !strings.Contains(got, `"count":3`) || !strings.Contains(got, "may_have_more_tracking") {
+	// shape); block 1 carries {count + evidence paging, both tracking
+	// dimensions} parsed from the envelope. Pure marshalMeta contract
+	// (no listener: sandbox denies loopback binds); the listener
+	// round-trip variant stays director-only outside the sandbox — see
+	// gates.log. A values-exhausted batch (next_offset -1) still
+	// carries next_message_offset so later batches advance.
+	if got := marshalMeta(envelopeMeta{Count: 0, Paged: map[string]any{"has_more": false, "next_offset": -1, "may_have_more_messages": true, "next_message_offset": 3, "may_have_more_tracking": false}}); !strings.Contains(got, `"count":0`) || !strings.Contains(got, "next_message_offset") || !strings.Contains(got, "may_have_more_messages") {
+		t.Fatalf("metadata block missing two-dimension paging: %q", got)
+	}
+	if got := marshalMeta(envelopeMeta{Count: 3, Paged: map[string]any{"has_more": true, "next_offset": 3, "may_have_more_tracking": true}}); !strings.Contains(got, `"count":3`) || !strings.Contains(got, "has_more") || !strings.Contains(got, "next_offset") || !strings.Contains(got, "may_have_more_tracking") {
 		t.Fatalf("metadata block missing count/paging: %q", got)
 	}
 	if got := marshalMeta(envelopeMeta{}); got != `{"count":0}` {

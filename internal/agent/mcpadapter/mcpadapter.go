@@ -248,7 +248,7 @@ func Tools() []Tool {
 	// clamps); offsets within sealed MaxOffset; download additionally
 	// requires attachment_id>0 and a destination path, with binary content
 	// capped at 2 MiB server-side.
-	evidenceDesc := "Read chatter, tracked changes or attachments linked to a visible approved parent (id: positive parent ID). limit: page size, default 50, policy-capped (over-max denies); offset: message page; tracking_offset: change page within those messages; download requires attachment_id (positive attachment ID) + path and caps binary content at 2 MiB. Content block 0 is the result JSON; block 1 carries {count, paging/completeness} metadata."
+	evidenceDesc := "Read chatter, tracked changes or attachments linked to a visible approved parent (id: positive parent ID). limit: page size, default 50, policy-capped (over-max denies); offset: message page; tracking_offset: change page within those messages; download requires attachment_id (positive attachment ID) + path and caps binary content at 2 MiB. chatter/attachments return {rows, limit, offset, has_more, next_offset}; tracking returns the same plus {message_offset, tracking_offset, source_message_ids, may_have_more_messages, next_message_offset}. count is len(rows) this page — a page size, never a cursor or total. Two paging dimensions for tracking, each with its own stop rule. Chatter stop rule: stop when cumulative distinct row ids >= visible_total. Tracking stop rule: within one message batch, exhaust values via next_offset (tracking_offset advances); across batches, advance offset to next_message_offset (resetting tracking_offset to 0) and accumulate source_message_ids across batches until their cumulative distinct count >= message_visible_total (visible_total is absent on tracking responses — never use it as the tracking stop rule). A batch with no values still advances via next_message_offset. Message windows walk forward in source order (post-limit access filtering strips rows after limit/offset with no refill): resume cursors use requested-based source accounting (no duplicates/skips); exhaustion is cardinality only — an empty or short window is inconclusive, never exhaustion (chatter: cumulative distinct row ids >= visible_total; tracking: cumulative distinct source_message_ids >= message_visible_total). Content block 0 is the result JSON; block 1 carries {count, paging/completeness} metadata."
 	domainHint := " Flat AND domain: positive-ID anchor (= single ID or in <=100 IDs), exact non-empty name/code/default_code/origin/client_order_ref/partner_ref (<=128 chars), or lower+upper bounds on the same date field spanning <=31 days; stock.rule also accepts route_id. team_id-only ticket queries stay denied — add an accepted anchor or a <=31-day window. Denials name the accepted shapes — retry the focused shape, never broaden permissions."
 	return []Tool{
 		{Name: "evidence", Description: evidenceDesc, InputSchema: obj(map[string]any{"model": str, "id": map[string]any{"type": "integer", "minimum": 1}, "kind": kind, "limit": map[string]any{"type": "integer", "minimum": 0}, "offset": map[string]any{"type": "integer", "minimum": 0}, "tracking_offset": map[string]any{"type": "integer", "minimum": 0}, "attachment_id": map[string]any{"type": "integer", "minimum": 1}, "path": str}, "model", "id", "kind")},
@@ -688,8 +688,9 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 			return map[string]any{"content": blocks, "isError": true}, nil
 		}
 		// One coherent output contract: block 0 is the result JSON
-		// (unchanged shape); block 1 carries {count + tracking paging
-		// cursors where the envelope supplies them} instead of discarded.
+		// (unchanged shape); block 1 carries {count + evidence paging
+		// cursors where the envelope supplies them, both tracking
+		// dimensions} instead of discarded.
 		return map[string]any{"content": []any{map[string]any{"type": "text", "text": parsed}, map[string]any{"type": "text", "text": marshalMeta(paging)}}}, nil
 	default:
 		return nil, &rpcErr{Code: -32601, Message: fmt.Sprintf("unknown method %q", method)}
@@ -697,11 +698,21 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 }
 
 // envelopeMeta is the parsed broker-envelope metadata carried in content
-// block 1: the envelope count plus tracking paging cursors where the
+// block 1: the envelope count plus evidence paging cursors where the
 // envelope's result object supplies them (same keys as the OMP adapter).
-// On errors, Error carries the broker error_meta object (phase, model,
-// request_id, category, retryable, status) so structured classification
-// survives both adapters.
+// chatter/attachments/tracking share one rows+metadata object shape:
+// rows holds this page (at most limit), count is len(rows) this page —
+// a page size, never a cursor or total. has_more/next_offset describe
+// this window's values (probe row for tracking values/attachments,
+// requested-based source walk for chatter/message batches, with
+// visible_total/complete for the caller-side cardinality stop rule);
+// tracking adds
+// may_have_more_messages/next_message_offset for the message-batch
+// dimension (offset advances those, tracking_offset resets to 0). The
+// legacy may_have_more_* keys stay for existing consumers. On errors, Error carries the
+// broker error_meta object (phase, model, request_id, category,
+// retryable, status) so structured classification survives both
+// adapters.
 type envelopeMeta struct {
 	Count int
 	Paged map[string]any
@@ -1080,7 +1091,7 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 	var robj map[string]any
 	if err := json.Unmarshal(env.Result, &robj); err == nil {
 		paged := map[string]any{}
-		for _, k := range []string{"may_have_more_messages", "may_have_more_tracking", "message_offset", "tracking_offset", "limit", "source_message_ids"} {
+		for _, k := range []string{"has_more", "next_offset", "offset", "may_have_more_messages", "next_message_offset", "message_complete", "message_visible_total", "may_have_more_tracking", "complete", "visible_total", "message_offset", "tracking_offset", "limit", "source_message_ids"} {
 			if v, ok := robj[k]; ok {
 				paged[k] = v
 			}

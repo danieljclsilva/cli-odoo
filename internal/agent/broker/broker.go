@@ -311,6 +311,9 @@ type Broker struct {
 	snap     snapshot.Snapshot
 	paths    ServingPaths
 	sessions map[string]*sess
+	// rev is the running build revision reported by the full meta
+	// listing. Empty means unstamped local build ("dev").
+	rev string
 
 	// inflight bounds concurrent admitted RPC dispatches (ModelMux
 	// half of the budget story). The semaphore capacity derives from
@@ -383,6 +386,30 @@ func (b *Broker) SetAdminSocket(path string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.adminSock = path
+}
+
+// SetRevision records the running broker build revision reported by the
+// full meta listing. The serve path wires the stamped binary version so
+// the broker package never imports the command layer. Empty input keeps
+// the honest dev default.
+func (b *Broker) SetRevision(v string) {
+	if strings.TrimSpace(v) == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.rev = strings.TrimSpace(v)
+}
+
+// revision returns the stamped build revision or the honest dev default
+// when nothing was wired (local builds, in-process tests).
+func (b *Broker) revision() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if strings.TrimSpace(b.rev) == "" {
+		return "dev"
+	}
+	return b.rev
 }
 
 // SetWorkspaceForTest injects an os.Root-confined workspace for in-process

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -299,7 +300,9 @@ func (f *seqExec) Execute(model, method string, args []any, kwargs map[string]an
 
 func TestEvidenceHandlerFailureEnvelope(t *testing.T) {
 	p := testPolicy()
-	p.Budgets.MaxRowsPerCall = 100
+	// Fetched-row scan reservations scale with limit (default 50):
+	// allow the reservation so the test reaches the fault path.
+	p.Budgets.MaxRowsPerCall = 1000
 	p.AllowLinkedEvidence = true
 	p.Models["mail.message"] = policy.ModelRule{Fields: []string{"id", "body"}, LinkedEvidence: true}
 	exec := &seqExec{rows: []any{map[string]any{"id": 1}}, failAfter: 1, failErr: errors.New("upstream FAKE-SECRET-boom")}
@@ -338,6 +341,322 @@ func TestEvidenceHandlerFailureEnvelope(t *testing.T) {
 	if env.ErrorMeta["request_id"] == nil || env.ErrorMeta["request_id"] == "" {
 		t.Fatalf("request_id missing: %s", rec.Body.String())
 	}
+}
+
+func TestEvidenceChatterPagesAreDisjointAndOrdered(t *testing.T) {
+	// Continuation uses requested-based source accounting: page 2 starts
+	// exactly where page 1's requested source range ended, so windows
+	// are disjoint and concatenation is exact and duplicate-free. The
+	// fake serves canned rows per offset (routing stub: proves offset
+	// arithmetic and envelope wiring, never Odoo filtering semantics).
+	// Total 5 with limit 3: page 1 returns 3 rows + resume at 3 with
+	// has_more true and complete false; page 2 returns 2 rows with
+	// has_more false, complete true, next -1.
+	pexec := &pageExec{total: 5, pages: map[int][]any{
+		0: {map[string]any{"id": 1}, map[string]any{"id": 2}, map[string]any{"id": 3}},
+		3: {map[string]any{"id": 4}, map[string]any{"id": 5}},
+	}}
+	p := testPolicy()
+	p.Budgets.MaxRowsPerCall = 100
+	p.AllowLinkedEvidence = true
+	p.Models["mail.message"] = policy.ModelRule{Fields: []string{"id", "body"}, LinkedEvidence: true}
+	b, err := NewForTest(p, &config.Instance{Name: "test"}, testSnapshot(), nil, pexec)
+	if err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	tok, err := b.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	ordered := []int{}
+	off := 0
+	for i := 0; i < 3; i++ {
+		rec := post(t, b, "/rpc/evidence", tok, `{"model":"res.partner","id":1,"kind":"chatter","limit":3,"offset":`+strconv.Itoa(off)+`}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("page at %d: want 200, got %d (%s)", off, rec.Code, rec.Body.String())
+		}
+		var env struct {
+			Success bool           `json:"success"`
+			Count   int            `json:"count"`
+			Result  map[string]any `json:"result"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("envelope decode: %v", err)
+		}
+		for _, r := range env.Result["rows"].([]any) {
+			ordered = append(ordered, int(r.(map[string]any)["id"].(float64)))
+		}
+		hm := env.Result["has_more"].(bool)
+		no := int(env.Result["next_offset"].(float64))
+		if i == 0 {
+			if !hm || no != 3 {
+				t.Fatalf("page 1 must continue at source offset 3: %s", rec.Body.String())
+			}
+			if env.Result["complete"] != false {
+				t.Fatalf("page 1 (3 of 5) must not claim complete: %s", rec.Body.String())
+			}
+			off = no
+			continue
+		}
+		// Page 2 holds 2 of 5: has_more stays true with a forward
+		// resume cursor — the broker cannot see the caller's first
+		// page. The WALK stops via the caller-side cumulative rule
+		// below (3+2 >= visible_total), so offset 9 is never
+		// requested.
+		if !hm || no != 7 {
+			t.Fatalf("page 2 must resume forward at source offset 7: %s", rec.Body.String())
+		}
+		if env.Result["complete"] != false {
+			t.Fatalf("page 2 (2 of 5 this page) must not claim complete: %s", rec.Body.String())
+		}
+		if env.Result["visible_total"].(float64) != 5 {
+			t.Fatalf("visible_total must be 5: %s", rec.Body.String())
+		}
+		// Caller stops here: cumulative 3+2 >= visible_total, so
+		// offset 7 is never requested (the fake would serve it empty
+		// — equally inconclusive, never claimed exhausted).
+		break
+	}
+	// Caller-side termination: cumulative distinct ids >= visible_total
+	// ends the walk without requesting offset 7.
+	want := []int{1, 2, 3, 4, 5}
+	if len(ordered) != len(want) {
+		t.Fatalf("ordered = %v, want %v (exact, no duplicates)", ordered, want)
+	}
+	for i := range want {
+		if ordered[i] != want[i] {
+			t.Fatalf("ordered = %v, want %v (exact, no duplicates)", ordered, want)
+		}
+	}
+}
+
+func TestEvidenceChatterMixedSparseDenseKeepsAllIds(t *testing.T) {
+	// Data-loss regression: every scan page must request only the
+	// remaining capacity. Limit 3 with a sparse first window ([2]) and
+	// a dense second window ([4,5,6]): page 1 collects [2,4,5] and
+	// resumes at source offset 5 — ID 6 stays unconsumed and reachable.
+	// Requesting a full limit again would consume [4,5,6], keep [4,5],
+	// drop 6, and resume at 6 with 6 lost.
+	pexec := &pageExec{total: 4, pages: map[int][]any{
+		0: {map[string]any{"id": 2}},
+		3: {map[string]any{"id": 4}, map[string]any{"id": 5}, map[string]any{"id": 6}},
+		5: {map[string]any{"id": 6}},
+	}}
+	p := testPolicy()
+	p.Budgets.MaxRowsPerCall = 100
+	p.AllowLinkedEvidence = true
+	p.Models["mail.message"] = policy.ModelRule{Fields: []string{"id", "body"}, LinkedEvidence: true}
+	b, err := NewForTest(p, &config.Instance{Name: "test"}, testSnapshot(), nil, pexec)
+	if err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	tok, err := b.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	ordered := []int{}
+	off := 0
+	for i := 0; i < 3; i++ {
+		rec := post(t, b, "/rpc/evidence", tok, `{"model":"res.partner","id":1,"kind":"chatter","limit":3,"offset":`+strconv.Itoa(off)+`}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("page at %d: want 200, got %d (%s)", off, rec.Code, rec.Body.String())
+		}
+		var env struct {
+			Success bool           `json:"success"`
+			Count   int            `json:"count"`
+			Result  map[string]any `json:"result"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("envelope decode: %v", err)
+		}
+		for _, r := range env.Result["rows"].([]any) {
+			ordered = append(ordered, int(r.(map[string]any)["id"].(float64)))
+		}
+		hm := env.Result["has_more"].(bool)
+		no := int(env.Result["next_offset"].(float64))
+		if i == 0 {
+			// [2,4,5] with resume at 5: ID 6 unconsumed.
+			if !hm || no != 5 {
+				t.Fatalf("mixed page 1 must resume at source offset 5: %s", rec.Body.String())
+			}
+			off = no
+			continue
+		}
+		// Page 2 at offset 5 collects [6]; cumulative 3+1 >= 4 ends
+		// the walk (caller-side rule) without further requests.
+		break
+	}
+	want := []int{2, 4, 5, 6}
+	if len(ordered) != len(want) {
+		t.Fatalf("ordered = %v, want %v (ID 6 must survive)", ordered, want)
+	}
+	for i := range want {
+		if ordered[i] != want[i] {
+			t.Fatalf("ordered = %v, want %v (ID 6 must survive)", ordered, want)
+		}
+	}
+}
+
+func TestEvidenceOffsetsRestorePerKind(t *testing.T) {
+	// The shared values/attachments fetch must honor its own dimension:
+	// tracking values page at tracking_offset (not the message offset),
+	// attachments at offset. The fake records offsets per model and
+	// serves one row; assertions are on dispatch kwargs (wiring), with
+	// totals that keep every dimension incomplete so both pages stay
+	// addressable.
+	oexec := &offsetExec{}
+	p := testPolicy()
+	p.Budgets.MaxRowsPerCall = 100
+	p.AllowLinkedEvidence = true
+	p.Models["mail.message"] = policy.ModelRule{Fields: []string{"id"}, LinkedEvidence: true}
+	p.Models["mail.tracking.value"] = policy.ModelRule{Fields: []string{"id"}, LinkedEvidence: true}
+	p.Models["ir.attachment"] = policy.ModelRule{Fields: []string{"id", "name"}, LinkedEvidence: true}
+	b, err := NewForTest(p, &config.Instance{Name: "test"}, testSnapshot(), nil, oexec)
+	if err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	tok, err := b.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	// Tracking: message offset 7, tracking offset 4. Values fetch must
+	// use offset 4; message scan starts at 7.
+	rec := post(t, b, "/rpc/evidence", tok, `{"model":"res.partner","id":1,"kind":"tracking","limit":2,"offset":7,"tracking_offset":4}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tracking: want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if oexec.valuesOffset != 4 {
+		t.Fatalf("tracking values fetched at offset %d, want tracking_offset 4", oexec.valuesOffset)
+	}
+	if oexec.messageFirstOffset != 7 {
+		t.Fatalf("message scan started at offset %d, want message offset 7", oexec.messageFirstOffset)
+	}
+	// Attachments: offset 6 must reach the fetch.
+	oexec2 := &offsetExec{}
+	b2, err := NewForTest(p, &config.Instance{Name: "test"}, testSnapshot(), nil, oexec2)
+	if err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	tok2, err := b2.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	rec = post(t, b2, "/rpc/evidence", tok2, `{"model":"res.partner","id":1,"kind":"attachments","limit":2,"offset":6}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("attachments: want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if oexec2.attachOffset != 6 {
+		t.Fatalf("attachments fetched at offset %d, want 6", oexec2.attachOffset)
+	}
+}
+
+func TestEvidenceScanBillsFetchedRows(t *testing.T) {
+	// Billing counts fetched rows, not dispatches: parent(1) +
+	// count(1) + scan fetched(2+1 across two pages) + projection(3) = 8
+	// (dispatch billing would give 7), while the envelope count stays 3
+	// returned.
+	pexec := &pageExec{total: 3, pages: map[int][]any{
+		0: {map[string]any{"id": 1}, map[string]any{"id": 2}},
+		3: {map[string]any{"id": 3}},
+	}}
+	p := testPolicy()
+	p.Budgets.MaxRowsPerCall = 100
+	p.AllowLinkedEvidence = true
+	p.Models["mail.message"] = policy.ModelRule{Fields: []string{"id", "body"}, LinkedEvidence: true}
+	b, err := NewForTest(p, &config.Instance{Name: "test"}, testSnapshot(), nil, pexec)
+	if err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	tok, err := b.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	rec := post(t, b, "/rpc/evidence", tok, `{"model":"res.partner","id":1,"kind":"chatter","limit":3,"offset":0}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	b.mu.Lock()
+	billed := b.sessions[tok].rows
+	b.mu.Unlock()
+	if billed != 8 {
+		t.Fatalf("billed = %d, want 8 (parent+count+scan fetched+projection)", billed)
+	}
+}
+
+// pageExec serves canned windows per source offset plus a canned visible
+// total: a routing/wiring stub asserting offset arithmetic, envelope
+// shape, and billing. It proves nothing about Odoo filtering.
+type pageExec struct {
+	total int
+	pages map[int][]any
+}
+
+func (f *pageExec) Execute(model, method string, args []any, kwargs map[string]any) (any, error) {
+	if model == "res.partner" {
+		return []any{map[string]any{"id": 1}}, nil
+	}
+	if method == "search_count" {
+		return f.total, nil
+	}
+	dom, _ := kwargs["domain"].([]any)
+	for _, leaf := range dom {
+		clause, _ := leaf.([]any)
+		if len(clause) == 3 && clause[0] == "id" && clause[1] == "in" {
+			out := []any{}
+			for _, v := range clause[2].([]any) {
+				out = append(out, map[string]any{"id": v})
+			}
+			return out, nil
+		}
+	}
+	off, _ := kwargs["offset"].(int)
+	lim, _ := kwargs["limit"].(int)
+	if rows, ok := f.pages[off]; ok {
+		// Honor the requested limit like a real window: at most lim rows.
+		n := len(rows)
+		if lim >= 0 && n > lim {
+			n = lim
+		}
+		out := make([]any, n)
+		copy(out, rows[:n])
+		return out, nil
+	}
+	return []any{}, nil
+}
+
+// offsetExec records which offset each evidence fetch used: wiring
+// assertions for per-kind offsets, one canned row per fetch.
+type offsetExec struct {
+	valuesOffset       int
+	valuesSeen         bool
+	messageFirstOffset int
+	messageSeen        bool
+	attachOffset       int
+	attachSeen         bool
+}
+
+func (f *offsetExec) Execute(model, method string, args []any, kwargs map[string]any) (any, error) {
+	if model == "res.partner" {
+		return []any{map[string]any{"id": 1}}, nil
+	}
+	if method == "search_count" {
+		return 99, nil
+	}
+	off, _ := kwargs["offset"].(int)
+	switch model {
+	case "mail.tracking.value":
+		f.valuesOffset, f.valuesSeen = off, true
+		return []any{map[string]any{"id": 901}}, nil
+	case "mail.message":
+		if !f.messageSeen {
+			f.messageFirstOffset, f.messageSeen = off, true
+		}
+		return []any{map[string]any{"id": 41}}, nil
+	case "ir.attachment":
+		f.attachOffset, f.attachSeen = off, true
+		return []any{map[string]any{"id": 71, "name": "a"}}, nil
+	}
+	return []any{}, nil
 }
 
 func TestEvidenceDownloadDeniedWithoutDatas(t *testing.T) {

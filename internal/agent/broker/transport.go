@@ -1174,12 +1174,38 @@ func (b *Broker) handleMeta(w http.ResponseWriter, r *http.Request) {
 	for name := range b.pol.Models {
 		perModel[name] = policy.BoundedHint(name)
 	}
+	// Reproducibility block: sealed-vs-recomputed snapshot binding plus
+	// compact capability counts. Scalars and short lists only — the full
+	// models map stays for existing callers but answering "what revision,
+	// what policy, what snapshot, what can it do" must not require
+	// parsing the ~56 KB body.
+	recomputed, _ := snapshot.CanonicalDigest(b.snap)
+	sealed := strings.TrimSpace(b.pol.SnapshotSHA256)
+	match := recomputed != "" && strings.EqualFold(strings.TrimSpace(recomputed), sealed)
+	capable := map[string]any{}
+	evidenceOnly := make([]string, 0)
+	for name, rule := range b.pol.Models {
+		if rule.LinkedEvidence {
+			evidenceOnly = append(evidenceOnly, name)
+		}
+	}
+	sort.Strings(ops)
+	sort.Strings(evidenceOnly)
+	capable["model_count"] = len(b.pol.Models)
+	capable["evidence_only_models"] = evidenceOnly
+	capable["evidence_enabled"] = b.pol.AllowLinkedEvidence
+	capable["workspace_enabled"] = b.pol.AllowWorkspace
+	capable["bounded_queries_required"] = b.pol.RequireBoundedQueries
 	b.writeEnvelope(w, r, tok, map[string]any{
 		"instance": b.pol.Instance, "operations": ops, "models": models,
 		"default_company": b.pol.Scope.Default, "workspace": b.pol.AllowWorkspace,
 		"budgets": b.pol.Budgets, "require_bounded_queries": b.pol.RequireBoundedQueries,
 		"include_archived": b.pol.IncludeArchived, "allow_linked_evidence": b.pol.AllowLinkedEvidence,
 		"bounded_domain_guidance": guidance, "bounded_domain_hints": perModel,
+		"broker_revision": b.revision(), "policy_version": b.pol.Version,
+		"snapshot_sha256_sealed": sealed, "snapshot_sha256_recomputed": recomputed,
+		"snapshot_digest_match": match, "snapshot_server_version": b.snap.ServerVersion,
+		"snapshot_captured_by": b.snap.CapturedBy, "capabilities": capable,
 	}, len(models))
 }
 
