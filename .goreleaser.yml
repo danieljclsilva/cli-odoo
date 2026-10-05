@@ -7,8 +7,12 @@ before:
     - go mod tidy
 
 builds:
+  # Build releases on macOS with Xcode Command Line Tools. Foundation is a
+  # system framework; the resulting binaries need no helper installation.
   - id: odoo
     binary: odoo
+    env:
+      - CGO_ENABLED={{ if eq .Os "darwin" }}1{{ else }}0{{ end }}
     goos:
       - darwin
       - linux

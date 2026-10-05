@@ -384,7 +384,7 @@ func agentSetupProtectedPaths(profilePath, snapshotPath string) []string {
 // companies enabled/default, shared policy, models/fields/ops (with
 // per-model companyless opt-in), budgets, and workspace. Guided setup
 // requires explicit confirmation of exactly this.
-func agentSetupPrintSummary(instance string, scope policy.CompanyScope, specs []snapshot.ModelSpec, ops map[policy.Operation]bool, shared string, b policy.Budgets, workspaceDir string, allowWorkspace bool) {
+func agentSetupPrintSummary(instance string, scope policy.CompanyScope, specs []snapshot.ModelSpec, ops map[policy.Operation]bool, shared string, b policy.Budgets, workspaceDir string, allowWorkspace bool, compact ...bool) {
 	opNames := make([]string, 0, len(ops))
 	for op := range ops {
 		opNames = append(opNames, string(op))
@@ -395,6 +395,10 @@ func agentSetupPrintSummary(instance string, scope policy.CompanyScope, specs []
 	fmt.Fprintf(os.Stderr, "  shared_records: %s\n", shared)
 	fmt.Fprintf(os.Stderr, "  operations: %s\n", strings.Join(opNames, ","))
 	for _, sp := range specs {
+		if len(compact) > 0 && compact[0] {
+			fmt.Fprintf(os.Stderr, "  model %s: %d fields company_field=%q shared=%v companyless=%v aggregate=%v\n", sp.Name, len(sp.Fields), sp.CompanyField, sp.CompanyIndependent, sp.IncludeCompanyless, sp.AllowAggregate)
+			continue
+		}
 		fmt.Fprintf(os.Stderr, "  model %s: fields=%s company_field=%q independent=%v include_companyless=%v aggregate=%v\n",
 			sp.Name, strings.Join(sp.Fields, ","), sp.CompanyField, sp.CompanyIndependent, sp.IncludeCompanyless, sp.AllowAggregate)
 	}
@@ -674,6 +678,12 @@ func agentSetupPolicySpecs(pol policy.Policy) []snapshot.ModelSpec {
 
 func newAgentSetupCmd() *cobra.Command {
 	var profilePath, snapshotPath, workspaceDir, companiesStr, opsStr, sharedRecords string
+	var presetName string
+	var includeModels []string
+	var maxConcurrentRPC, minRPCIntervalMillis int
+	var boundedQueries bool
+	var showFields bool
+	var includeArchived bool
 	var defaultCompany int
 	var modelFlags []string
 	var adminStdin, resetFlag, nonInteractive bool
@@ -685,19 +695,31 @@ func newAgentSetupCmd() *cobra.Command {
 		Short: "Human-only guided setup: approve scope, seal policy (never model-invoked)",
 		Long: `Human-only guided setup for the agent boundary. Uses the active
 instance (--instance flag or ODOO_INSTANCE) with its keychain secret
-(run: odoo login first), then:
+(run: odoo login first). The default investigation profile discovers the
+installed business models and stored fields, including custom fields.
+It includes Helpdesk, products, BoMs, warehouse, sales/purchases, accounting,
+and linked chatter/attachment evidence. Missing optional modules and models
+without enforceable company scope are reported in the summary. Core product
+models and explicitly requested custom models are required; failures abort.
+Nonstored/computed, binary and secret-like business fields remain metadata
+only. Linked attachment downloads are separately bounded at 2 MiB.
+Companies are always human-selected. Run 'odoo agent presets' to inspect the
+proposal offline. --include-model approves an additional scoped custom
+model without allowing custom methods. Explicit --model selects manual setup
+instead; --ops/--shared-records/--workspace/budget flags override defaults.
+Use --show-fields for the full field list before confirmation. Then:
 
   1. shows available companies from res.company; you enable >=2 and pick
      the default from the enabled set (--companies 1,2 --default-company 1,
      or interactive prompts);
-  2. approves models/fields (--model name:fields[:scope][:aggregate],
-     repeatable; scope is company_id|company_ids|companyless|independent) or
-     interactively; only approved models are ever described with fields_get;
+  2. discovers the investigation model/field proposal automatically;
+     --model name:fields[:scope][:aggregate] instead selects manual scope
+     (repeatable; company_id|company_ids|companyless|independent);
   3. approves operations (--ops), budgets, and shared-record handling
      (--shared-records deny|allow-classified);
   4. takes a workspace directory (--workspace), created 0700 when missing;
   5. prints the effective summary and requires explicit confirmation
-     (or --non-interactive with all choices explicit);
+     (or --non-interactive to accept the supplied/default choices);
   6. builds the snapshot from the live server, writes it 0600;
   7. seals the policy with an admin password (TTY no-echo prompt, or
      --admin-password-stdin only) and writes the profile 0600.
@@ -709,6 +731,39 @@ The admin password never appears in output, envelopes, or errors.
 MethodManifest in the snapshot is informational only, never executable.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "agent_setup"
+			if maxConcurrentRPC < 1 || maxConcurrentRPC > 8 || minRPCIntervalMillis < 0 || minRPCIntervalMillis > 60000 {
+				output.Fail(tool, fmt.Errorf("RPC concurrency must be 1..8; interval must be 0..60000ms"))
+				return
+			}
+			if len(includeModels) > 0 && cmd.Flags().Changed("model") {
+				output.Fail(tool, fmt.Errorf("--include-model belongs to the investigation profile, not manual --model setup"))
+				return
+			}
+			if presetName == "" && !cmd.Flags().Changed("model") && !cmd.Flags().Changed("preset") {
+				presetName = "investigation"
+			}
+			var discovered map[string]map[string]snapshot.SFieldMeta
+			if presetName != "" {
+				preset, err := agentFindPreset(presetName)
+				if err != nil {
+					output.Fail(tool, err)
+					return
+				}
+				if cmd.Flags().Changed("model") {
+					output.Fail(tool, fmt.Errorf("--preset and --model cannot be combined; use manual setup for a custom model list"))
+					return
+				}
+				if !cmd.Flags().Changed("ops") {
+					opsStr = "search,read,count,aggregate,meta"
+				}
+				if !cmd.Flags().Changed("shared-records") {
+					sharedRecords = policy.SharedAllowClassified
+				}
+				if !cmd.Flags().Changed("workspace") {
+					workspaceDir = agentSetupDefaultWorkspaceDir()
+				}
+				fmt.Fprintf(os.Stderr, "Profile %q: %s\nShared business/reference access is included. Chatter and attachments require a visible approved parent record.\n", preset.Name, preset.Description)
+			}
 			if profilePath == "" {
 				profilePath = DefaultAgentProfilePath()
 			}
@@ -734,9 +789,9 @@ MethodManifest in the snapshot is informational only, never executable.`,
 				output.Fail(tool, err)
 				return
 			}
-			interactive := strings.TrimSpace(companiesStr) == "" || defaultCompany == 0 || len(modelFlags) == 0 || strings.TrimSpace(workspaceDir) == ""
+			interactive := strings.TrimSpace(companiesStr) == "" || defaultCompany == 0 || (len(modelFlags) == 0 && presetName == "") || strings.TrimSpace(workspaceDir) == ""
 			if nonInteractive && interactive {
-				output.Fail(tool, fmt.Errorf("--non-interactive requires --companies, --default-company, --model, and --workspace (no prompts allowed)"))
+				output.Fail(tool, fmt.Errorf("--non-interactive requires --companies, --default-company, and either --model plus --workspace or --preset (no prompts allowed)"))
 				return
 			}
 			cli, inst, err := agentSetupLiveClient(InstanceName())
@@ -804,10 +859,25 @@ MethodManifest in the snapshot is informational only, never executable.`,
 				}
 				defaultCompany = ids[0]
 			}
+			sort.Ints(enabled)
 			scope := policy.CompanyScope{Enabled: enabled, Default: defaultCompany}
+			if err := policy.ValidateScope(scope); err != nil {
+				output.Fail(tool, err)
+				return
+			}
 
 			var specs []snapshot.ModelSpec
-			if len(modelFlags) > 0 {
+			if presetName == "investigation" {
+				var notes []string
+				specs, discovered, notes, err = agentDiscoverInvestigation(cli, includeModels)
+				if err != nil {
+					output.Fail(tool, err)
+					return
+				}
+				for _, note := range notes {
+					fmt.Fprintln(os.Stderr, "  "+note)
+				}
+			} else if len(modelFlags) > 0 {
 				for _, f := range modelFlags {
 					sp, err := agentSetupParseModelSpec(f)
 					if err != nil {
@@ -884,17 +954,22 @@ MethodManifest in the snapshot is informational only, never executable.`,
 				sort.Strings(fields)
 				perModel := maxLimit
 				models[sp.Name] = policy.ModelRule{
-					Fields: fields, MaxLimit: perModel,
+					LinkedEvidence: presetName == "investigation" && policy.IsEvidenceModel(sp.Name),
+					Fields:         fields, MaxLimit: perModel,
 					AllowAggregate: sp.AllowAggregate,
 					CompanyField:   sp.CompanyField, CompanyIndependent: sp.CompanyIndependent,
 					IncludeCompanyless: sp.IncludeCompanyless,
 				}
 			}
 			pol := policy.Policy{
-				Version: policy.PolicyVersion, Instance: instanceName,
+				IncludeArchived:       includeArchived,
+				AllowLinkedEvidence:   presetName == "investigation",
+				RequireBoundedQueries: boundedQueries,
+				Version:               policy.PolicyVersion, Instance: instanceName,
 				Operations: ops, Models: models, Scope: scope,
 				SharedRecords: shared,
 				Budgets: policy.Budgets{
+					MaxConcurrentRPC: maxConcurrentRPC, MinRPCIntervalMillis: minRPCIntervalMillis,
 					MaxLimit: maxLimit, MaxOffset: maxOffset,
 					MaxRowsPerCall: maxRowsPerCall, MaxResponseBytes: maxResponseBytes,
 					MaxCallsPerSession: maxCallsPerSession, MaxRowsPerSession: maxRowsPerSession,
@@ -905,7 +980,9 @@ MethodManifest in the snapshot is informational only, never executable.`,
 			}
 			// Guided setup: print the effective summary and require
 			// explicit confirmation before committing anything.
-			agentSetupPrintSummary(instanceName, scope, specs, ops, shared, pol.Budgets, wsAbs, allowWorkspace)
+			agentSetupPrintSummary(instanceName, scope, specs, ops, shared, pol.Budgets, wsAbs, allowWorkspace, presetName != "" && !showFields)
+			fmt.Fprintf(os.Stderr, "  RPC protection: concurrent=%d interval=%dms bounded_queries=%v linked_evidence=%v\n", maxConcurrentRPC, minRPCIntervalMillis, boundedQueries, pol.AllowLinkedEvidence)
+			fmt.Fprintf(os.Stderr, "  archived records: %v\n", includeArchived)
 			if !nonInteractive {
 				confirm, err := ask("Commit this setup (seal policy + write snapshot)? (yes/N): ")
 				if err != nil {
@@ -921,6 +998,19 @@ MethodManifest in the snapshot is informational only, never executable.`,
 			if err != nil {
 				output.Fail(tool, err)
 				return
+			}
+			// Advisory metadata never adds fields to the policy allowlist.
+			for name, fields := range discovered {
+				m, ok := snap.Models[name]
+				if !ok {
+					continue
+				}
+				for field, meta := range fields {
+					if _, exists := m.Fields[field]; !exists {
+						m.Fields[field] = meta
+					}
+				}
+				snap.Models[name] = m
 			}
 			// New password seals the replacement (the overwrite guard
 			// above already verified the current one, unless --reset
@@ -962,9 +1052,16 @@ MethodManifest in the snapshot is informational only, never executable.`,
 	c.Flags().StringVar(&profilePath, "profile", "", "sealed profile path (default "+DefaultAgentProfilePath()+")")
 	c.Flags().StringVar(&snapshotPath, "snapshot-path", "", "snapshot file path (default "+DefaultAgentSnapshotPath()+")")
 	c.Flags().StringVar(&workspaceDir, "workspace", "", "dedicated workspace directory (created 0700 when missing)")
+	c.Flags().StringVar(&presetName, "preset", "", "investigation profile (default unless explicit --model is supplied)")
+	c.Flags().StringArrayVar(&includeModels, "include-model", nil, "additional human-approved custom business model with a direct company_id; repeatable")
+	c.Flags().IntVar(&maxConcurrentRPC, "max-concurrent-rpc", 1, "maximum simultaneous upstream RPCs (1..8)")
+	c.Flags().IntVar(&minRPCIntervalMillis, "min-rpc-interval-ms", 1000, "minimum interval between upstream RPC starts (milliseconds)")
+	c.Flags().BoolVar(&boundedQueries, "bounded-queries", true, "require record/reference anchors or a <=31-day date window for operational queries")
+	c.Flags().BoolVar(&showFields, "show-fields", false, "show every proposed field in the setup summary rather than field counts")
+	c.Flags().BoolVar(&includeArchived, "include-archived", true, "include archived business/configuration records for investigation")
 	c.Flags().StringVar(&companiesStr, "companies", "", "enabled company ids, e.g. \"1,2\" (prompts when empty)")
 	c.Flags().IntVar(&defaultCompany, "default-company", 0, "default company id, must be enabled (prompts when 0)")
-	c.Flags().StringSliceVar(&modelFlags, "model", nil, "approved model name:fields[:scope][:aggregate], repeatable (prompts when empty)")
+	c.Flags().StringArrayVar(&modelFlags, "model", nil, "manual approved model name:fields[:scope][:aggregate], repeatable (replaces default profile)")
 	c.Flags().StringVar(&opsStr, "ops", "search,read,count,meta", "approved operations CSV")
 	c.Flags().StringVar(&sharedRecords, "shared-records", policy.SharedDeny, "shared-record handling: deny|allow-classified")
 	c.Flags().BoolVar(&adminStdin, "admin-password-stdin", false, "read admin password from stdin (never args/env)")
@@ -976,7 +1073,7 @@ MethodManifest in the snapshot is informational only, never executable.`,
 	c.Flags().Int64Var(&maxRowsPerSession, "max-rows-per-session", 100000, "session row budget")
 	c.Flags().BoolVar(&allowWorkspace, "allow-workspace", true, "grant the model broker-level workspace file tools")
 	c.Flags().BoolVar(&resetFlag, "reset", false, "explicit secure recovery: type RESET plus a new password to replace an existing sealed profile (no old password)")
-	c.Flags().BoolVar(&nonInteractive, "non-interactive", false, "fail instead of prompting; requires --companies, --default-company, --model, and --workspace")
+	c.Flags().BoolVar(&nonInteractive, "non-interactive", false, "fail instead of prompting; requires companies/default plus a preset or explicit models/workspace")
 	return c
 }
 

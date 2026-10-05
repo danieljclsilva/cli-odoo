@@ -64,12 +64,17 @@ const (
 // scoped models via an OR-false enforcing fragment; it is meaningless on
 // CompanyIndependent models and rejected by Validate.
 type ModelRule struct {
+	LinkedEvidence     bool
 	Fields             []string
 	MaxLimit           int
 	AllowAggregate     bool
 	CompanyField       string
 	CompanyIndependent bool
 	IncludeCompanyless bool
+}
+
+func IsEvidenceModel(name string) bool {
+	return name == "mail.message" || name == "mail.tracking.value" || name == "ir.attachment"
 }
 
 // CompanyScope is the human-chosen company set. At least two companies must
@@ -85,12 +90,14 @@ type CompanyScope struct {
 // Authorize; per-request caps (MaxLimit, MaxOffset, MaxRowsPerCall,
 // MaxResponseBytes) gate Authorize.
 type Budgets struct {
-	MaxLimit           int
-	MaxOffset          int
-	MaxRowsPerCall     int
-	MaxResponseBytes   int
-	MaxCallsPerSession int64
-	MaxRowsPerSession  int64
+	MaxConcurrentRPC     int
+	MinRPCIntervalMillis int
+	MaxLimit             int
+	MaxOffset            int
+	MaxRowsPerCall       int
+	MaxResponseBytes     int
+	MaxCallsPerSession   int64
+	MaxRowsPerSession    int64
 }
 
 // Policy is the sealed, human-built authorization policy.
@@ -100,17 +107,20 @@ type Budgets struct {
 // compares before serving. Empty denies so pre-binding profiles must be
 // re-sealed via setup.
 type Policy struct {
-	Version        int
-	Instance       string
-	Operations     map[Operation]bool
-	Models         map[string]ModelRule
-	Scope          CompanyScope
-	SharedRecords  string
-	Budgets        Budgets
-	AllowWorkspace bool
-	WorkspaceDir   string
-	SnapshotPath   string
-	SnapshotSHA256 string `json:"snapshot_sha256"`
+	AllowLinkedEvidence   bool
+	IncludeArchived       bool
+	RequireBoundedQueries bool
+	Version               int
+	Instance              string
+	Operations            map[Operation]bool
+	Models                map[string]ModelRule
+	Scope                 CompanyScope
+	SharedRecords         string
+	Budgets               Budgets
+	AllowWorkspace        bool
+	WorkspaceDir          string
+	SnapshotPath          string
+	SnapshotSHA256        string `json:"snapshot_sha256"`
 }
 
 // Request is a single model request awaiting authorization. Domain is the

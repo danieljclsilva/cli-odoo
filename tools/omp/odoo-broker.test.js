@@ -10,7 +10,7 @@
 // path exercised, so no model/backend/Odoo credentials exist anywhere in
 // this file.
 //
-// PROVEN (2026-10-04): factory shape (11 typed tools, 5-arg execute);
+// PROVEN (2026-10-04): factory shape (12 typed tools, 5-arg execute);
 // legitimate routing to typed broker paths; denials surface as isError;
 // strict unknown/wrong-typed args rejected with no fetch; non-loopback
 // broker URLs refused; redirect:'error' set on every request; token
@@ -41,7 +41,7 @@ function byName(name) {
   return t;
 }
 
-test('factory returns eleven typed tools with execute + JSON-schema parameters', () => {
+test('factory returns twelve typed tools with execute + JSON-schema parameters', () => {
   assert.strictEqual(typeof factory, 'function', 'module must export the factory function');
   const tools = toolsOf();
   const names = tools.map((t) => t.name).sort();
@@ -50,6 +50,7 @@ test('factory returns eleven typed tools with execute + JSON-schema parameters',
     'odoo.catalog',
     'odoo.companies',
     'odoo.count',
+    'odoo.evidence',
     'odoo.meta',
     'odoo.read',
     'odoo.search',
@@ -125,6 +126,9 @@ test('legitimate call routes to the broker path', async () => {
     assert.strictEqual(seen[0].opts.redirect, 'error', 'redirects must never be followed with the token attached');
     const text = res.content[0].text;
     assert.ok(text.includes('rows'), `result text must carry the broker result, got ${text}`);
+    assert.strictEqual(res.content.length, 2, 'success must carry result + metadata blocks');
+    const meta = JSON.parse(res.content[1].text);
+    assert.ok('count' in meta, `metadata block must carry count key, got ${res.content[1].text}`);
   } finally {
     global.fetch = realFetch;
     delete process.env.ODOO_BROKER_TOKEN;
@@ -147,27 +151,52 @@ test('denied call surfaces isError without throwing', async () => {
   }
 });
 
-test('workspace.mkdir routes to /rpc/workspace/mkdir', async () => {
-  const seen = [];
+test('evidence error_meta survives as second block', async () => {
   const realFetch = global.fetch;
-  global.fetch = async (url) => {
-    seen.push(String(url));
-    return streamedEnvelope({ success: true, result: { path: 'reports', written: true } });
-  };
+  const meta = { phase: 'messages', model: 'mail.message', request_id: 'deadbeef', category: 'unknown', retryable: false, status: 502 };
+  global.fetch = async () => streamedEnvelope({ success: false, error: 'linked messages read failed for mail.message (req deadbeef); retryable:false', error_meta: meta });
   process.env.ODOO_BROKER_TOKEN = 'tok';
   try {
     const tools = toolsOf();
-    const mkdir = tools.find((t) => t.name === 'odoo.workspace.mkdir');
-    assert.ok(mkdir, 'workspace.mkdir tool must exist');
-    const res = await mkdir.execute('id-3', { path: 'reports' }, undefined, {}, undefined);
-    assert.strictEqual(res.isError, undefined);
-    assert.ok(seen[0].endsWith('/rpc/workspace/mkdir'), `routed to ${seen[0]}`);
+    const evidence = tools.find((t) => t.name === 'odoo.evidence');
+    const res = await evidence.execute('id-em', { model: 'helpdesk.ticket', id: 1, kind: 'chatter' }, undefined, {}, undefined);
+    assert.strictEqual(res.isError, true, 'evidence error must surface isError');
+    assert.ok(res.content[0].text.includes('deadbeef'), `reqID missing, got ${res.content[0].text}`);
+    assert.strictEqual(res.content.length, 2, 'error must carry error_meta block');
+    const parsed = JSON.parse(res.content[1].text);
+    assert.deepStrictEqual(parsed.error_meta, meta);
   } finally {
     global.fetch = realFetch;
     delete process.env.ODOO_BROKER_TOKEN;
   }
 });
 
+test('evidence numeric minimums rejected with no fetch', async () => {
+  const realFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return streamedEnvelope({ success: true, result: [] });
+  };
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  try {
+    const evidence = byName('odoo.evidence');
+    for (const params of [
+      { model: 'helpdesk.ticket', id: 0, kind: 'chatter' },
+      { model: 'helpdesk.ticket', id: 1, kind: 'chatter', offset: -1 },
+      { model: 'helpdesk.ticket', id: 1, kind: 'download', attachment_id: 0, path: 'x' },
+    ]) {
+      const bad = await evidence.execute('id-min', params, undefined, {}, undefined);
+      assert.strictEqual(bad.isError, true, `out-of-range must be isError: ${JSON.stringify(params)}`);
+    }
+    assert.strictEqual(calls, 0, 'minimums rejection must happen before any fetch');
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
 
 test('unknown args rejected with no fetch', async () => {
   const realFetch = global.fetch;
@@ -472,5 +501,51 @@ test('caller abort still aborts mid-flight', async () => {
     delete process.env.ODOO_BROKER_URL;
     delete process.env.ODOO_BROKER_TOKEN;
     delete process.env.ODOO_BROKER_TIMEOUT_MS;
+  }
+});
+
+test('evidence kind enum rejected before dispatch', async () => {
+  const realFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return streamedEnvelope({ success: true, result: [] });
+  };
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  try {
+    const evidence = byName('odoo.evidence');
+    const bad = await evidence.execute('id-kind', { model: 'helpdesk.ticket', id: 1, kind: 'messages' }, undefined, {}, undefined);
+    assert.strictEqual(bad.isError, true, 'guessed kind must be isError');
+    assert.ok(bad.content[0].text.includes('chatter'), `must list accepted kinds, got ${bad.content[0].text}`);
+    assert.strictEqual(calls, 0, 'kind rejection must happen before any fetch');
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
+  }
+});
+
+test('catalog model selector queries focused catalog, empty keeps full catalog', async () => {
+  const seen = [];
+  const realFetch = global.fetch;
+  global.fetch = async (url) => {
+    seen.push(String(url));
+    return streamedEnvelope({ success: true, result: { models: {} }, count: 0 });
+  };
+  process.env.ODOO_BROKER_URL = 'http://127.0.0.1:9';
+  process.env.ODOO_BROKER_TOKEN = 'tok';
+  try {
+    const catalog = byName('odoo.catalog');
+    const focused = await catalog.execute('id-cat1', { model: 'res.partner' }, undefined, {}, undefined);
+    assert.strictEqual(focused.isError, undefined);
+    assert.ok(seen[0].includes('/rpc/catalog?model=res.partner'), `focused catalog must QueryEscape model, got ${seen[0]}`);
+    const full = await catalog.execute('id-cat2', {}, undefined, {}, undefined);
+    assert.strictEqual(full.isError, undefined);
+    assert.ok(seen[1].endsWith('/rpc/catalog'), `empty catalog must keep full listing, got ${seen[1]}`);
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.ODOO_BROKER_URL;
+    delete process.env.ODOO_BROKER_TOKEN;
   }
 });

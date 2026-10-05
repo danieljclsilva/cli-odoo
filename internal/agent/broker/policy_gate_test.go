@@ -2,10 +2,15 @@ package broker
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/danieljclsilva/cli-odoo/internal/agent/policy"
+	"github.com/danieljclsilva/cli-odoo/internal/agent/workspace"
 	"github.com/danieljclsilva/cli-odoo/internal/config"
 )
 
@@ -179,5 +184,260 @@ func TestRealGateDottedHierarchyMux(t *testing.T) {
 				t.Fatalf("want 1 dispatch, got %d", len(exec.calls))
 			}
 		})
+	}
+}
+
+func TestDomainDenialCarriesSafeHint(t *testing.T) {
+	// Response4 item 8: the denial path exposes the model-specific
+	// accepted-shape hint (fields only, never user domain values).
+	p := testPolicy()
+	p.RequireBoundedQueries = true
+	b, err := NewForTest(p, &config.Instance{Name: "test"}, testSnapshot(), nil, &fakeExec{})
+	if err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	tok, err := b.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	rec := post(t, b, "/rpc/count", tok, `{"model":"res.partner","domain":[["team_id","=",1891]]}`)
+	body := rec.Body.String()
+	if !strings.Contains(body, "domain-denied") {
+		t.Fatalf("denial reason missing: %s", body)
+	}
+	if !strings.Contains(body, "31-day") && !strings.Contains(body, "flat AND") {
+		t.Fatalf("accepted-shape hint missing: %s", body)
+	}
+	if strings.Contains(body, "1891") {
+		t.Fatalf("user domain value echoed in denial: %s", body)
+	}
+}
+
+func TestErrorMetaSurvivesFittingEnvelope(t *testing.T) {
+	// Response5 item 5: the actual broker error writer preserves
+	// error_meta when it fits; unknown upstream FAKE-secret text is
+	// never echoed (structured fields only).
+	p := testPolicy()
+	b, err := New(p, &config.Instance{Name: "test"}, testSnapshot())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/rpc/evidence", nil)
+	meta := map[string]any{
+		"phase": "messages", "model": "mail.message", "request_id": "deadbeef",
+		"category": "unknown", "retryable": false, "status": 502,
+	}
+	b.writeErrorMeta(rec, req, http.StatusBadGateway, "linked messages read failed for mail.message (req deadbeef); retryable:false", meta)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	var env struct {
+		Success   bool           `json:"success"`
+		Error     string         `json:"error"`
+		ErrorMeta map[string]any `json:"error_meta"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("envelope decode: %v", err)
+	}
+	if env.ErrorMeta["phase"] != "messages" || env.ErrorMeta["request_id"] != "deadbeef" {
+		t.Fatalf("error_meta dropped: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "FAKE") {
+		t.Fatalf("upstream text leaked: %s", rec.Body.String())
+	}
+}
+
+func TestErrorMetaFallsBackUnderTinyCap(t *testing.T) {
+	// Tiny caps keep strict behavior: meta-less denial, status kept.
+	p := testPolicy()
+	p.Budgets.MaxResponseBytes = 10
+	b, err := New(p, &config.Instance{Name: "test"}, testSnapshot())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/rpc/evidence", nil)
+	b.writeErrorMeta(rec, req, http.StatusBadGateway, "linked messages read failed", map[string]any{"phase": "messages"})
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if body := rec.Body.Bytes(); len(body) > 10 && len(body) != 0 {
+		t.Fatalf("cap violated: %d bytes", len(body))
+	}
+}
+
+// seqExec serves rows for the first n dispatches, then fails: parent
+// re-link succeeds while the linked phase faults, exercising the exact
+// phase path (dispatch recorder + fault injector, never Odoo semantics).
+type seqExec struct {
+	rows      []any
+	seq       [][]any
+	failAfter int
+	failErr   error
+	calls     int
+}
+
+func (f *seqExec) Execute(model, method string, args []any, kwargs map[string]any) (any, error) {
+	f.calls++
+	if len(f.seq) > 0 {
+		idx := f.calls - 1
+		if idx >= len(f.seq) {
+			idx = len(f.seq) - 1
+		}
+		out := make([]any, len(f.seq[idx]))
+		copy(out, f.seq[idx])
+		return out, nil
+	}
+	if f.failAfter > 0 && f.calls > f.failAfter {
+		return nil, f.failErr
+	}
+	out := make([]any, len(f.rows))
+	copy(out, f.rows)
+	return out, nil
+}
+
+func TestEvidenceHandlerFailureEnvelope(t *testing.T) {
+	p := testPolicy()
+	p.Budgets.MaxRowsPerCall = 100
+	p.AllowLinkedEvidence = true
+	p.Models["mail.message"] = policy.ModelRule{Fields: []string{"id", "body"}, LinkedEvidence: true}
+	exec := &seqExec{rows: []any{map[string]any{"id": 1}}, failAfter: 1, failErr: errors.New("upstream FAKE-SECRET-boom")}
+	b, err := NewForTest(p, &config.Instance{Name: "test"}, testSnapshot(), nil, exec)
+	if err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	tok, err := b.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	rec := post(t, b, "/rpc/evidence", tok, `{"model":"res.partner","id":1,"kind":"chatter"}`)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("want error envelope, got 200 (%s)", rec.Body.String())
+	}
+	var env struct {
+		Success   bool           `json:"success"`
+		Error     string         `json:"error"`
+		ErrorMeta map[string]any `json:"error_meta"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("envelope decode: %v", err)
+	}
+	if env.Success || env.Error == "" {
+		t.Fatalf("not an error envelope: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "FAKE-SECRET") {
+		t.Fatalf("raw upstream fault leaked: %s", rec.Body.String())
+	}
+	if env.ErrorMeta["phase"] != "messages" {
+		t.Fatalf("wrong phase (want messages): %s", rec.Body.String())
+	}
+	if env.ErrorMeta["category"] != "unknown" || env.ErrorMeta["retryable"] != false {
+		t.Fatalf("unknown must stay unknown/retryable:false: %s", rec.Body.String())
+	}
+	if env.ErrorMeta["request_id"] == nil || env.ErrorMeta["request_id"] == "" {
+		t.Fatalf("request_id missing: %s", rec.Body.String())
+	}
+}
+
+func TestEvidenceDownloadDeniedWithoutDatas(t *testing.T) {
+	// Response6 item 4: datas denial through the actual handler when the
+	// sealed rule omits datas — no content fetch, no bytes, no hash.
+	p := testPolicy()
+	p.AllowLinkedEvidence = true
+	p.AllowWorkspace = true
+	p.Models["ir.attachment"] = policy.ModelRule{Fields: []string{"id", "name"}, LinkedEvidence: true}
+	p.SharedRecords = policy.SharedAllowClassified
+	dexec := &seqExec{seq: [][]any{
+		{map[string]any{"id": 1}},
+		{map[string]any{"id": 7, "name": "ticket.pdf", "file_size": 4, "type": "binary"}},
+	}}
+	b, err := NewForTest(p, &config.Instance{Name: "test"}, testSnapshot(), nil, dexec)
+	if err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	tok, err := b.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	rec := post(t, b, "/rpc/evidence", tok, `{"model":"res.partner","id":1,"kind":"download","attachment_id":7,"path":"ticket-7.pdf"}`)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("want datas denial, got 200 (%s)", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "attachment content not enabled") {
+		t.Fatalf("wrong denial: %s", rec.Body.String())
+	}
+	if dexec.calls != 2 {
+		t.Fatalf("want parent+meta dispatches only, got %d (datas must never fetch)", dexec.calls)
+	}
+}
+
+func TestEvidenceDownloadSuccessMetadata(t *testing.T) {
+	// Response6 item 4: through the actual download handler with datas
+	// enabled — descriptor/bytes/hash exact, text metadata sanitized.
+	p := testPolicy()
+	p.AllowLinkedEvidence = true
+	p.AllowWorkspace = true
+	p.Models["ir.attachment"] = policy.ModelRule{Fields: []string{"id", "name", "mimetype", "file_size", "type", "datas"}, LinkedEvidence: true}
+	p.SharedRecords = policy.SharedAllowClassified
+	dexec := &seqExec{seq: [][]any{
+		{map[string]any{"id": 1}},
+		{map[string]any{"id": 7, "name": "ticket.pdf", "mimetype": "text/plain;password=FAKE-SECRET", "file_size": 5, "type": "binary"}},
+		{map[string]any{"id": 7, "datas": "aGVsbG8="}},
+	}}
+	b, err := NewForTest(p, &config.Instance{Name: "test"}, testSnapshot(), nil, dexec)
+	if err != nil {
+		t.Fatalf("NewForTest: %v", err)
+	}
+	dir := t.TempDir()
+	ws, err := workspace.Open(dir)
+	if err != nil {
+		t.Fatalf("workspace.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = ws.Close() })
+	b.ws = ws
+	tok, err := b.Grant(time.Hour)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	rec := post(t, b, "/rpc/evidence", tok, `{"model":"res.partner","id":1,"kind":"download","attachment_id":7,"path":"ticket-7.txt"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var env struct {
+		Success bool `json:"success"`
+		Result  struct {
+			Path     string `json:"path"`
+			Bytes    int    `json:"bytes"`
+			Sha256   string `json:"sha256"`
+			Name     string `json:"name"`
+			Mimetype string `json:"mimetype"`
+		} `json:"result"`
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("envelope decode: %v", err)
+	}
+	if !env.Success || env.Count != 1 {
+		t.Fatalf("not a success count=1 envelope: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "FAKE-SECRET") {
+		t.Fatalf("stored mimetype secret crossed raw: %s", rec.Body.String())
+	}
+	if !strings.Contains(env.Result.Mimetype, RedactionMarker) {
+		t.Fatalf("mimetype marker missing: %s", rec.Body.String())
+	}
+	if env.Result.Path != "ticket-7.txt" || env.Result.Bytes != 5 || env.Result.Name != "ticket.pdf" {
+		t.Fatalf("descriptor semantics changed: %s", rec.Body.String())
+	}
+	if env.Result.Sha256 != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
+		t.Fatalf("sha256 wrong (want sha256(hello)): %s", rec.Body.String())
+	}
+	data, err := ws.Read("ticket-7.txt", 1<<20)
+	if err != nil {
+		t.Fatalf("workspace.Read: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("workspace bytes changed: %q", data)
 	}
 }

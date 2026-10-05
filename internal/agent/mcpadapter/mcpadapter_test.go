@@ -192,8 +192,8 @@ func TestToolsListTypedOnly(t *testing.T) {
 	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
 	result, _ := res["result"].(map[string]any)
 	tools, _ := result["tools"].([]any)
-	if len(tools) != 11 {
-		t.Fatalf("tools/list = %d tools, want 11", len(tools))
+	if len(tools) != 12 {
+		t.Fatalf("tools/list = %d tools, want 12", len(tools))
 	}
 }
 
@@ -238,8 +238,8 @@ func TestToolsListRequiresReady(t *testing.T) {
 	res = roundTrip(t, srv, `{"jsonrpc":"2.0","id":73,"method":"tools/list","params":{}}`)
 	result, _ := res["result"].(map[string]any)
 	tools, _ := result["tools"].([]any)
-	if len(tools) != 11 {
-		t.Fatalf("ready tools/list = %d tools, want 11", len(tools))
+	if len(tools) != 12 {
+		t.Fatalf("ready tools/list = %d tools, want 12", len(tools))
 	}
 }
 
@@ -471,6 +471,8 @@ func TestSchemasHaveNoRequiredNull(t *testing.T) {
 			if tool.Name != name {
 				continue
 			}
+			// meta/catalog accept an OPTIONAL model query (empty = full
+			// listing): no required key. companies takes no arguments.
 			if _, ok := tool.InputSchema["required"]; ok {
 				t.Fatalf("tool %q takes optional/no args but declares required", name)
 			}
@@ -889,7 +891,7 @@ func TestBrokerResponseOverflowDeniedWithoutInitialize(t *testing.T) {
 	}))
 	t.Cleanup(upstream.Close)
 	srv := New(Config{BaseURL: upstream.URL, Token: "probe-token"})
-	text, toolErr, perr := srv.callTool(context.Background(), "search", map[string]any{"model": "res.partner"})
+	text, _, toolErr, perr := srv.callTool(context.Background(), "search", map[string]any{"model": "res.partner"})
 	if perr != nil {
 		t.Fatalf("over-cap body should be a tool error, not a protocol error: %+v", perr)
 	}
@@ -996,5 +998,167 @@ func TestLoopbackRawPrechecks(t *testing.T) {
 		if err := validateBaseURL(raw); err == nil {
 			t.Fatalf("validateBaseURL(%q) = nil, want deny", raw)
 		}
+	}
+}
+
+func TestEvidenceKindEnumRejectedPreDispatch(t *testing.T) {
+	// Pure validation path: no broker, no httptest listener (sandbox
+	// denies loopback binds). Proves the guessed kind rejects with zero
+	// dispatch surface before any broker contact.
+	if err := validateArgs("evidence", map[string]any{"model": "helpdesk.ticket", "id": float64(1), "kind": "messages"}); err == nil {
+		t.Fatal("guessed kind should be InvalidParams")
+	}
+	if err := validateArgs("evidence", map[string]any{"model": "helpdesk.ticket", "id": float64(1), "kind": "chatter"}); err != nil {
+		t.Fatalf("accepted kind rejected: %+v", err)
+	}
+	// Enum is advertised on the schema so clients need not guess.
+	found := false
+	for _, tool := range Tools() {
+		if tool.Name != "evidence" {
+			continue
+		}
+		props, _ := tool.InputSchema["properties"].(map[string]any)
+		kind, _ := props["kind"].(map[string]any)
+		items, _ := kind["enum"].([]string)
+		for _, k := range items {
+			if k == "chatter" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("evidence schema missing kind enum")
+	}
+}
+
+func TestCatalogModelSelectorRoutes(t *testing.T) {
+	// Pure surface contract: catalog accepts an optional model string
+	// (empty = full listing) and the endpoint maps to GET /rpc/catalog.
+	// Listener-backed routing stays with the pre-existing suite (sandbox
+	// denies loopback binds here).
+	if err := validateArgs("catalog", map[string]any{"model": "res.partner"}); err != nil {
+		t.Fatalf("focused catalog rejected: %+v", err)
+	}
+	if err := validateArgs("catalog", map[string]any{}); err != nil {
+		t.Fatalf("empty catalog (full listing) rejected: %+v", err)
+	}
+	if m, p, ok := endpoint("catalog"); !ok || m != "GET" || p != "/rpc/catalog" {
+		t.Fatalf("endpoint(catalog) = %q %q %v, want GET /rpc/catalog true", m, p, ok)
+	}
+	found := false
+	for _, tool := range Tools() {
+		if tool.Name != "catalog" {
+			continue
+		}
+		props, _ := tool.InputSchema["properties"].(map[string]any)
+		if _, ok := props["model"]; ok {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("catalog schema missing optional model selector")
+	}
+}
+
+func TestReadinessTextsDistinguishCauses(t *testing.T) {
+	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: ""})
+	text, _, toolErr, perr := srv.callTool(context.Background(), "search", map[string]any{"model": "res.partner"})
+	if perr != nil || !toolErr {
+		t.Fatalf("missing token should be a tool error: %v %v", toolErr, perr)
+	}
+	if !strings.Contains(text, "odoo agent grant") {
+		t.Fatalf("missing-token text lacks renewal hint: %q", text)
+	}
+	srv2 := New(Config{BaseURL: "http://192.0.2.1:8471", Token: "probe"})
+	text2, _, toolErr2, perr2 := srv2.callTool(context.Background(), "search", map[string]any{"model": "res.partner"})
+	if perr2 != nil || !toolErr2 {
+		t.Fatalf("bad-URL should be a tool error: %v %v", toolErr2, perr2)
+	}
+	if !strings.Contains(text2, "loopback") || text == text2 {
+		t.Fatalf("unreachable-broker text not distinct: %q vs %q", text, text2)
+	}
+}
+
+func TestSuccessCarriesCountMetadataBlock(t *testing.T) {
+	// One coherent output contract: block 0 is the result JSON (unchanged
+	// shape); block 1 carries {count + tracking paging} parsed from the
+	// envelope. Pure marshalMeta contract (no listener: sandbox denies
+	// loopback binds); the listener round-trip variant stays director-only
+	// outside the sandbox — see gates.log.
+	if got := marshalMeta(envelopeMeta{Count: 3, Paged: map[string]any{"may_have_more_tracking": true}}); !strings.Contains(got, `"count":3`) || !strings.Contains(got, "may_have_more_tracking") {
+		t.Fatalf("metadata block missing count/paging: %q", got)
+	}
+	if got := marshalMeta(envelopeMeta{}); got != `{"count":0}` {
+		t.Fatalf("zero metadata shape = %q, want {\"count\":0}", got)
+	}
+}
+
+func TestInitializeCarriesUsageInstructions(t *testing.T) {
+	// Response4 item 8: short MCP initialize guidance — discovery,
+	// permitted reads/relationships, pacing, opaque untrusted text.
+	srv := New(Config{BaseURL: "http://127.0.0.1:1", Token: "x"})
+	res := roundTrip(t, srv, `{"jsonrpc":"2.0","id":46,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"c","version":"1"},"capabilities":{}}}`)
+	result, _ := res["result"].(map[string]any)
+	text, _ := result["instructions"].(string)
+	for _, want := range []string{"Discovery", "flat AND", "never traverse", "untrusted", "429", "odoo agent grant"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("instructions missing %q: %q", want, text)
+		}
+	}
+}
+
+func TestToolErrorCarriesErrorMetaBlock(t *testing.T) {
+	// Response4 item 8: structured phase/model/request-id/category/
+	// retryable/status survives the adapter on a second content block.
+	// Pure callTool path with a stub RoundTripper (no listener).
+	upstream := `{"success":false,"error":"linked messages read failed for mail.message (req deadbeef); retryable:false","error_meta":{"phase":"messages","model":"mail.message","request_id":"deadbeef","category":"unknown","retryable":false,"status":502}}`
+	srv := New(Config{
+		BaseURL: "http://127.0.0.1:1",
+		Token:   "probe",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusBadGateway,
+				Body:       io.NopCloser(strings.NewReader(upstream)),
+				Header:     make(http.Header),
+			}, nil
+		})},
+	})
+	text, meta, toolErr, perr := srv.callTool(context.Background(), "search", map[string]any{"model": "res.partner"})
+	if perr != nil || !toolErr {
+		t.Fatalf("denial should be a tool error: %v %v", toolErr, perr)
+	}
+	if !strings.Contains(text, "deadbeef") {
+		t.Fatalf("reqID missing in error text: %q", text)
+	}
+	if meta.Error["phase"] != "messages" || meta.Error["request_id"] != "deadbeef" {
+		t.Fatalf("error_meta lost: %+v", meta.Error)
+	}
+	if meta.Error["category"] != "unknown" || meta.Error["retryable"] != false {
+		t.Fatalf("category/retryability wrong: %+v", meta.Error)
+	}
+}
+
+// roundTripFunc is a stub RoundTripper returning canned broker bodies.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestEvidenceNumericMinimumsRejectedPreDispatch(t *testing.T) {
+	// Response5 item 6: id:0 and offset:-1 fail client-side with zero
+	// dispatch; dynamic policy caps stay server-side.
+	for _, args := range []map[string]any{
+		{"model": "helpdesk.ticket", "id": float64(0), "kind": "chatter"},
+		{"model": "helpdesk.ticket", "id": float64(-1), "kind": "chatter"},
+		{"model": "helpdesk.ticket", "id": float64(1), "kind": "chatter", "offset": float64(-1)},
+		{"model": "helpdesk.ticket", "id": float64(1), "kind": "download", "attachment_id": float64(0), "path": "x"},
+	} {
+		if err := validateArgs("evidence", args); err == nil {
+			t.Fatalf("out-of-range evidence args accepted: %v", args)
+		}
+	}
+	if err := validateArgs("evidence", map[string]any{"model": "helpdesk.ticket", "id": float64(1), "kind": "chatter"}); err != nil {
+		t.Fatalf("in-range evidence args rejected: %+v", err)
 	}
 }

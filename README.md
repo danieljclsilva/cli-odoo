@@ -28,6 +28,21 @@ brew install danieljclsilva/tap/cli-odoo
 go build -o odoo .
 ```
 
+macOS builds with CGO enabled use Apple's Foundation `URLSession` for
+Odoo HTTP requests, matching native Apple apps. Install Xcode Command Line
+Tools to build from source. The executable uses only system frameworks;
+no Swift helper, browser session, credential file or additional runtime is
+required. Redirects still pass through the CLI's exact-origin protection;
+TLS verification, cancellation and the 10 MiB response cap remain enforced.
+Native requests have a 32 MiB request-body cap. Cookies and HTTP caching are
+disabled. Linux, Windows and explicitly `CGO_ENABLED=0` macOS builds use Go's
+HTTP transport; a CGO-disabled macOS build does not provide native-client
+compatibility with sites that challenge Go HTTP clients. Build all five
+release targets (`make cross` or GoReleaser) on macOS with its SDK installed.
+Foundation buffers bounded responses before returning them to Go, including
+redirect responses. A stalled or oversized redirect body fails under the
+timeout/size cap; it is not followed merely because headers have arrived.
+
 ## Quickstart
 
 The user logs in once; the secret lives in the OS keychain (service

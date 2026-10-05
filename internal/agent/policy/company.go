@@ -73,7 +73,13 @@ func CompanyFilterFragment(rule ModelRule, scope CompanyScope) (frag []any, enfo
 	if rule.IncludeCompanyless {
 		leafIn := []any{field, "in", ids}
 		leafFalse := []any{field, "=", false}
+		if field == "product_tmpl_id.company_id" {
+			return []any{[]any{"product_tmpl_id", "!=", false}, "|", leafIn, leafFalse}, true
+		}
 		return []any{"|", leafIn, leafFalse}, true
+	}
+	if field == "product_tmpl_id.company_id" {
+		return []any{[]any{"product_tmpl_id", "!=", false}, []any{field, "in", ids}}, true
 	}
 	return []any{[]any{field, "in", ids}}, true
 }
@@ -117,6 +123,9 @@ func (p *Policy) CompanyFieldValid(schema SchemaView, model string) error {
 	if !ok {
 		return fmt.Errorf("policy: unknown model %q", model)
 	}
+	if rule.LinkedEvidence && p.AllowLinkedEvidence && IsEvidenceModel(model) {
+		return nil
+	}
 	if rule.CompanyIndependent {
 		if rule.CompanyField != "" {
 			return fmt.Errorf("policy: model %q contradictory: company-independent with company field", model)
@@ -126,6 +135,28 @@ func (p *Policy) CompanyFieldValid(schema SchemaView, model string) error {
 	field, ok := NormalizeName(rule.CompanyField)
 	if !ok || field == "" || field != rule.CompanyField {
 		return fmt.Errorf("policy: model %q has no usable company field", model)
+	}
+	if field == "product_tmpl_id.company_id" && (model == "product.template.attribute.line" || model == "product.template.attribute.value") {
+		if schema == nil {
+			return fmt.Errorf("policy: missing parent schema")
+		}
+		child, ok := schema.Model(model)
+		if !ok {
+			return fmt.Errorf("policy: missing child schema")
+		}
+		parent, ok := child.Field("product_tmpl_id")
+		if !ok || parent.Type != "many2one" || parent.Relation != "product.template" {
+			return fmt.Errorf("policy: invalid product parent")
+		}
+		target, ok := schema.Model("product.template")
+		if !ok {
+			return fmt.Errorf("policy: missing product schema")
+		}
+		company, ok := target.Field("company_id")
+		if !ok || company.Type != "many2one" || company.Relation != "res.company" {
+			return fmt.Errorf("policy: invalid product company scope")
+		}
+		return nil
 	}
 	if schema == nil {
 		return fmt.Errorf("policy: model %q company field %q unverifiable without schema", model, field)

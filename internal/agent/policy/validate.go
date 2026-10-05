@@ -123,6 +123,9 @@ func (p *Policy) Validate() error {
 	if p.Budgets.MaxLimit <= 0 {
 		return fmt.Errorf("policy: non-positive global MaxLimit %d", p.Budgets.MaxLimit)
 	}
+	if p.Budgets.MaxConcurrentRPC < 0 || p.Budgets.MaxConcurrentRPC > 8 || p.Budgets.MinRPCIntervalMillis < 0 || p.Budgets.MinRPCIntervalMillis > 60000 {
+		return fmt.Errorf("policy: invalid RPC concurrency/interval budget")
+	}
 	if p.Budgets.MaxRowsPerCall <= 0 {
 		return fmt.Errorf("policy: non-positive MaxRowsPerCall %d", p.Budgets.MaxRowsPerCall)
 	}
@@ -142,6 +145,9 @@ func (p *Policy) Validate() error {
 		return err
 	}
 	for name, rule := range p.Models {
+		if rule.LinkedEvidence && (!p.AllowLinkedEvidence || !IsEvidenceModel(name) || rule.CompanyField != "" || rule.CompanyIndependent || rule.IncludeCompanyless || rule.AllowAggregate) {
+			return fmt.Errorf("policy: invalid linked evidence scope on %q", name)
+		}
 		norm, ok := NormalizeName(name)
 		if !ok || norm != name {
 			return fmt.Errorf("policy: bad model name %q", name)
@@ -267,6 +273,15 @@ func (p *Policy) Authorize(schema SchemaView, r Request) Decision {
 	rule, ok := p.Models[model]
 	if !ok {
 		return deny(ReasonUnknownModel)
+	}
+	if rule.LinkedEvidence {
+		return deny(ReasonCompanyDenied)
+	}
+	if p.RequireBoundedQueries && r.Operation != OpMeta && !rule.CompanyIndependent && !BoundedDomainFor(model, r.Domain) {
+		return deny(ReasonDomainDenied)
+	}
+	if p.RequireBoundedQueries && (len(r.Fields) > 64 || len(r.GroupBy) > 3) {
+		return deny(ReasonFieldDenied)
 	}
 	if r.Operation == OpAggregate && !rule.AllowAggregate {
 		return deny(ReasonAggregateDenied)
