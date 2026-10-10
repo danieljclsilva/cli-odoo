@@ -74,7 +74,7 @@ func testBrokerServer(t *testing.T, gate *stubGate, exec *stubExec) (*httptest.S
 			"res.partner": {Name: "res.partner", Label: "Partner", Provenance: snapshot.ProvServer,
 				Fields: map[string]snapshot.SFieldMeta{"name": {Name: "name", Type: "char", Label: "Name"}}},
 		},
-		MethodManifest: []string{"search_read"},
+		MethodManifest: []snapshot.MethodMeta{{Model: "res.partner", Method: "search_read", Signature: "unknown", SourceModule: "unknown", SourceRevision: "unknown", SourceReference: "unknown", Provenance: snapshot.ProvUnknown, MutationAssessment: "unknown"}},
 	}
 	digest, derr := snapshot.CanonicalDigest(snap)
 	if derr != nil {
@@ -299,7 +299,7 @@ func TestCatalogCarriesManifestAndProvenance(t *testing.T) {
 				Provenance string `json:"provenance"`
 			} `json:"fields"`
 		} `json:"models"`
-		MethodManifest []string `json:"method_manifest"`
+		MethodManifest []snapshot.MethodMeta `json:"method_manifest"`
 	}
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
 		t.Fatalf("catalog text is not JSON: %v (%q)", err, text)

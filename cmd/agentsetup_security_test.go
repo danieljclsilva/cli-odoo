@@ -193,7 +193,7 @@ func validBundleSnapshot() snapshot.Snapshot {
 					"company_id": {Name: "company_id", Type: "many2one", Relation: "res.company", Label: "Company", Provenance: snapshot.ProvServer},
 				}},
 		},
-		MethodManifest: []string{"search_read"},
+		MethodManifest: []snapshot.MethodMeta{{Model: "res.partner", Method: "search_read", Signature: "unknown", SourceModule: "unknown", SourceRevision: "unknown", SourceReference: "unknown", Provenance: snapshot.ProvUnknown, MutationAssessment: "unknown"}},
 	}
 }
 

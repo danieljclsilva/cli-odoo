@@ -697,12 +697,13 @@ func newAgentSetupCmd() *cobra.Command {
 instance (--instance flag or ODOO_INSTANCE) with its keychain secret
 (run: odoo login first). The default investigation profile discovers the
 installed business models and stored fields, including custom fields.
-It includes Helpdesk, products, BoMs, warehouse, sales/purchases, accounting,
+It includes Helpdesk, products, BoMs, manufacturing work orders, warehouse, sales/purchases, accounting,
 and linked chatter/attachment evidence. Missing optional modules and models
 without enforceable company scope are reported in the summary. Core product
 models and explicitly requested custom models are required; failures abort.
 Nonstored/computed, binary and secret-like business fields remain metadata
-only. Linked attachment downloads are separately bounded at 2 MiB.
+only for generic projections. Field-backed worksheets/artwork use the linked
+attachment evidence selector when res_field is approved, bounded at 5 MiB.
 Companies are always human-selected. Run 'odoo agent presets' to inspect the
 proposal offline. --include-model approves an additional scoped custom
 model without allowing custom methods. Explicit --model selects manual setup
@@ -1094,9 +1095,9 @@ only). Subcommands:
   import-catalog: converts a human-transcribed offline catalog file into a
     snapshot (snapshot.ImportCatalog), writes it 0600, and reseals the
     profile binding the same way.
-  import-manifest: inspects a human-authored method list
-    (snapshot.ImportManifest, informational only — never executable) and
-    prints the entries for review; it writes nothing and reseals nothing.
+  import-manifest: inspects structured method evidence; --apply reseals offline
+    (informational only — never executable). Without --apply it prints the
+    entries for review and writes nothing; --apply requires human unlock.
 
 Only human-approved models are ever described with fields_get; custom
 models outside the approved set are never touched. Refresh and
@@ -1475,6 +1476,16 @@ func newAgentSnapshotRefreshCmd() *cobra.Command {
 			if strings.TrimSpace(snapshotPath) == "" {
 				snapshotPath = DefaultAgentSnapshotPath()
 			}
+			prior, err := snapshot.Load(pol.SnapshotPath)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			priorDigest, err := snapshot.CanonicalDigest(prior)
+			if err != nil || priorDigest != pol.SnapshotSHA256 {
+				output.Fail(tool, fmt.Errorf("snapshot digest does not match sealed profile"))
+				return
+			}
 			cli, _, err := agentSetupLiveClient(pol.Instance)
 			if err != nil {
 				output.Fail(tool, err)
@@ -1485,6 +1496,8 @@ func newAgentSnapshotRefreshCmd() *cobra.Command {
 				output.Fail(tool, err)
 				return
 			}
+			// Live field refresh does not discover methods or replace imported evidence.
+			snap.MethodManifest = append([]snapshot.MethodMeta{}, prior.MethodManifest...)
 			// Stage ALL validation + Seal BEFORE any mutation; commit the
 			// snapshot+profile pair together or roll back to the prior
 			// working pair. The admin password was already verified (unlock
@@ -1597,15 +1610,19 @@ unlock); the sealed policy is never rewritten without it.`,
 }
 
 func newAgentSnapshotImportManifestCmd() *cobra.Command {
-	var manifestPath string
+	var manifestPath, profilePath string
+	var apply, adminStdin bool
 	c := &cobra.Command{
 		Use:   "import-manifest",
 		Short: "Human-only: inspect a method manifest (informational, never executable)",
-		Long: `Human-only bounded inspection: reads a human-authored method
-list (snapshot.ImportManifest: regular file, max 4 MiB, strict {"methods":
-[...]} decoding, capped entries) and prints the entries for review. The
-result is informational only — no Execute path may take a name from it.
-Writes nothing and reseals nothing.`,
+		Long: `Human-only offline import of a versioned, structured method manifest.
+Default: validates and prints metadata for review without modifying files.
+With --apply: unlocks the existing profile, verifies its snapshot binding,
+replaces only method metadata, and reseals the snapshot/profile pair. Also
+explicitly migrates v1 snapshots to v2; normal serve has no legacy fallback.
+No Odoo connection, source fetch or method execution occurs. Importing a model,
+method or mutation assessment grants no execution or record permission.`,
+		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			const tool = "agent_snapshot_import_manifest"
 			if strings.TrimSpace(manifestPath) == "" {
@@ -1617,10 +1634,51 @@ Writes nothing and reseals nothing.`,
 				output.Fail(tool, err)
 				return
 			}
-			output.Ok(tool, map[string]any{"methods": methods}, len(methods))
+			if !apply {
+				if cmd.Flags().Changed("profile") || cmd.Flags().Changed("admin-password-stdin") {
+					output.Fail(tool, fmt.Errorf("--profile and --admin-password-stdin require --apply"))
+					return
+				}
+				output.Ok(tool, map[string]any{"manifest_version": snapshot.ManifestVersion, "methods": methods, "applied": false}, len(methods))
+				return
+			}
+			if profilePath == "" {
+				profilePath = DefaultAgentProfilePath()
+			}
+			adminPassword, err := agentSetupAdminPassword(adminStdin, false)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			pol, err := agentSetupOpenPolicy(profilePath, adminPassword)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			snap, err := snapshot.ImportManifestSnapshot(pol.SnapshotPath, pol.SnapshotSHA256, methods)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			// Reuse staged pair validation and rollback; preserve every permission.
+			bundle, err := agentSetupStageSealedBundle(profilePath, pol.SnapshotPath, adminPassword, pol, snap)
+			if err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			if err := agentSetupCommitBundle(bundle); err != nil {
+				output.Fail(tool, err)
+				return
+			}
+			output.Ok(tool, map[string]any{"applied": true, "snapshot": pol.SnapshotPath,
+				"snapshot_version": snapshot.FormatVersion, "snapshot_sha256": bundle.pol.SnapshotSHA256,
+				"methods": len(methods), "restart_required": true}, len(methods))
 		},
 	}
-	c.Flags().StringVar(&manifestPath, "manifest", "", "human-authored method-list file to inspect (required)")
+	c.Flags().StringVar(&manifestPath, "manifest", "", "versioned structured method manifest (required)")
+	c.Flags().BoolVar(&apply, "apply", false, "human-unlock and reseal method metadata offline; preserves all permissions")
+	c.Flags().StringVar(&profilePath, "profile", "", "sealed profile path (requires --apply)")
+	c.Flags().BoolVar(&adminStdin, "admin-password-stdin", false, "read admin password from stdin (requires --apply)")
 	return c
 }
 

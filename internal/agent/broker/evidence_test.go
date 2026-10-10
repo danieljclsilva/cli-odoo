@@ -1,6 +1,8 @@
 package broker
 
 import (
+	"bytes"
+	"encoding/base64"
 	"testing"
 	"time"
 
@@ -52,6 +54,29 @@ func TestAttachmentEncodingBoundaries(t *testing.T) {
 	for _, input := range []any{false, nil, "not base64!", make([]byte, 3*maxAttachmentBytes)} {
 		if _, err := decodeAttachmentDatas(input); err == nil {
 			t.Fatal("invalid or oversized payload accepted")
+		}
+	}
+}
+
+func TestAttachmentFiveMiBBoundary(t *testing.T) {
+	const capBytes = 5 << 20
+	if maxAttachmentBytes != capBytes {
+		t.Fatalf("download cap = %d, want %d", maxAttachmentBytes, capBytes)
+	}
+	data := bytes.Repeat([]byte{'x'}, capBytes)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	for _, input := range []any{encoded, []byte(encoded)} {
+		got, err := decodeAttachmentDatas(input)
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("exactly 5 MiB refused: %v", err)
+		}
+	}
+	// These payloads can share the same base64 length. Verify the decoded
+	// byte cap as well as the encoded cap; metadata alone is insufficient.
+	over := base64.StdEncoding.EncodeToString(append(data, 'x'))
+	for _, input := range []any{over, []byte(over)} {
+		if _, err := decodeAttachmentDatas(input); err == nil {
+			t.Fatal("5 MiB plus one byte accepted")
 		}
 	}
 }

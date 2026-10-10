@@ -20,7 +20,10 @@ func BoundedDomain(domain any) bool {
 // query-cost guarantee. Narrow and reviewed: do not accept every
 // relational field, generic OR/NOT, or arbitrary relationship traversal.
 var modelAnchors = map[string]map[string]bool{
-	"stock.rule": {"route_id": true},
+	"stock.rule":      {"route_id": true},
+	"stock.move":      {"raw_material_production_id": true, "production_id": true, "workorder_id": true},
+	"stock.move.line": {"production_id": true, "workorder_id": true},
+	"mrp.workorder":   {"production_id": true, "operation_id": true},
 }
 
 // BoundedHint returns the accepted query shapes for model: its per-model

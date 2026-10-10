@@ -17,13 +17,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/danieljclsilva/cli-odoo/internal/agent/policy"
 	"github.com/kolo/xmlrpc"
 )
 
-const maxAttachmentBytes = 2 << 20
+const maxAttachmentBytes = 5 << 20
 
 // maxMessagePages bounds one mail.message source scan: each source page
 // costs one billed row, so a window can never bill more than this many
@@ -40,7 +41,37 @@ type evidenceBody struct {
 	Offset         int    `json:"offset"`
 	TrackingOffset int    `json:"tracking_offset"`
 	AttachmentID   int    `json:"attachment_id"`
+	Field          string `json:"field"`
 	Path           string `json:"path"`
+}
+
+// attachmentEvidenceDomain makes field-backed evidence explicit. Odoo 17
+// otherwise hides res_field attachments; pinning an id alone skips that
+// default, so even downloads must carry the same res_field constraint.
+// Approving res_field on the linked source opts into this route at human
+// setup. Catalog metadata alone cannot enable it on an older profile.
+func (b *Broker) attachmentEvidenceDomain(in evidenceBody, evidence policy.ModelRule) ([]any, error) {
+	if in.Kind != "attachments" && in.Kind != "download" {
+		if in.Field != "" {
+			return nil, fmt.Errorf("field is only supported for attachments or download")
+		}
+		return nil, nil
+	}
+	var field any = false
+	if in.Field != "" {
+		if norm, ok := policy.NormalizeName(in.Field); !ok || norm != in.Field || strings.Contains(in.Field, ".") || policy.IsSecretField(in.Field) {
+			return nil, fmt.Errorf("attachment field must be a canonical non-secret binary field")
+		}
+		if !containsField(evidence.Fields, "res_field") {
+			return nil, fmt.Errorf("field-backed attachments not enabled; human setup must approve ir.attachment.res_field")
+		}
+		meta, ok := b.snap.Models[in.Model].Fields[in.Field]
+		if !ok || meta.Type != "binary" {
+			return nil, fmt.Errorf("attachment field is not a binary field in the sealed parent catalog")
+		}
+		field = in.Field
+	}
+	return []any{[]any{"res_model", "=", in.Model}, []any{"res_id", "=", in.ID}, []any{"res_field", "=", field}}, nil
 }
 
 // Evidence phases for classified linked-evidence errors. Each upstream
@@ -153,6 +184,12 @@ func (b *Broker) handleEvidence(w http.ResponseWriter, r *http.Request) {
 		b.release(tok)
 		return
 	}
+	attachmentDomain, err := b.attachmentEvidenceDomain(in, evidence)
+	if err != nil {
+		b.writeError(w, r, http.StatusForbidden, err.Error())
+		b.release(tok)
+		return
+	}
 	domain, kwargs, err := b.scopedArgs(rule, parentDomain)
 	if err != nil {
 		b.writeError(w, r, http.StatusForbidden, "parent scope unavailable")
@@ -247,6 +284,9 @@ func (b *Broker) handleEvidence(w http.ResponseWriter, r *http.Request) {
 		link = "res_model"
 	}
 	evidenceDomain := []any{[]any{link, "=", in.Model}, []any{"res_id", "=", in.ID}}
+	if source == "ir.attachment" {
+		evidenceDomain = attachmentDomain
+	}
 	fields := []string{}
 	for _, f := range evidence.Fields {
 		if f != "datas" {
@@ -430,7 +470,7 @@ func (b *Broker) handleEvidence(w http.ResponseWriter, r *http.Request) {
 		}
 		size, ok := evidenceInt(meta["file_size"])
 		if !ok || size < 0 || size > maxAttachmentBytes || meta["type"] != "binary" {
-			b.writeError(w, r, http.StatusBadRequest, "only linked binary attachments up to 2 MiB may be downloaded; URL attachments are not fetched")
+			b.writeError(w, r, http.StatusBadRequest, "only linked binary attachments up to 5 MiB may be downloaded; URL attachments are not fetched")
 			return
 		}
 		if !containsField(evidence.Fields, "datas") {
@@ -802,6 +842,7 @@ func evidenceInt(v any) (int, bool) {
 //     is a malformed response: 502/malformed, retryable:false;
 //   - real RPC faults (server status codes, XML fault envelopes, json2
 //     error members) are opaque server text: 502/unknown, retryable:false.
+//
 // Every failure emits one operator log line keyed by reqID (phase, model,
 // category, status, upstream kind only — never the upstream message) so a
 // human can correlate `req <id>` after the fact while the model envelope
@@ -953,6 +994,7 @@ func evidenceIsTimeoutErr(err error) bool {
 	}
 	return false
 }
+
 // evidenceIsTransportErr reports HTTP-layer transport breakage by TYPE,
 // without matching message text: net errors at the HTTP layer (refused,
 // reset, DNS, closed connection), *url.Error from the HTTP client (which

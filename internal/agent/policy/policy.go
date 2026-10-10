@@ -77,6 +77,18 @@ func IsEvidenceModel(name string) bool {
 	return name == "mail.message" || name == "mail.tracking.value" || name == "ir.attachment"
 }
 
+// IsSecretField excludes credential-like names from automatic business
+// projections and field-backed attachment evidence alike.
+func IsSecretField(name string) bool {
+	lower := strings.ToLower(name)
+	for _, secret := range []string{"password", "secret", "token", "api_key", "private_key"} {
+		if strings.Contains(lower, secret) {
+			return true
+		}
+	}
+	return false
+}
+
 // CompanyScope is the human-chosen company set. At least two companies must
 // be enabled so the model can never imply a single-company context, and the
 // default must be a member of the enabled set.

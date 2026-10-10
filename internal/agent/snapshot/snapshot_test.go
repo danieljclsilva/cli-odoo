@@ -42,7 +42,7 @@ func validTestSnapshot() Snapshot {
 				Provenance:         ProvServer,
 			},
 		},
-		MethodManifest: []string{"search_read", "read"},
+		MethodManifest: []MethodMeta{{Model: "res.partner", Method: "search_read", Signature: "unknown", SourceModule: "unknown", SourceRevision: "unknown", SourceReference: "unknown", Provenance: ProvUnknown, MutationAssessment: "unknown"}, {Model: "res.partner", Method: "read", Signature: "unknown", SourceModule: "unknown", SourceRevision: "unknown", SourceReference: "unknown", Provenance: ProvUnknown, MutationAssessment: "unknown"}},
 	}
 }
 
@@ -77,7 +77,7 @@ func TestLoadRoundTrip(t *testing.T) {
 func TestLoadVersionMismatchDenies(t *testing.T) {
 	// A file written for any other version is refused with no legacy
 	// fallback, even if the body is otherwise valid.
-	for _, version := range []string{"0", "2", "99"} {
+	for _, version := range []string{"0", "1", "99"} {
 		body := `{"version":` + version + `,"instance":"test",` +
 			`"server_version":"17.0","captured_at":"2026-01-01T00:00:00Z",` +
 			`"available_companies":[{"id":1,"name":"A"},{"id":2,"name":"B"}],` +
@@ -218,7 +218,7 @@ func TestDiscoverableNotExecutable(t *testing.T) {
 	// MethodManifest entries are informational only: they must NOT resolve
 	// as models. Discovery is not execution.
 	for _, method := range s.MethodManifest {
-		if _, ok := s.Model(method); ok {
+		if _, ok := s.Model(method.Method); ok {
 			t.Fatalf("Model(%q): manifest method must not resolve as a model", method)
 		}
 	}
@@ -279,7 +279,7 @@ func TestImportBoundedCatalogMixedProvenance(t *testing.T) {
 		`"email":{"type":"char","label":"Email"}}},` +
 		`"x.custom":{"label":"Custom","executable":false,"fields":{` +
 		`"x_note":{"type":"text","label":"Note"}}}}` +
-		`,"method_manifest":["search_read"]}`
+		`,"method_manifest":[]}`
 	s, err := ImportCatalog(writeCatalogFile(t, body))
 	if err != nil {
 		t.Fatalf("ImportCatalog: %v", err)
@@ -364,22 +364,22 @@ func TestImportManifestInformationalOnly(t *testing.T) {
 	// A bounded method list imports for inspection; entries never resolve
 	// as models and no Execute path takes names from this list.
 	path := filepath.Join(t.TempDir(), "manifest.json")
-	if err := os.WriteFile(path, []byte(`{"methods":["search_read","read"]}`), 0600); err != nil {
+	if err := os.WriteFile(path, mustMarshal(map[string]any{"manifest_version": ManifestVersion, "methods": validTestSnapshot().MethodManifest}), 0600); err != nil {
 		t.Fatal(err)
 	}
 	methods, err := ImportManifest(path)
 	if err != nil {
 		t.Fatalf("ImportManifest: %v", err)
 	}
-	if len(methods) != 2 || methods[0] != "search_read" {
+	if len(methods) != 2 || methods[0].Method != "search_read" {
 		t.Fatalf("methods = %v", methods)
 	}
 	s := validTestSnapshot()
 	for _, m := range methods {
-		if _, ok := s.Model(m); ok {
+		if _, ok := s.Model(m.Method); ok {
 			t.Fatalf("manifest entry %q resolved as a model", m)
 		}
-		if s.IsExecutable(m) {
+		if s.IsExecutable(m.Method) {
 			t.Fatalf("manifest entry %q executable", m)
 		}
 	}

@@ -40,6 +40,13 @@ func TestBoundedDomainPerModelAnchors(t *testing.T) {
 	}{
 		{"stock.rule", []any{leaf("route_id", "in", []any{float64(66), float64(27)})}},
 		{"stock.rule", []any{leaf("route_id", "=", 66)}},
+		{"mrp.workorder", []any{leaf("production_id", "=", 66)}},
+		{"mrp.workorder", []any{leaf("operation_id", "in", []any{float64(1), float64(2)})}},
+		{"stock.move", []any{leaf("raw_material_production_id", "=", 66)}},
+		{"stock.move", []any{leaf("workorder_id", "=", 66)}},
+		{"stock.move", []any{leaf("production_id", "=", 66)}},
+		{"stock.move.line", []any{leaf("production_id", "=", 66)}},
+		{"stock.move.line", []any{leaf("workorder_id", "=", 66)}},
 	} {
 		if !BoundedDomainFor(tc.model, tc.domain) {
 			t.Fatalf("reviewed anchor refused for %s: %v", tc.model, tc.domain)
@@ -77,6 +84,10 @@ func TestBoundedDomainPerModelAnchors(t *testing.T) {
 		{"stock.rule", []any{"|", leaf("route_id", "=", 1), leaf("id", "=", 2)}},
 		{"helpdesk.ticket", []any{leaf("team_id", "=", "1891")}},
 		{"helpdesk.ticket", []any{leaf("other_rel", "=", 1)}},
+		{"res.partner", []any{leaf("production_id", "=", 1)}},
+		{"mrp.workorder", []any{leaf("production_id", "=", false)}},
+		{"mrp.workorder", []any{leaf("production_id", "in", []any{float64(1), float64(-1)})}},
+		{"stock.move", []any{leaf("raw_material_production_id", "in", many)}},
 	} {
 		if BoundedDomainFor(tc.model, tc.domain) {
 			t.Fatalf("unbounded per-model filter admitted for %s: %v", tc.model, tc.domain)

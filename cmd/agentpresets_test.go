@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 // not emulate an Odoo server or assert ORM behavior.
 func TestInvestigationStoredFieldsAndScope(t *testing.T) {
 	defs := investigationModels()
-	installed := map[string]bool{"product.product": true, "product.template": true, "uom.uom": true, "mail.message": true, "ir.attachment": true, "product.template.attribute.line": true}
+	installed := map[string]bool{"product.product": true, "product.template": true, "uom.uom": true, "mail.message": true, "ir.attachment": true, "product.template.attribute.line": true, "mrp.workorder": true}
 	rows := []any{}
 	add := func(model, name, typ, relation string, stored bool) {
 		rows = append(rows, map[string]any{"model": model, "name": name, "ttype": typ, "relation": relation, "store": stored})
@@ -35,6 +36,10 @@ func TestInvestigationStoredFieldsAndScope(t *testing.T) {
 	add("ir.attachment", "file_size", "integer", "", true)
 	add("ir.attachment", "type", "selection", "", true)
 	add("ir.attachment", "datas", "binary", "", false)
+	add("ir.attachment", "res_field", "char", "", true)
+	add("mrp.workorder", "company_id", "many2one", "res.company", true)
+	add("mrp.workorder", "production_id", "many2one", "mrp.production", true)
+	add("mrp.workorder", "operation_id", "many2one", "mrp.routing.workcenter", true)
 	add("product.template.attribute.line", "product_tmpl_id", "many2one", "product.template", true)
 	specs, metadata, notes, err := agentCompileInvestigation(defs, installed, rows, nil)
 	if err != nil {
@@ -65,11 +70,17 @@ func TestInvestigationStoredFieldsAndScope(t *testing.T) {
 		if (sp.Name == "mail.message" || sp.Name == "ir.attachment") && (sp.CompanyIndependent || sp.CompanyField != "") {
 			t.Fatal("evidence exposed as global/direct model")
 		}
+		if sp.Name == "ir.attachment" && !slices.Contains(sp.Fields, "res_field") {
+			t.Fatal("field-backed evidence selector missing from proposal")
+		}
+		if sp.Name == "mrp.workorder" && (sp.CompanyField != "company_id" || sp.IncludeCompanyless || !slices.Contains(sp.Fields, "production_id")) {
+			t.Fatal("work-order discovery lost scope or manufacturing linkage")
+		}
 	}
 	if !found["uom.uom"] || len(notes) == 0 || metadata["product.product"]["x_computed"].Type != "char" {
 		t.Fatal("discovery information lost")
 	}
-	if !found["mail.message"] || !found["ir.attachment"] {
+	if !found["mail.message"] || !found["ir.attachment"] || !found["mrp.workorder"] {
 		t.Fatal("Odoo 17 evidence fields refused")
 	}
 	for _, raw := range rows {

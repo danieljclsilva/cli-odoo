@@ -57,7 +57,7 @@ func main() {
 				},
 			},
 		},
-		MethodManifest: []string{"search_read", "read"},
+		MethodManifest: []snapshot.MethodMeta{{Model: "res.partner", Method: "search_read", Signature: "unknown", SourceModule: "unknown", SourceRevision: "unknown", SourceReference: "unknown", Provenance: snapshot.ProvUnknown, MutationAssessment: "unknown"}, {Model: "res.partner", Method: "read", Signature: "unknown", SourceModule: "unknown", SourceRevision: "unknown", SourceReference: "unknown", Provenance: snapshot.ProvUnknown, MutationAssessment: "unknown"}},
 	}
 	digest, err := snapshot.CanonicalDigest(snap)
 	if err != nil {

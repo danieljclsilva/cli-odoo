@@ -20,7 +20,7 @@ func investigationModels() []investigationModel {
 	for _, name := range []string{
 		"helpdesk.ticket", "helpdesk.team", "stock.picking", "stock.move", "stock.move.line", "stock.quant", "stock.picking.type", "stock.warehouse", "stock.lot",
 		"sale.order", "sale.order.line", "purchase.order", "purchase.order.line",
-		"mrp.production", "mrp.workcenter", "mrp.routing.workcenter",
+		"mrp.production", "mrp.workorder", "mrp.workcenter", "mrp.routing.workcenter",
 		"account.move", "account.move.line", "account.account", "account.journal", "account.tax",
 	} {
 		out = append(out, investigationModel{name: name})
@@ -254,7 +254,7 @@ func agentCompileInvestigation(defs []investigationModel, installed map[string]b
 			wanted := map[string][]string{
 				"mail.message":        {"id", "model", "res_id", "date", "subject", "body", "author_id", "message_type", "subtype_id", "tracking_value_ids", "attachment_ids"},
 				"mail.tracking.value": {"id", "mail_message_id", "field_id", "field_desc", "old_value_char", "new_value_char", "old_value_text", "new_value_text", "old_value_integer", "new_value_integer", "old_value_float", "new_value_float", "old_value_datetime", "new_value_datetime"},
-				"ir.attachment":       {"id", "res_model", "res_id", "name", "mimetype", "file_size", "type", "datas"},
+				"ir.attachment":       {"id", "res_model", "res_id", "res_field", "name", "mimetype", "file_size", "type", "datas"},
 			}[d.name]
 			fields = nil
 			for _, f := range wanted {
@@ -282,7 +282,7 @@ func agentCompileInvestigation(defs []investigationModel, installed map[string]b
 			return nil, nil, nil, fmt.Errorf("required model %s unavailable or company scope cannot be enforced", n)
 		}
 	}
-	notes = append(notes, "Nonstored/computed, binary and secret-like business fields are discoverable metadata only; evidence binaries require the attachment tool.")
+	notes = append(notes, "Nonstored/computed and secret-like business fields are metadata only. Binary fields are not generic projections; field-backed worksheets/artwork use parent-linked attachments with an explicit field selector when ir.attachment.res_field is approved (5 MiB download cap).")
 	return specs, metadata, notes, nil
 }
 
@@ -296,11 +296,8 @@ func appendIfMissing(fields []string, name string) []string {
 }
 
 func investigationReadableField(name, typ string, stored bool) bool {
-	lower := strings.ToLower(name)
-	for _, secret := range []string{"password", "secret", "token", "api_key", "private_key"} {
-		if strings.Contains(lower, secret) {
-			return false
-		}
+	if policy.IsSecretField(name) {
+		return false
 	}
 	if !stored {
 		return false

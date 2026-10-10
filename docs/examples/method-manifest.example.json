@@ -1,0 +1,16 @@
+{
+  "manifest_version": 1,
+  "methods": [
+    {
+      "model": "x.example.model",
+      "method": "example_method",
+      "signature": "unknown",
+      "source_module": "unknown",
+      "source_revision": "unknown",
+      "source_reference": "unknown",
+      "provenance": "unknown",
+      "description": "Example only; replace with deployment-specific evidence",
+      "mutation_assessment": "unknown"
+    }
+  ]
+}

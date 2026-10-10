@@ -103,7 +103,7 @@ func testSnapshot() snapshot.Snapshot {
 				},
 			},
 		},
-		MethodManifest: []string{"search_read", "read"},
+		MethodManifest: []snapshot.MethodMeta{{Model: "res.partner", Method: "search_read", Signature: "unknown", SourceModule: "unknown", SourceRevision: "unknown", SourceReference: "unknown", Provenance: snapshot.ProvUnknown, MutationAssessment: "unknown"}, {Model: "res.partner", Method: "read", Signature: "unknown", SourceModule: "unknown", SourceRevision: "unknown", SourceReference: "unknown", Provenance: snapshot.ProvUnknown, MutationAssessment: "unknown"}},
 	}
 }
 
@@ -721,7 +721,7 @@ func TestDiscoveryCatalogMarksExecutable(t *testing.T) {
 				UnknownProvenance []string       `json:"unknown_provenance"`
 				Provenance        string         `json:"provenance"`
 			} `json:"models"`
-			MethodManifest []string `json:"method_manifest"`
+			MethodManifest []snapshot.MethodMeta `json:"method_manifest"`
 		} `json:"result"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&env); err != nil {
@@ -739,7 +739,7 @@ func TestDiscoveryCatalogMarksExecutable(t *testing.T) {
 		t.Fatal("catalog method_manifest missing")
 	}
 	for _, m := range env.Result.MethodManifest {
-		if _, isModel := env.Result.Models[m]; isModel && m != "read" {
+		if _, isModel := env.Result.Models[m.Method]; isModel {
 			t.Fatalf("manifest method %q must not resolve as an executable model entry point", m)
 		}
 	}

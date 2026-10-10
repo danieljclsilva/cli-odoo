@@ -1275,13 +1275,7 @@ func (b *Broker) handleCatalog(w http.ResponseWriter, r *http.Request) {
 			b.release(tok)
 			return
 		}
-		if _, allowed := b.pol.Models[model]; !allowed {
-			if _, allowed := b.pol.Models[norm]; !allowed {
-				b.writeError(w, r, http.StatusForbidden, "denied: "+policy.ReasonUnknownModel)
-				b.release(tok)
-				return
-			}
-		}
+		// Catalog-only and manifest-only models are metadata, never grants.
 		if err := b.live(tok); err != nil {
 			b.checkError(w, r, err)
 			return
@@ -1324,6 +1318,8 @@ func (b *Broker) handleCatalog(w http.ResponseWriter, r *http.Request) {
 			entry["unknown_provenance"] = unknown
 		}
 		catalogPermissions(entry, rule, exec)
+		b.catalogAttachmentPermissions(entry, exec && !rule.LinkedEvidence)
+		entry["method_manifest"] = catalogMethods(b.snap.MethodManifest, name)
 		models[name] = entry
 	}
 	for name, rule := range b.pol.Models {
@@ -1345,9 +1341,16 @@ func (b *Broker) handleCatalog(w http.ResponseWriter, r *http.Request) {
 			"unknown_provenance": unknown,
 		}
 		catalogPermissions(entry, rule, true)
+		b.catalogAttachmentPermissions(entry, !rule.LinkedEvidence)
+		entry["method_manifest"] = catalogMethods(b.snap.MethodManifest, name)
 		models[name] = entry
 	}
-	manifest := append([]string(nil), b.snap.MethodManifest...)
+	for _, method := range b.snap.MethodManifest {
+		if _, exists := models[method.Model]; !exists {
+			models[method.Model] = manifestModelEntry(b.snap.MethodManifest, method.Model)
+		}
+	}
+	manifest := catalogMethods(b.snap.MethodManifest, "")
 	b.mu.Unlock()
 	b.record(tok, 0)
 	b.writeEnvelope(w, r, tok, map[string]any{"models": models, "method_manifest": manifest}, len(models))
@@ -1386,6 +1389,20 @@ func catalogPermissions(entry map[string]any, rule policy.ModelRule, enabled boo
 	}
 }
 
+// catalogAttachmentPermissions advertises the separately approved linked
+// attachment route; binary metadata never becomes a generic projection.
+// Callers hold b.mu while rendering the catalog.
+func (b *Broker) catalogAttachmentPermissions(entry map[string]any, parentEnabled bool) {
+	evidence := b.pol.Models["ir.attachment"]
+	enabled := parentEnabled && b.pol.AllowLinkedEvidence && b.pol.Operations[policy.OpRead] && evidence.LinkedEvidence && containsField(evidence.Fields, "res_field")
+	fields, _ := entry["fields"].(map[string]any)
+	for name, raw := range fields {
+		if field, ok := raw.(map[string]any); ok {
+			field["attachment_evidence"] = enabled && field["type"] == "binary" && !policy.IsSecretField(name)
+		}
+	}
+}
+
 // catalogEntry renders one model's catalog entry (same shape as the
 // per-model values in handleCatalog, without the manifest wrapper).
 func (b *Broker) catalogEntry(name string) (map[string]any, bool) {
@@ -1402,6 +1419,8 @@ func (b *Broker) catalogEntry(name string) (map[string]any, bool) {
 			entry["unknown_provenance"] = unknown
 		}
 		catalogPermissions(entry, rule, exec)
+		b.catalogAttachmentPermissions(entry, exec && !rule.LinkedEvidence)
+		entry["method_manifest"] = catalogMethods(b.snap.MethodManifest, name)
 		return entry, true
 	}
 	if rule, ok := b.pol.Models[name]; ok {
@@ -1420,9 +1439,39 @@ func (b *Broker) catalogEntry(name string) (map[string]any, bool) {
 			"unknown_provenance": unknown,
 		}
 		catalogPermissions(entry, rule, true)
+		b.catalogAttachmentPermissions(entry, !rule.LinkedEvidence)
+		entry["method_manifest"] = catalogMethods(b.snap.MethodManifest, name)
 		return entry, true
 	}
+	for _, method := range b.snap.MethodManifest {
+		if method.Model == name {
+			return manifestModelEntry(b.snap.MethodManifest, name), true
+		}
+	}
 	return nil, false
+}
+
+// All method entries are non-executable even on an approved business model.
+// Claimed mutation assessments are evidence only, never read-method grants.
+type catalogMethod struct {
+	snapshot.MethodMeta
+	Executable bool `json:"executable"`
+}
+
+func catalogMethods(methods []snapshot.MethodMeta, model string) []catalogMethod {
+	out := []catalogMethod{}
+	for _, m := range methods {
+		if model == "" || m.Model == model {
+			out = append(out, catalogMethod{MethodMeta: m, Executable: false})
+		}
+	}
+	return out
+}
+
+func manifestModelEntry(methods []snapshot.MethodMeta, model string) map[string]any {
+	return map[string]any{"label": model, "provenance": snapshot.ProvManifest,
+		"executable": false, "linked_evidence_only": false, "fields": map[string]any{},
+		"method_manifest": catalogMethods(methods, model)}
 }
 
 // ---------------------------------------------------------------------------

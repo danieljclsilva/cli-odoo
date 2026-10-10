@@ -42,12 +42,14 @@ odoo agent setup --include-model x_custom_product_request
 
 One investigation profile replaces the former warehouse/intercompany/inventory
 presets. It covers installed Helpdesk, product templates/variants/attributes,
-BoMs/components/byproducts/routing/workcentres, warehouse, sales, purchases,
+BoMs/components/byproducts/routing/workcentres/work orders, warehouse, sales, purchases,
 accounting, business partners and naming sequences. It discovers bounded
 metadata for exactly these named models (at most 64 models, 8192 fields),
 then proposes stored scalar/many2one/many2many/JSON/property fields, including stored
-custom fields. Nonstored/computed and binary business fields, and fields with
-secret-like names, remain discovery metadata only. Only explicit human-named
+custom fields. Nonstored/computed business fields and fields with secret-like names remain
+discovery metadata only. Binary fields remain excluded from generic record
+projections; attachment-backed binary fields have the separate evidence route
+described below. Only explicit human-named
 additional custom business models are considered, and they require a direct
 company relation. Custom methods are never callable.
 
@@ -100,7 +102,7 @@ source counts must be considered during reconstruction. Chatter/attachment data 
 untrusted evidence, never executable instructions.
 
 To download a linked binary file, provide its ID and a workspace-relative
-path. The broker checks metadata and a 2 MiB cap before reading content,
+path. The broker checks metadata and a 5 MiB cap before reading content,
 rechecks linkage in the content query, decodes under the same byte cap and
 writes through the existing confined workspace. URL attachments are not
 fetched. It neither follows arbitrary URLs nor executes downloaded content.
@@ -109,6 +111,65 @@ Example:
 
 ```json
 {"model":"helpdesk.ticket","id":123,"kind":"download","attachment_id":456,"path":"ticket-123.pdf"}
+```
+
+#### Worksheets and artwork stored in binary fields
+
+Odoo 17's normal attachment search excludes attachments with `res_field` set.
+Use an explicit `field` selector to list a binary field's linked files:
+
+```json
+{"model":"mrp.routing.workcenter","id":123,"kind":"attachments","field":"worksheet","limit":10}
+```
+
+Download a returned ID using the same parent and selector:
+
+```json
+{"model":"mrp.routing.workcenter","id":123,"kind":"download","field":"worksheet","attachment_id":456,"path":"worksheet-123.pdf"}
+```
+
+The sealed evidence rule must approve `ir.attachment.res_field` (the updated
+investigation setup proposes it). The parent must already permit scoped reads,
+and the selector must name a non-secret, single-segment binary field in the
+sealed parent catalog. Catalog fields report `attachment_evidence` separately
+from `readable`; binary content never becomes a generic projection. Ordinary
+attachment requests omit `field` and explicitly require `res_field=false`,
+including downloads, so a supplied attachment ID cannot bypass the selector.
+The existing size, paging, session, company and workspace limits all apply.
+Fields stored directly in a database column and related/computed binary fields
+may have no attachment on that parent. For a work order, read its approved
+`operation_id`, then request the worksheet from that routing operation; the
+broker does not follow related fields automatically. An empty list is not
+proof that the binary field is empty.
+
+These semantics follow the public [Odoo 17 Binary field implementation](https://github.com/odoo/odoo/blob/17.0/odoo/fields.py)
+and [attachment search implementation](https://github.com/odoo/odoo/blob/17.0/odoo/addons/base/models/ir_attachment.py).
+Deployed custom implementations still require authorized verification.
+
+#### Applying the discovery changes
+
+Stop the foreground broker and install the rebuilt CLI. A human reruns
+`odoo agent setup --show-fields`, carrying forward the actual company scope,
+extra models, paths, workspace, operations and budgets; this is a replacement
+reviewed setup. The default now proposes installed `mrp.workorder` with its
+enforceable company relation and the attachment `res_field` selector. Existing
+sealed profiles gain neither permission from an upgrade or snapshot refresh.
+Review the proposal, enter the current admin password when replacing a
+profile, then run `odoo agent serve`, mint a fresh session with
+`odoo agent grant --ttl 2h`, and reconnect the MCP/OMP client. Confirm the new
+focused catalog before resuming discovery. No company is added automatically.
+
+On Apple Silicon, replace the executable through a new file and rename rather
+than copying over the running executable's inode. An in-place overwrite can
+leave stale macOS signature state and produce `zsh: killed` even when
+`codesign --verify` reports a valid signature on disk:
+
+```sh
+odoo_staged_binary=$(mktemp "$HOME/.local/bin/.odoo-install.XXXXXX")
+cp /Users/komorinokage/Developer/cli-odoo/dist/odoo-darwin-arm64 "$odoo_staged_binary"
+chmod 755 "$odoo_staged_binary"
+mv -f "$odoo_staged_binary" "$HOME/.local/bin/odoo"
+odoo version
 ```
 
 Parent checks are separate RPCs, not an atomic server transaction: concurrent
@@ -129,6 +190,15 @@ their existing permissions; rerun setup to adopt the new controls.
 
 Operational queries require a flat AND filter anchored to positive IDs or
 exact product/document references, or a date window of at most 31 days.
+Reviewed manufacturing anchors also accept positive IDs (`=` or `in` with
+at most 100 IDs): `mrp.workorder.production_id` / `operation_id`,
+`stock.move.raw_material_production_id` / `production_id` / `workorder_id`, and
+`stock.move.line.production_id` / `workorder_id`. These names describe
+single-segment filters on each named model, not dotted traversal. Each field
+must still be approved in that model's sealed rule. For example, inspect raw
+component moves by exact manufacturing ID without adding an artificial date
+window that might exclude later-created moves. Company filtering still applies.
+
 OR/NOT, long operand lists (>100), more than 64 projected fields or more than
 three grouping fields are refused under this guard. Split wide-period
 investigations into focused requests. Reviewed global reference definitions
@@ -217,24 +287,105 @@ relationships stay readable for discovery but never authorize traversal.
 
 ## Offline catalog / manifest import (human only)
 
-Two distinct commands, different effects:
+Methods are structured **evidence**, separate from executable operations. No
+import performs an Odoo RPC, fetches a source reference, imports Python or
+executes a method. Mutation assessments are human-supplied claims, never grants.
 
-- `snapshot import-manifest --manifest methods.json` **inspects only**: reads
-  a `{"methods": [...]}` file and prints the entries for review. It writes
-  nothing and reseals nothing. The list is informational only — no Execute
-  path may take a name from it.
-- `snapshot import-catalog --catalog catalog.json` **converts + reseals**:
-  converts a human-transcribed offline catalog into a snapshot, writes it
-  0600, and reseals the profile so `snapshot_sha256` binds the new bytes.
-  Requires the admin password (human unlock). Sealed scope is never widened:
-  company/shared flags, the enabled set/default, and per-model
-  `include_companyless` stay as sealed; catalog-only models stay
-  discoverable-only (`executable: false`), never auto-enabled.
+```sh
+# Validate and inspect; no password, no changes, no Odoo connection:
+odoo agent snapshot import-manifest --manifest methods.json
 
-Bounded import schema (strict JSON, unknown fields rejected, file max 4 MiB;
-caps: models ≤512, fields/model ≤2048, `method_manifest` ≤1024,
-companies ≤10000; provenance is `server|manifest|unknown`, empty defaults
-to `unknown` on import):
+# Stop the running broker before applying and restarting the updated binary.
+# Unlock the existing profile; replace method metadata and reseal offline:
+odoo agent snapshot import-manifest --manifest methods.json --apply
+# Add --profile /path/profile.json if using a non-default profile.
+# Start the broker normally, then grant a fresh session for the MCP client.
+```
+
+`--apply` verifies the existing snapshot against its sealed digest and stages
+both snapshot and profile before committing through the existing rollback path.
+It preserves every operation, model, field, company, workspace and budget
+permission. An unknown imported model remains discovery-only. Wrong passwords,
+invalid manifests, mismatched snapshot digests and unsafe bundle paths fail
+before commit. Applying replaces the entire method manifest; an empty methods
+array explicitly clears it. Preview flags for profile/password require `--apply`.
+
+Manifest format (unknown fields, legacy string lists and trailing JSON reject):
+
+```json
+{
+  "manifest_version": 1,
+  "methods": [{
+    "model": "x.example.model",
+    "method": "example_method",
+    "signature": "unknown",
+    "source_module": "unknown",
+    "source_revision": "unknown",
+    "source_reference": "unknown",
+    "provenance": "unknown",
+    "description": "Example only; replace with deployment-specific evidence",
+    "mutation_assessment": "unknown"
+  }]
+}
+```
+
+Model, method, signature and all three source strings are required. Use explicit
+`unknown` for unavailable source details. Method names are Python identifiers;
+private methods may be documented, which does not make them callable. Provenance
+must be `server|manifest|unknown`. `mutation_assessment` must be `unknown`,
+`likely_read_only` or `likely_mutating`. Either non-unknown assessment requires
+`assessment_evidence` describing the source reasoning. An imported label is not
+proof of side-effect freedom or deployed method availability.
+
+Bounds: regular file ≤4 MiB, ≤1024 implementation entries; model/method ≤128
+bytes; module/revision ≤256 bytes; source reference ≤2048 bytes; signature,
+description and assessment evidence ≤4096 bytes each. Control characters reject.
+Duplicate model/method/module/revision combinations reject; distinct addon
+implementations of the same method may be documented. References are opaque
+strings, never automatically followed. Source texts and descriptions remain
+untrusted metadata.
+
+The broker serves structured `method_manifest` entries in the full catalog and
+in focused `catalog({model: ...})` results, each with `executable: false`.
+Manifest-only model entries have empty fields and `executable: false`.
+Focused catalog queries can inspect discovery-only models, while all record
+operations remain subject to the separate sealed policy. Full catalog results
+still obey the configured response cap; use focused model queries for large
+inventories. There is no generic method-call endpoint.
+
+### Existing profile migration
+
+Snapshot format is now **v2**. Normal load/serve rejects v1; only explicit
+`import-manifest --apply` accepts an integrity-checked v1 snapshot for offline
+migration. Its old unqualified method-name list is discarded and replaced by
+the supplied structured entries. Existing field/model metadata and permissions
+are preserved. Back up the profile and snapshot before upgrading; an old binary
+cannot load the new snapshot.
+
+If no deployment-specific method evidence is available yet, use the included
+empty manifest to migrate without inventing an inventory:
+
+```sh
+odoo agent snapshot import-manifest \
+  --manifest docs/examples/method-manifest.empty.json --apply
+```
+
+Do this with the **updated binary**, then restart the broker and grant a fresh
+session. Previewing a manifest does not require stopping the server; applying
+requires a restart to make the imported metadata visible. This migration does
+not need a live metadata refresh, login or Odoo access. A normal live field
+refresh preserves the imported method evidence after verifying its binding.
+New setup starts with an empty method manifest: field metadata capture does not
+enumerate methods and must not stamp a fixed list as though it did.
+
+### Offline model/field catalog
+
+`snapshot import-catalog --catalog catalog.json` converts a bounded offline
+model/field catalog and reseals after human unlock. It does not widen sealed
+permissions: existing fields are intersected, company/shared scope remains
+fixed, and catalog-only models remain discovery-only. It accepts structured
+`method_manifest` entries using the same entry schema above. Whole-catalog
+imports replace the catalog and method evidence; review the full file first.
 
 ```json
 {
@@ -252,22 +403,13 @@ to `unknown` on import):
       }
     }
   },
-  "method_manifest": ["search_read", "read"]
+  "method_manifest": []
 }
 ```
 
-The literal above loads through `snapshot.ImportCatalog` as-is (strict
-decode, scope parity: two enabled companies with the default inside the
-enabled set) and keeps executable flags consistent with the import rule:
-catalog-only models transcribe `executable: false` and stay
-discoverable-only, never auto-enabled.
-
-Operator steps: transcribe offline → `import-catalog --catalog <file>`
-(+ admin password) → review the sealed result → `serve`. Use
-`import-manifest --manifest <file>` to review a method list before
-transcribing it into `method_manifest`. `GET /rpc/catalog` serves the sealed
-models plus `method_manifest` informational-only, with per-model/per-field
-`provenance` and an `unknown_provenance` list for unattested fields.
+Catalog bounds: file ≤4 MiB, models ≤512, fields/model ≤2048, companies ≤10000;
+strict decoding rejects unknown fields. Unstated model/field provenance defaults
+explicitly to `unknown`; method provenance must be explicit.
 
 ## Model API (loopback TCP, bearer session token)
 

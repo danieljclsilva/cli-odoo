@@ -71,13 +71,7 @@ type catalogFile struct {
 	EnabledCompanies   []int                   `json:"enabled_companies"`
 	DefaultCompany     int                     `json:"default_company"`
 	Models             map[string]catalogModel `json:"models"`
-	MethodManifest     []string                `json:"method_manifest"`
-}
-
-// manifestFile is the human-authored method list import source: pure data
-// for human inspection, never executable.
-type manifestFile struct {
-	Methods []string `json:"methods"`
+	MethodManifest     []MethodMeta            `json:"method_manifest"`
 }
 
 // IsExecutable reports the display-only catalog flag for model: whether a
@@ -236,13 +230,6 @@ func ImportCatalog(path string) (Snapshot, error) {
 			Provenance:         prov, Executable: cm.Executable,
 		}
 	}
-	manifest := make([]string, 0, len(f.MethodManifest))
-	for i, m := range f.MethodManifest {
-		if strings.TrimSpace(m) == "" {
-			return Snapshot{}, fmt.Errorf("snapshot: catalog method_manifest[%d] is empty", i)
-		}
-		manifest = append(manifest, m)
-	}
 	by := strings.TrimSpace(f.CapturedBy)
 	if by == "" {
 		by = "human:import"
@@ -256,42 +243,10 @@ func ImportCatalog(path string) (Snapshot, error) {
 		EnabledCompanies:   f.EnabledCompanies,
 		DefaultCompany:     f.DefaultCompany,
 		Models:             models,
-		MethodManifest:     manifest,
+		MethodManifest:     f.MethodManifest,
 	}
 	if err := s.validate(); err != nil {
 		return Snapshot{}, fmt.Errorf("snapshot: invalid catalog %q: %w", path, err)
 	}
 	return s, nil
-}
-
-// ImportManifest reads a human-authored method-list file and returns its
-// entries for inspection. The result is informational only: no Execute path
-// may take a name from it. The file shape is {"methods": [...]}; decoding
-// is strict and the entry count is capped at MaxCatalogMethods.
-func ImportManifest(path string) ([]string, error) {
-	b, err := ReadBoundedFile(path, MaxFileBytes, "manifest")
-	if err != nil {
-		return nil, fmt.Errorf("snapshot: reading manifest %q: %w", path, err)
-	}
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
-	var f manifestFile
-	if err := dec.Decode(&f); err != nil {
-		return nil, fmt.Errorf("snapshot: decoding manifest %q (unknown fields rejected): %w", path, err)
-	}
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
-		return nil, fmt.Errorf("snapshot: decoding manifest %q: trailing data after document", path)
-	}
-	if len(f.Methods) > MaxCatalogMethods {
-		return nil, fmt.Errorf("snapshot: manifest holds %d entries, over cap %d", len(f.Methods), MaxCatalogMethods)
-	}
-	out := make([]string, 0, len(f.Methods))
-	for i, m := range f.Methods {
-		if strings.TrimSpace(m) == "" {
-			return nil, fmt.Errorf("snapshot: manifest methods[%d] is empty", i)
-		}
-		out = append(out, m)
-	}
-	return out, nil
 }

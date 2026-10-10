@@ -13,7 +13,7 @@
 // (what the model may touch). The broker enforces the enabled scope; this
 // package only records the human's choice.
 //
-// Discoverable is not executable: MethodManifest lists method names as pure
+// Discoverable is not executable: MethodManifest describes method implementations as pure
 // data for human inspection. Nothing in this package performs RPC on the
 // model path and nothing here authorizes execution; the broker must never
 // Execute a name taken from MethodManifest.
@@ -61,7 +61,7 @@ func tempPath(dir string) string {
 
 // FormatVersion is the only snapshot file version Load accepts. There is no
 // legacy fallback: a version skew denies.
-const FormatVersion = 1
+const FormatVersion = 2
 
 // Size and count caps. Snapshot and catalog files are human-handled inputs:
 // anything over cap fails closed before decode completes.
@@ -148,7 +148,7 @@ type Snapshot struct {
 	EnabledCompanies   []int                `json:"enabled_companies"`
 	DefaultCompany     int                  `json:"default_company"`
 	Models             map[string]ModelMeta `json:"models"`
-	MethodManifest     []string             `json:"method_manifest"`
+	MethodManifest     []MethodMeta         `json:"method_manifest"`
 }
 
 // snapshotFile is the on-disk envelope: Snapshot plus the format version the
@@ -164,7 +164,7 @@ type snapshotFile struct {
 	EnabledCompanies   []int                `json:"enabled_companies"`
 	DefaultCompany     int                  `json:"default_company"`
 	Models             map[string]ModelMeta `json:"models"`
-	MethodManifest     []string             `json:"method_manifest"`
+	MethodManifest     []MethodMeta         `json:"method_manifest"`
 }
 
 // modelView adapts ModelMeta to policy.ModelView for the broker's
@@ -392,7 +392,11 @@ func RestoreBytes(path string, b []byte) error {
 // stamps CanonicalDigest output into the policy after human review; the
 // broker recomputes and compares before serving.
 func CanonicalDigest(s Snapshot) (string, error) {
-	b, err := json.Marshal(s)
+	return canonicalValueDigest(s)
+}
+
+func canonicalValueDigest(value any) (string, error) {
+	b, err := json.Marshal(value)
 	if err != nil {
 		return "", fmt.Errorf("snapshot: canonical digest: %w", err)
 	}
@@ -406,6 +410,9 @@ func CanonicalDigest(s Snapshot) (string, error) {
 // server use), sane companies, and per-model metadata hygiene. It fills an
 // empty model Label from the model name.
 func (s *Snapshot) validate() error {
+	if err := validateMethods(s.MethodManifest); err != nil {
+		return err
+	}
 	if strings.TrimSpace(s.Instance) == "" {
 		return fmt.Errorf("instance is empty")
 	}
@@ -512,15 +519,6 @@ type ModelSpec struct {
 	CompanyIndependent bool     `json:"company_independent"`
 	IncludeCompanyless bool     `json:"include_companyless"`
 	AllowAggregate     bool     `json:"allow_aggregate"`
-}
-
-// snapshotMethodManifest is the fixed informational method list stamped into
-// built snapshots. It is pure data for human inspection: presence in this
-// list never authorizes execution and the broker must never Execute a name
-// taken from it.
-var snapshotMethodManifest = []string{
-	"search_read", "read", "search_count", "read_group", "fields_get",
-	"name_search", "check_access_rights", "version", "context_get",
 }
 
 // BuildFromServer builds a Snapshot from live server metadata. It is
@@ -703,7 +701,7 @@ func BuildFromServer(client *odoo.Client, instance string, scope policy.CompanyS
 		EnabledCompanies:   enabled,
 		DefaultCompany:     scope.Default,
 		Models:             models,
-		MethodManifest:     append([]string(nil), snapshotMethodManifest...),
+		MethodManifest:     []MethodMeta{},
 	}
 	if err := s.validate(); err != nil {
 		return Snapshot{}, fmt.Errorf("snapshot: built invalid snapshot: %w", err)
